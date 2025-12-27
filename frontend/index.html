@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>当直くん - スケジュール自動生成</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+
+        main {
+            padding: 40px;
+        }
+
+        .upload-zone {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 60px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: #f8f9ff;
+        }
+
+        .upload-zone:hover {
+            border-color: #764ba2;
+            background: #f0f2ff;
+        }
+
+        .upload-zone.drag-over {
+            border-color: #764ba2;
+            background: #e8ebff;
+            transform: scale(1.02);
+        }
+
+        .upload-icon {
+            font-size: 4em;
+            margin-bottom: 20px;
+        }
+
+        .upload-text {
+            font-size: 1.2em;
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .upload-hint {
+            color: #666;
+            font-size: 0.9em;
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        .settings {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9ff;
+            border-radius: 10px;
+        }
+
+        .settings h3 {
+            margin-bottom: 15px;
+            color: #667eea;
+        }
+
+        .setting-row {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #333;
+            font-weight: 500;
+        }
+
+        input[type="number"],
+        input[type="text"],
+        textarea {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            font-size: 1em;
+            transition: border-color 0.3s;
+        }
+
+        input[type="number"]:focus,
+        input[type="text"]:focus,
+        textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 80px;
+        }
+
+        .checkbox-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+
+        button {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1em;
+            font-weight: bold;
+            cursor: pointer;
+            margin-top: 20px;
+            transition: transform 0.2s;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .progress-container {
+            display: none;
+            margin-top: 30px;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 30px;
+            background: #f0f0f0;
+            border-radius: 15px;
+            overflow: hidden;
+            margin-bottom: 10px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            transition: width 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+        }
+
+        .progress-message {
+            text-align: center;
+            color: #666;
+        }
+
+        .result {
+            display: none;
+            margin-top: 30px;
+            padding: 20px;
+            background: #e8f5e9;
+            border-radius: 10px;
+            text-align: center;
+        }
+
+        .result.success {
+            background: #e8f5e9;
+        }
+
+        .result.error {
+            background: #ffebee;
+        }
+
+        .download-btn {
+            display: inline-block;
+            padding: 15px 40px;
+            background: #4caf50;
+            color: white;
+            text-decoration: none;
+            border-radius: 10px;
+            margin-top: 15px;
+            font-weight: bold;
+            transition: background 0.3s;
+        }
+
+        .download-btn:hover {
+            background: #45a049;
+        }
+
+        .file-info {
+            display: none;
+            margin-top: 20px;
+            padding: 15px;
+            background: #e3f2fd;
+            border-radius: 10px;
+            border-left: 4px solid #2196f3;
+        }
+
+        .file-info-title {
+            font-weight: bold;
+            color: #1976d2;
+            margin-bottom: 5px;
+        }
+
+        @media (max-width: 600px) {
+            h1 {
+                font-size: 1.8em;
+            }
+
+            main {
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📅 当直くん</h1>
+            <p class="subtitle">医師の当直スケジュールを自動生成</p>
+        </header>
+
+        <main>
+            <!-- ファイルアップロード -->
+            <div class="upload-zone" id="uploadZone">
+                <div class="upload-icon">📁</div>
+                <div class="upload-text">Excelファイルをドラッグ＆ドロップ</div>
+                <div class="upload-hint">または クリックしてファイルを選択</div>
+                <input type="file" id="fileInput" accept=".xlsx,.xls">
+            </div>
+
+            <!-- ファイル情報 -->
+            <div class="file-info" id="fileInfo">
+                <div class="file-info-title">選択されたファイル:</div>
+                <div id="fileName"></div>
+            </div>
+
+            <!-- 設定 -->
+            <div class="settings">
+                <h3>⚙️ 設定</h3>
+
+                <div class="setting-row">
+                    <label for="numPatterns">生成パターン数:</label>
+                    <input type="number" id="numPatterns" value="1000" min="10" max="10000" step="10">
+                </div>
+
+                <div class="setting-row checkbox-row">
+                    <input type="checkbox" id="localSearch" checked>
+                    <label for="localSearch">局所探索を有効化（推奨）</label>
+                </div>
+
+                <div class="setting-row">
+                    <label for="holidays">祝日（改行区切り、YYYY-MM-DD形式）:</label>
+                    <textarea id="holidays" placeholder="2026-01-01&#10;2026-05-03"></textarea>
+                </div>
+
+                <div class="setting-row">
+                    <label for="wedForbidden">水曜H〜U禁止医師（カンマ区切り）:</label>
+                    <input type="text" id="wedForbidden" placeholder="金城,山田,野寺">
+                </div>
+            </div>
+
+            <!-- 生成ボタン -->
+            <button id="generateBtn" disabled>ファイルを選択してください</button>
+
+            <!-- 進捗表示 -->
+            <div class="progress-container" id="progressContainer">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill">0%</div>
+                </div>
+                <div class="progress-message" id="progressMessage">処理中...</div>
+            </div>
+
+            <!-- 結果表示 -->
+            <div class="result" id="result"></div>
+        </main>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8000';  // 本番環境では環境変数から取得
+
+        let selectedFile = null;
+
+        // DOM要素
+        const uploadZone = document.getElementById('uploadZone');
+        const fileInput = document.getElementById('fileInput');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileName = document.getElementById('fileName');
+        const generateBtn = document.getElementById('generateBtn');
+        const progressContainer = document.getElementById('progressContainer');
+        const progressFill = document.getElementById('progressFill');
+        const progressMessage = document.getElementById('progressMessage');
+        const result = document.getElementById('result');
+
+        // ファイルアップロード（クリック）
+        uploadZone.addEventListener('click', () => fileInput.click());
+
+        fileInput.addEventListener('change', (e) => {
+            handleFile(e.target.files[0]);
+        });
+
+        // ドラッグ＆ドロップ
+        uploadZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadZone.classList.add('drag-over');
+        });
+
+        uploadZone.addEventListener('dragleave', () => {
+            uploadZone.classList.remove('drag-over');
+        });
+
+        uploadZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadZone.classList.remove('drag-over');
+            handleFile(e.dataTransfer.files[0]);
+        });
+
+        // ファイル処理
+        function handleFile(file) {
+            if (!file) return;
+
+            // Excelファイルチェック
+            if (!file.name.match(/\.(xlsx|xls)$/i)) {
+                alert('Excelファイル（.xlsx または .xls）を選択してください');
+                return;
+            }
+
+            // サイズチェック（10MB）
+            if (file.size > 10 * 1024 * 1024) {
+                alert('ファイルサイズは10MB以下にしてください');
+                return;
+            }
+
+            selectedFile = file;
+            fileName.textContent = `${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+            fileInfo.style.display = 'block';
+            generateBtn.disabled = false;
+            generateBtn.textContent = 'スケジュールを生成';
+        }
+
+        // 生成ボタン
+        generateBtn.addEventListener('click', async () => {
+            if (!selectedFile) return;
+
+            // 設定取得
+            const config = {
+                num_patterns: parseInt(document.getElementById('numPatterns').value),
+                local_search_enabled: document.getElementById('localSearch').checked,
+                holidays: document.getElementById('holidays').value
+                    .split('\n')
+                    .map(d => d.trim())
+                    .filter(d => d),
+                wed_forbidden_doctors: document.getElementById('wedForbidden').value
+                    .split(',')
+                    .map(d => d.trim())
+                    .filter(d => d)
+            };
+
+            // UI更新
+            generateBtn.disabled = true;
+            generateBtn.textContent = '処理中...';
+            progressContainer.style.display = 'block';
+            result.style.display = 'none';
+
+            try {
+                // アップロード
+                const formData = new FormData();
+                formData.append('file', selectedFile);
+                formData.append('config', JSON.stringify(config));
+
+                const uploadRes = await fetch(`${API_BASE}/api/schedule/generate`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!uploadRes.ok) {
+                    const error = await uploadRes.json();
+                    throw new Error(error.detail || 'アップロードに失敗しました');
+                }
+
+                const { task_id } = await uploadRes.json();
+
+                // ステータスポーリング
+                await pollStatus(task_id);
+
+            } catch (error) {
+                showError(error.message);
+            } finally {
+                generateBtn.disabled = false;
+                generateBtn.textContent = 'スケジュールを生成';
+            }
+        });
+
+        // ステータスポーリング
+        async function pollStatus(taskId) {
+            const interval = setInterval(async () => {
+                try {
+                    const res = await fetch(`${API_BASE}/api/schedule/status/${taskId}`);
+                    const data = await res.json();
+
+                    // 進捗更新
+                    updateProgress(data.progress, data.message);
+
+                    if (data.status === 'completed') {
+                        clearInterval(interval);
+                        showSuccess(taskId);
+                    } else if (data.status === 'failed') {
+                        clearInterval(interval);
+                        throw new Error(data.message || '処理に失敗しました');
+                    }
+                } catch (error) {
+                    clearInterval(interval);
+                    showError(error.message);
+                }
+            }, 1000);
+        }
+
+        // 進捗更新
+        function updateProgress(progress, message) {
+            progressFill.style.width = `${progress}%`;
+            progressFill.textContent = `${progress}%`;
+            progressMessage.textContent = message || '処理中...';
+        }
+
+        // 成功表示
+        function showSuccess(taskId) {
+            progressContainer.style.display = 'none';
+            result.className = 'result success';
+            result.style.display = 'block';
+            result.innerHTML = `
+                <div style="font-size: 3em; margin-bottom: 10px;">✅</div>
+                <div style="font-size: 1.3em; font-weight: bold; margin-bottom: 10px;">
+                    スケジュール生成が完了しました！
+                </div>
+                <div style="color: #666; margin-bottom: 20px;">
+                    TOP3のパターンと診断情報を含むExcelファイルをダウンロードできます
+                </div>
+                <a href="${API_BASE}/api/schedule/download/${taskId}" class="download-btn" download>
+                    📥 ダウンロード
+                </a>
+            `;
+        }
+
+        // エラー表示
+        function showError(message) {
+            progressContainer.style.display = 'none';
+            result.className = 'result error';
+            result.style.display = 'block';
+            result.innerHTML = `
+                <div style="font-size: 3em; margin-bottom: 10px;">❌</div>
+                <div style="font-size: 1.3em; font-weight: bold; margin-bottom: 10px; color: #c62828;">
+                    エラーが発生しました
+                </div>
+                <div style="color: #666;">
+                    ${message}
+                </div>
+            `;
+        }
+    </script>
+</body>
+</html>
