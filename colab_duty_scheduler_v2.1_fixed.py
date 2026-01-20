@@ -21,6 +21,8 @@ COLAB_AVAILABLE = (
 )
 if COLAB_AVAILABLE:
     from google.colab import files
+else:
+    raise RuntimeError("このスクリプトはGoogle Colabでの実行を想定しています。Colabで開いて実行してください。")
 
 # =========================
 # ユーザー設定
@@ -110,6 +112,23 @@ def is_slot_value(v) -> bool:
     return False
 
 # =========================
+# Colab 入出力ヘルパー
+# =========================
+def upload_excel_file():
+    uploaded = files.upload()
+    if not uploaded:
+        raise ValueError("❌ ファイルが選択されませんでした。Excelファイルを選択してください。")
+    if len(uploaded) > 1:
+        raise ValueError("❌ 複数ファイルは処理できません。Excelファイルを1つだけ選択してください。")
+    filename = next(iter(uploaded.keys()))
+    return filename, uploaded[filename]
+
+def download_excel_file(path: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"❌ 出力ファイルが見つかりません: {path}")
+    files.download(path)
+
+# =========================
 # sheet4 読み込み（ヘッダ行自動検出＋重複耐性）
 # 🔧 FIX: 検索範囲を30→50行に拡大
 # =========================
@@ -174,11 +193,10 @@ print("="*60)
 print("\nsheet1〜sheet4（またはSheet4）が入った当直Excelファイルを選択してください")
 
 if COLAB_AVAILABLE:
-    uploaded = files.upload()
-    uploaded_filename = list(uploaded.keys())[0]
+    uploaded_filename, uploaded_bytes = upload_excel_file()
 
     try:
-        xls = pd.ExcelFile(io.BytesIO(uploaded[uploaded_filename]))
+        xls = pd.ExcelFile(io.BytesIO(uploaded_bytes))
     except Exception as e:
         raise ValueError(f"❌ Excelファイルの読み込みに失敗しました: {e}")
 
@@ -1620,4 +1638,4 @@ print("  3. 問題があればpattern_02, pattern_03も確認")
 print("="*60)
 
 if COLAB_AVAILABLE:
-    files.download(output_path)
+    download_excel_file(output_path)
