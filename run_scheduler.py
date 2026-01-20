@@ -5,14 +5,28 @@
 元のColabコードをローカル環境で実行
 """
 
+import io
+import os
+import importlib.util
 import pandas as pd
 import numpy as np
 from collections import defaultdict
 import random
-import sys
 
 # =========================
-# データ読み込み（ファイルアップロードの代わり）
+# Colab入出力
+# =========================
+COLAB_AVAILABLE = (
+    importlib.util.find_spec("google") is not None
+    and importlib.util.find_spec("google.colab") is not None
+)
+if COLAB_AVAILABLE:
+    from google.colab import files
+else:
+    raise RuntimeError("このスクリプトはGoogle Colabでの実行を想定しています。Colabで開いて実行してください。")
+
+# =========================
+# データ読み込み（Excelアップロード）
 # =========================
 print("=" * 60)
 print("   当直スケジュール自動生成ツール v2.1.1（統合版）")
@@ -26,33 +40,30 @@ print("✅ 同日重複チェックの強化")
 print("✅ ★B〜Jはsheet3記載必須（ハード制約）")
 print("=" * 60)
 
-sys.path.insert(0, '/home/user/Tochoku-kun')
-from tochoku_data import DATA as ORIG_DATA
-from sheet3_sheet4_data import sheet3_data, sheet4_data
+def upload_excel_file():
+    uploaded = files.upload()
+    if not uploaded:
+        raise ValueError("❌ ファイルが選択されませんでした。Excelファイルを選択してください。")
+    if len(uploaded) > 1:
+        raise ValueError("❌ 複数ファイルは処理できません。Excelファイルを1つだけ選択してください。")
+    filename = next(iter(uploaded.keys()))
+    return filename, uploaded[filename]
 
-DATA = ORIG_DATA.copy()
-DATA['sheet3'] = sheet3_data
-DATA['Sheet4'] = sheet4_data
+def download_excel_file(path: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"❌ 出力ファイルが見つかりません: {path}")
+    files.download(path)
 
-# DataFrameに変換
-shift_df = pd.DataFrame(DATA['sheet1'])
-availability_raw = pd.DataFrame(DATA['sheet2'])
-schedule_raw = pd.DataFrame(DATA['sheet3'])
-sheet4_raw_out = pd.DataFrame(DATA['Sheet4'])
-
-# 日付列の変換
-shift_df['Date'] = pd.to_datetime(shift_df['Date'], errors='coerce').dt.normalize().dt.tz_localize(None)
-availability_raw['Date'] = pd.to_datetime(availability_raw['Date'], errors='coerce').dt.normalize().dt.tz_localize(None)
-schedule_raw['Date'] = pd.to_datetime(schedule_raw['Date'], errors='coerce').dt.normalize().dt.tz_localize(None)
-
-uploaded_filename = "Tochoku.ver9_2026.01.xlsx"
-
-# モックExcelFile
-class MockExcelFile:
-    def __init__(self, data_dict):
-        self.sheet_names = list(data_dict.keys())
-
-xls = MockExcelFile(DATA)
+def find_sheet_name(xls: pd.ExcelFile, target: str):
+    if target in xls.sheet_names:
+        return target
+    low_map = {s.lower(): s for s in xls.sheet_names}
+    if target.lower() in low_map:
+        return low_map[target.lower()]
+    for s in xls.sheet_names:
+        if s.strip().lower() == target.strip().lower():
+            return s
+    return None
 
 # =========================
 # ユーザー設定
@@ -153,6 +164,39 @@ def is_slot_value(v):
     return False
 
 # =========================
+# Excelアップロード → DataFrame化
+# =========================
+print("\n📤 Excelファイルをアップロードしてください。")
+uploaded_filename, uploaded_bytes = upload_excel_file()
+
+try:
+    xls = pd.ExcelFile(io.BytesIO(uploaded_bytes))
+except Exception as e:
+    raise ValueError(f"❌ Excelファイルの読み込みに失敗しました: {e}")
+
+sheet1_name = find_sheet_name(xls, "sheet1")
+sheet2_name = find_sheet_name(xls, "sheet2")
+sheet3_name = find_sheet_name(xls, "sheet3")
+sheet4_name = find_sheet_name(xls, "sheet4") or find_sheet_name(xls, "Sheet4")
+
+missing = [k for k, v in [("sheet1", sheet1_name), ("sheet2", sheet2_name), ("sheet3", sheet3_name), ("sheet4", sheet4_name)] if v is None]
+if missing:
+    raise ValueError(f"❌ 必要なシートが見つかりません: {missing}\n実際のシート名: {xls.sheet_names}")
+
+shift_df = strip_cols(pd.read_excel(xls, sheet_name=sheet1_name))
+availability_raw = strip_cols(pd.read_excel(xls, sheet_name=sheet2_name))
+schedule_raw = strip_cols(pd.read_excel(xls, sheet_name=sheet3_name))
+sheet4_raw_out = strip_cols(pd.read_excel(xls, sheet_name=sheet4_name))
+
+# 日付列の変換
+if "Date" in shift_df.columns:
+    shift_df["Date"] = pd.to_datetime(shift_df["Date"], errors="coerce").dt.normalize().dt.tz_localize(None)
+if "Date" in availability_raw.columns:
+    availability_raw["Date"] = pd.to_datetime(availability_raw["Date"], errors="coerce").dt.normalize().dt.tz_localize(None)
+if "Date" in schedule_raw.columns:
+    schedule_raw["Date"] = pd.to_datetime(schedule_raw["Date"], errors="coerce").dt.normalize().dt.tz_localize(None)
+
+# =========================
 # データ処理
 # =========================
 shift_df.columns = make_unique(list(shift_df.columns))
@@ -249,7 +293,7 @@ print("\n✅ スケジュール生成完了（簡易版）")
 
 # 出力
 output_filename = f"{uploaded_filename.rsplit('.', 1)[0]}_auto_schedules_demo.xlsx"
-output_path = f"/home/user/Tochoku-kun/{output_filename}"
+output_path = output_filename
 
 print(f"\n📝 結果をExcelファイルに出力中...")
 
@@ -261,6 +305,7 @@ print("\n" + "=" * 60)
 print("   🎉 完了！")
 print("=" * 60)
 print(f"\n📥 出力ファイル: {output_path}")
+download_excel_file(output_path)
 print("\n【注意】")
 print("これは簡易デモ版です。")
 print("完全版を実行するには、元のColabコードの全関数を統合する必要があります。")
