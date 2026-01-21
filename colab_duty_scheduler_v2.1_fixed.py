@@ -422,7 +422,7 @@ all_dates = sorted(slots_by_date.keys())
 all_shift_dates = sorted(pd.to_datetime(shift_df[date_col_shift].dropna()).dt.normalize().dt.tz_localize(None).unique())  # 🔧 FIX
 
 # =========================
-# cap設計：3回ベース＋余りは右側から4回目
+# cap設計：n回ベース＋余りは右側（下側）からn+1回
 # =========================
 def is_always_unavailable(doc):
     if preassigned_count.get(doc, 0) > 0:
@@ -442,6 +442,8 @@ EXTRA_ALLOWED = set(active_sorted_right[:EXTRA_SLOTS])
 
 TARGET_CAP = {d: 0 for d in doctor_names}
 for d in active_doctors:
+    TARGET_CAP[d] = BASE_TARGET
+for d in EXTRA_ALLOWED:
     TARGET_CAP[d] = BASE_TARGET + 1
 for d in doctor_names:
     if preassigned_count.get(d, 0) > TARGET_CAP.get(d, 0):
@@ -454,7 +456,7 @@ print(f"   全枠数: {total_slots}")
 print(f"   active医師: {len(active_doctors)}人")
 print(f"   inactive医師: {len(inactive_doctors)}人")
 print(f"   基本割当数: {BASE_TARGET}回")
-print(f"   余り枠: {EXTRA_SLOTS}枠（全員の上限は+1回）")
+print(f"   余り枠: {EXTRA_SLOTS}枠（右側の医師から+1回）")
 
 # =========================
 # B-K / L-Y 比率バランス（sheet3で「3」記載の医師は除外）
@@ -1537,7 +1539,8 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
     })
 
 refined_sorted = sorted(refined, key=lambda e: e["raw_after"], reverse=True)
-top_patterns = refined_sorted[:3]
+TOP_OUTPUT_PATTERNS = 1
+top_patterns = refined_sorted[:TOP_OUTPUT_PATTERNS]
 
 scores_df = pd.DataFrame(score_rows).sort_values(["raw_score", "seed"], ascending=[False, True]).reset_index(drop=True)
 
@@ -1554,11 +1557,13 @@ refined_df = pd.DataFrame([
 ]).sort_values(["raw_after", "seed"], ascending=[False, True]).reset_index(drop=True)
 
 print("\n✅ 局所探索完了")
-print("\n=== TOP3パターンのスコア ===")
+print("\n=== TOPパターンのスコア ===")
 for rank, pattern in enumerate(top_patterns, 1):
-    print(f"   {rank}位: raw_score={pattern['raw_after']:.1f}, " +
-          f"gap違反={pattern['metrics_after']['gap_violations']}, " +
-          f"未割当={pattern['metrics_after']['unassigned_slots']}")
+    print(
+        f"   {rank}位: raw_score={pattern['raw_after']:.1f}, "
+        + f"gap違反={pattern['metrics_after']['gap_violations']}, "
+        + f"未割当={pattern['metrics_after']['unassigned_slots']}"
+    )
 
 # =========================
 # 出力（pattern + summary + diagnostics）
@@ -1569,6 +1574,15 @@ output_path = output_filename
 
 print(f"\n📝 結果をExcelファイルに出力中...")
 
+def write_diagnostics_sheet(writer, sheet_name, diagnostics):
+    startrow = 0
+    for title, df in diagnostics:
+        df.to_excel(writer, sheet_name=sheet_name, startrow=startrow + 1, index=False)
+        ws = writer.sheets[sheet_name]
+        ws.cell(row=startrow + 1, column=1, value=title)
+        startrow += len(df.index) + 3
+
+
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
     # 元シート
     shift_df.to_excel(writer, sheet_name="sheet1", index=False)
@@ -1576,13 +1590,7 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
     schedule_raw.to_excel(writer, sheet_name="sheet3", index=False)
     sheet4_raw_out.to_excel(writer, sheet_name="sheet4", index=False)
 
-    # スコア一覧
-    scores_df.to_excel(writer, sheet_name="scores", index=False)
-
-    # ローカル探索の改善一覧
-    refined_df.to_excel(writer, sheet_name="refined_candidates", index=False)
-
-    # TOP3出力
+    # TOPパターン出力
     for rank, entry in enumerate(top_patterns, start=1):
         sheet_label = f"pattern_{rank:02d}"
         entry["pattern_df"].to_excel(writer, sheet_name=sheet_label, index=False)
@@ -1595,12 +1603,18 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
 
         # diagnostics
         df_doctors, df_gap, df_same, df_hdup, df_unass, df_metrics = build_diagnostics(entry["pattern_df"])
-        df_doctors.to_excel(writer, sheet_name=f"{sheet_label}_diag_doctors", index=False)
-        df_gap.to_excel(writer, sheet_name=f"{sheet_label}_diag_gap", index=False)
-        df_same.to_excel(writer, sheet_name=f"{sheet_label}_diag_sameday", index=False)
-        df_hdup.to_excel(writer, sheet_name=f"{sheet_label}_diag_hospdup", index=False)
-        df_unass.to_excel(writer, sheet_name=f"{sheet_label}_diag_unassigned", index=False)
-        df_metrics.to_excel(writer, sheet_name=f"{sheet_label}_diag_metrics", index=False)
+        write_diagnostics_sheet(
+            writer,
+            sheet_name=f"{sheet_label}_diag",
+            diagnostics=[
+                ("医師ごとの偏り", df_doctors),
+                ("gap違反", df_gap),
+                ("同日重複", df_same),
+                ("同一病院重複", df_hdup),
+                ("未割当枠", df_unass),
+                ("メトリクス", df_metrics),
+            ],
+        )
 
 print("\n" + "="*60)
 print("   🎉 完了！")
@@ -1608,15 +1622,12 @@ print("="*60)
 print(f"\n📥 出力ファイル: {output_path}")
 print("\n【ファイル内容】")
 print("  - sheet1〜4: 元データ")
-print("  - scores: 全パターンのスコア一覧")
-print("  - refined_candidates: 局所探索の改善結果")
-print("  - pattern_01〜03: TOP3のスケジュール")
-print("  - pattern_XX_今月/累計: サマリーシート")
-print("  - pattern_XX_diag_*: 診断シート（gap違反、重複等）")
+print("  - pattern_01: TOPスケジュール")
+print("  - pattern_01_今月/累計: サマリーシート")
+print("  - pattern_01_diag: 診断シート（gap違反、重複等）")
 print("\n【推奨】")
-print("  1. pattern_01_diag_gap: gap違反を確認")
-print("  2. pattern_01_diag_doctors: 医師ごとの偏りを確認")
-print("  3. 問題があればpattern_02, pattern_03も確認")
+print("  1. pattern_01_diag: gap違反・重複・未割当を確認")
+print("  2. pattern_01_今月/累計: 医師ごとの偏りを確認")
 print("="*60)
 
 if COLAB_AVAILABLE:
