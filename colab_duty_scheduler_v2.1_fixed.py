@@ -1,5 +1,11 @@
-# @title 当直くん v2.4 (列構造変更対応版)
+# @title 当直くん v2.5 (カテ表コード保有医師制約修正版)
 # 修正内容:
+# v2.5 (2026-01-21):
+# - B〜K列の制約を修正：カテ表コード保有医師のみカテ表コードが必要
+#   - sheet3で少なくとも1つのカテ表コード（A,B,C,CC,D,E等）を持つ医師を特定
+#   - カテ表コード保有医師は、カテ表コードがない日にB〜K列に割り当てられない
+#   - カテ表コード非保有医師は、B〜K列に自由に割り当て可能
+# - 出力パターンを1個から3個に変更（TOP3候補を提示）
 # v2.4 (2026-01-21):
 # - 列構造の変更対応（B〜Y列）
 #   - 可否コード2: B〜Q列のみ可（従来B〜M列）
@@ -174,15 +180,15 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直スケジュール自動生成ツール v2.4 (列構造変更対応版)")
+print("   当直スケジュール自動生成ツール v2.5 (カテ表コード保有医師制約修正版)")
 print("="*60)
+print("\n【v2.5の修正内容】")
+print("🔧 B〜K列の制約を修正")
+print("  - カテ表コード保有医師のみカテ表コードが必要")
+print("  - カテ表コード非保有医師はB〜K列に自由に割り当て可能")
+print("  - 出力パターンをTOP3候補に変更（従来1個）")
 print("\n【v2.4の修正内容】")
-print("🔧 列構造の変更対応（B〜Y列）")
-print("  - 可否コード2: B〜Q列のみ可（従来B〜M列）")
-print("  - 可否コード3: L〜Y列のみ可（従来H〜U列）")
-print("  - カテ表制約: L〜Y列禁止（従来H〜U列）")
-print("  - B〜H列: 2回まで（新規制約）")
-print("  - 診断シートにB〜H列2回超過違反検出を追加")
+print("🔧 列構造の変更対応（B〜Y列）、B〜H列2回上限制約")
 print("\n【v2.3の修正内容】")
 print("🔧 B〜K列（大学系）のカテ表要件をハード制約に変更")
 print("\n【v2.2の修正内容】")
@@ -499,6 +505,7 @@ print(f"   余り枠: {EXTRA_SLOTS}枠（右側の医師から+1回）")
 
 # =========================
 # B-K / L-Y 比率バランス（sheet3で「3」記載の医師は除外）
+# sheet3でカテ表コード保有医師の特定
 # =========================
 def has_sheet3_code_3(doc):
     if doc not in schedule_df.columns:
@@ -506,9 +513,25 @@ def has_sheet3_code_3(doc):
     values = schedule_df[doc].dropna()
     return any(str(v).strip() == "3" for v in values)
 
+def has_any_schedule_code(doc):
+    """医師がsheet3で少なくとも1つのカテ表コード（A,B,C,CC,D,E等、3以外）を持っているか"""
+    if doc not in schedule_df.columns:
+        return False
+    values = schedule_df[doc].dropna()
+    for v in values:
+        s = str(v).strip()
+        if s and s != "0" and s != "3":  # 0と3以外のコードがあればTrue
+            return True
+    return False
+
 RATIO_EXEMPT_DOCTORS = {doc for doc in doctor_names if has_sheet3_code_3(doc)}
 if RATIO_EXEMPT_DOCTORS:
     print(f"   比率バランス除外（sheet3に3あり）: {sorted(RATIO_EXEMPT_DOCTORS)}")
+
+SCHEDULE_CODE_HOLDERS = {doc for doc in doctor_names if has_any_schedule_code(doc)}
+if SCHEDULE_CODE_HOLDERS:
+    print(f"   カテ表コード保有医師: {len(SCHEDULE_CODE_HOLDERS)}人")
+    print(f"   カテ表コード非保有医師: {len([d for d in doctor_names if d not in SCHEDULE_CODE_HOLDERS])}人")
 
 # =========================
 # 大学(B〜G)の昼夜判定 & 7分類
@@ -615,9 +638,10 @@ def choose_doctor_for_slot(
                 if get_sched_code(date, doc):
                     continue
 
-            # ★ ハード制約3: B〜K列はカテ表コードが必要（絶対に緩和しない）
+            # ★ ハード制約3: B〜K列はカテ表コード保有医師のみカテ表コードが必要（絶対に緩和しない）
             if B_COL_INDEX <= idx <= B_K_END_INDEX:
-                if not get_sched_code(date, doc):
+                # カテ表コード保有医師は、その日にカテ表コードが必要
+                if doc in SCHEDULE_CODE_HOLDERS and not get_sched_code(date, doc):
                     continue
 
             # ★ ハード制約4: B〜H列は2回まで（relax_bh_limitで緩和可能）
@@ -1113,9 +1137,9 @@ def can_assign_doc_to_slot(doc, date, hosp):
     if L_COL_INDEX <= idx <= L_Y_END_INDEX:
         if get_sched_code(date, doc):
             return False
-    # B〜K列はカテ表コードが必要
+    # B〜K列はカテ表コード保有医師のみカテ表コードが必要
     if B_COL_INDEX <= idx <= B_K_END_INDEX:
-        if not get_sched_code(date, doc):
+        if doc in SCHEDULE_CODE_HOLDERS and not get_sched_code(date, doc):
             return False
     # 水曜日L〜Y列禁止医師
     if dow == 2 and L_COL_INDEX <= idx <= L_Y_END_INDEX and doc in WED_FORBIDDEN_DOCTORS:
@@ -1590,8 +1614,8 @@ def build_hard_constraint_violations(pattern_df):
                     "詳細": f"カテ表（{sched_code}）がある日に外病院（列{idx}）に割当",
                 })
 
-            # 違反5: B〜K列でカテ表コードなし
-            if B_COL_INDEX <= idx <= B_K_END_INDEX and not sched_code:
+            # 違反5: B〜K列でカテ表コードなし（カテ表コード保有医師のみ）
+            if B_COL_INDEX <= idx <= B_K_END_INDEX and doc in SCHEDULE_CODE_HOLDERS and not sched_code:
                 rows.append({
                     "違反種別": "B-K列カテ表コード欠如",
                     "日付": date,
@@ -1600,7 +1624,7 @@ def build_hard_constraint_violations(pattern_df):
                     "列番号": idx,
                     "可否コード": code,
                     "カテ表": "",
-                    "詳細": f"B〜K列（大学系）の割当にカテ表コードが必要。列{idx}に割当",
+                    "詳細": f"B〜K列（大学系）の割当にカテ表コードが必要（カテ表コード保有医師）。列{idx}に割当",
                 })
 
             # 違反6: 水曜日L〜Y列禁止医師
@@ -1761,7 +1785,7 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
     })
 
 refined_sorted = sorted(refined, key=lambda e: e["raw_after"], reverse=True)
-TOP_OUTPUT_PATTERNS = 1
+TOP_OUTPUT_PATTERNS = 3
 top_patterns = refined_sorted[:TOP_OUTPUT_PATTERNS]
 
 scores_df = pd.DataFrame(score_rows).sort_values(["raw_score", "seed"], ascending=[False, True]).reset_index(drop=True)
@@ -1791,7 +1815,7 @@ for rank, pattern in enumerate(top_patterns, 1):
 # 出力（pattern + summary + diagnostics）
 # =========================
 base_name = uploaded_filename.rsplit(".", 1)[0]
-output_filename = f"{base_name}_auto_schedules_v2.4.xlsx"
+output_filename = f"{base_name}_auto_schedules_v2.5.xlsx"
 output_path = output_filename
 
 print(f"\n📝 結果をExcelファイルに出力中...")
@@ -1845,19 +1869,20 @@ print("="*60)
 print(f"\n📥 出力ファイル: {output_path}")
 print("\n【ファイル内容】")
 print("  - sheet1〜4: 元データ")
-print("  - pattern_01: TOPスケジュール")
-print("  - pattern_01_今月/累計: サマリーシート")
-print("  - pattern_01_diag: 診断シート（ハード制約違反、gap違反、重複等）")
+print("  - pattern_01〜03: TOP3スケジュール候補")
+print("  - pattern_XX_今月/累計: 各パターンのサマリーシート")
+print("  - pattern_XX_diag: 各パターンの診断シート（ハード制約違反、gap違反、重複等）")
 print("\n【推奨】")
-print("  🚨 重要: pattern_01_diagの「ハード制約違反」を最優先で確認")
+print("  🚨 重要: 各pattern_XX_diagの「ハード制約違反」を最優先で確認")
 print("    - 可否コード0違反（絶対不可の日に割当）")
 print("    - カテ表+外病院違反（カテ表がある日にL〜Y列）")
 print("    - 可否コード2違反（B〜Q列以外に割当）")
 print("    - 可否コード3違反（L〜Y列以外に割当）")
-print("    - B-K列カテ表コード欠如（大学系にカテ表コードなしで割当）")
+print("    - B-K列カテ表コード欠如（カテ表コード保有医師がコードなし日に割当）")
 print("    - B-H列2回超過違反（B〜H列に3回以上割当）")
-print("  1. pattern_01_diag: gap違反・重複・未割当を確認")
-print("  2. pattern_01_今月/累計: 医師ごとの偏りを確認")
+print("  1. 3つのパターンを比較し、最適なものを選択")
+print("  2. 選択したパターンの診断シートで gap違反・重複・未割当を確認")
+print("  3. サマリーシートで医師ごとの偏りを確認")
 print("="*60)
 
 if COLAB_AVAILABLE:
