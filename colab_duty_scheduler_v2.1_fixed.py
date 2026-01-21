@@ -23,8 +23,13 @@ if COLAB_AVAILABLE:
     from google.colab import files
 
 # =========================
-# ユーザー設定
+# @title ユーザー設定
 # =========================
+# @markdown **入力方法（Colab）**  
+# @markdown - `INPUT_MODE = "upload"`: ファイルをアップロード  
+# @markdown - `INPUT_MODE = "path"`: 指定パスのExcelを読み込み
+INPUT_MODE = "upload"
+INPUT_EXCEL_PATH = "/content/Tochoku.ver9_2026.01.xlsx"
 HOLIDAYS = set()  # 祝日を入れるならここ（例: {pd.Timestamp("2026-01-01"), ...}）
 BG_DAY_COLS = set()    # 列名で「昼」固定したい大学枠があれば追加
 BG_NIGHT_COLS = set()  # 列名で「夜」固定したい大学枠があれば追加
@@ -154,7 +159,7 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
     return data
 
 # =========================
-# 入力ファイルのアップロード
+# @title 入力ファイルの読み込み
 # =========================
 print("="*60)
 print("   当直スケジュール自動生成ツール v2.1 (バグ修正版)")
@@ -174,13 +179,19 @@ print("="*60)
 print("\nsheet1〜sheet4（またはSheet4）が入った当直Excelファイルを選択してください")
 
 if COLAB_AVAILABLE:
-    uploaded = files.upload()
-    uploaded_filename = list(uploaded.keys())[0]
-
-    try:
-        xls = pd.ExcelFile(io.BytesIO(uploaded[uploaded_filename]))
-    except Exception as e:
-        raise ValueError(f"❌ Excelファイルの読み込みに失敗しました: {e}")
+    if INPUT_MODE == "upload":
+        uploaded = files.upload()
+        uploaded_filename = list(uploaded.keys())[0]
+        try:
+            xls = pd.ExcelFile(io.BytesIO(uploaded[uploaded_filename]))
+        except Exception as e:
+            raise ValueError(f"❌ Excelファイルの読み込みに失敗しました: {e}")
+    else:
+        uploaded_filename = os.path.basename(INPUT_EXCEL_PATH)
+        try:
+            xls = pd.ExcelFile(INPUT_EXCEL_PATH)
+        except Exception as e:
+            raise ValueError(f"❌ Excelファイルの読み込みに失敗しました: {e}")
 
     sheet1_name = find_sheet_name(xls, "sheet1")
     sheet2_name = find_sheet_name(xls, "sheet2")
