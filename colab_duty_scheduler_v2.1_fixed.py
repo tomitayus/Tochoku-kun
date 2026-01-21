@@ -1,5 +1,11 @@
-# @title 当直くん v2.1 (バグ修正版)
+# @title 当直くん v2.2 (ハード制約違反修正版)
 # 修正内容:
+# v2.2 (2026-01-21):
+# - ハード制約違反の修正（可否コード0、カテ表+外病院、コード2/3違反）
+# - collect_candidates関数でコード0を常に除外するよう修正
+# - カテ表がある日のH〜U列割当を絶対禁止に変更
+# - ハード制約違反チェック機能を診断シートに追加
+# v2.1:
 # - タイムゾーン問題の修正
 # - 医師名の正規化（空白除去）
 # - sheet4ヘッダ検出範囲の拡大（30→50行）
@@ -157,9 +163,15 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直スケジュール自動生成ツール v2.1 (バグ修正版)")
+print("   当直スケジュール自動生成ツール v2.2 (ハード制約修正版)")
 print("="*60)
-print("\n【主な修正内容】")
+print("\n【v2.2の修正内容】")
+print("🔧 ハード制約違反の修正")
+print("  - 可否コード0（絶対不可）の厳格化")
+print("  - カテ表がある日の外病院（H〜U列）割当を絶対禁止に")
+print("  - 可否コード2/3の制約を厳格化")
+print("  - 診断シートにハード制約違反チェックを追加")
+print("\n【過去の修正内容】")
 print("✅ タイムゾーン問題の修正")
 print("✅ 医師名の正規化（空白による制約ミスを防止）")
 print("✅ sheet4ヘッダ検出範囲の拡大（30→50行）")
@@ -553,10 +565,14 @@ def choose_doctor_for_slot(
             if not allow_same_day and date in assigned_dates[doc]:
                 continue
 
+            code = get_avail_code(date, doc)
+
+            # ★ ハード制約1: コード0は絶対に緩和しない
+            if code == 0:
+                continue
+
+            # コード2/3のチェック（relax_availability=Trueで緩和可能）
             if not relax_availability:
-                code = get_avail_code(date, doc)
-                if code == 0:
-                    continue
                 # 2 -> B〜M列以外ダメ
                 if code == 2 and not (B_COL_INDEX <= idx <= M_COL_INDEX):
                     continue
@@ -564,14 +580,17 @@ def choose_doctor_for_slot(
                 if code == 3 and not (H_COL_INDEX <= idx <= U_COL_INDEX):
                     continue
 
-            if not relax_schedule and H_COL_INDEX <= idx <= U_COL_INDEX:
+            # ★ ハード制約2: カテ表あり→H〜U列不可（絶対に緩和しない）
+            if H_COL_INDEX <= idx <= U_COL_INDEX:
                 if get_sched_code(date, doc):
                     continue
 
+            # ソフト制約: B〜K列はカテ表コードが必要（relax_scheduleで緩和可能）
             if not relax_schedule and B_COL_INDEX <= idx <= B_K_END_INDEX:
                 if not get_sched_code(date, doc):
                     continue
 
+            # ★ ハード制約3: 水曜日のH〜U列禁止医師
             if not relax_wed and dow == 2 and H_COL_INDEX <= idx <= U_COL_INDEX:
                 if doc in WED_FORBIDDEN_DOCTORS:
                     continue
@@ -1441,6 +1460,100 @@ def build_metrics_df(score_clamped, raw_score, metrics):
     row = {"score": float(score_clamped), "raw_score": float(raw_score), **metrics}
     return pd.DataFrame([row])
 
+def build_hard_constraint_violations(pattern_df):
+    """ハード制約違反の詳細リストを生成"""
+    rows = []
+
+    for ridx in pattern_df.index:
+        date = pattern_df.at[ridx, date_col_shift]
+        if pd.isna(date):
+            continue
+        date = pd.to_datetime(date).normalize().tz_localize(None)
+        dow = date.weekday()
+
+        for hosp in hospital_cols:
+            val = pattern_df.at[ridx, hosp]
+            if not isinstance(val, str):
+                continue
+            doc = normalize_name(val)
+            if doc not in doctor_names:
+                continue
+
+            idx = shift_df.columns.get_loc(hosp)
+            code = get_avail_code(date, doc)
+            sched_code = get_sched_code(date, doc)
+
+            # 違反1: 可否コード0
+            if code == 0:
+                rows.append({
+                    "違反種別": "可否コード0違反",
+                    "日付": date,
+                    "医師名": doc,
+                    "病院": hosp,
+                    "列番号": idx,
+                    "可否コード": code,
+                    "カテ表": sched_code if sched_code else "",
+                    "詳細": "コード0（不可）の日に割当",
+                })
+
+            # 違反2: 可否コード2違反（N〜U列に割当）
+            N_COL_INDEX = min(13, n_cols - 1)
+            if code == 2 and not (B_COL_INDEX <= idx <= M_COL_INDEX):
+                rows.append({
+                    "違反種別": "可否コード2違反",
+                    "日付": date,
+                    "医師名": doc,
+                    "病院": hosp,
+                    "列番号": idx,
+                    "可否コード": code,
+                    "カテ表": sched_code if sched_code else "",
+                    "詳細": f"コード2はB〜M列のみ可。列{idx}に割当",
+                })
+
+            # 違反3: 可否コード3違反（B〜G列に割当）
+            if code == 3 and not (H_COL_INDEX <= idx <= U_COL_INDEX):
+                rows.append({
+                    "違反種別": "可否コード3違反",
+                    "日付": date,
+                    "医師名": doc,
+                    "病院": hosp,
+                    "列番号": idx,
+                    "可否コード": code,
+                    "カテ表": sched_code if sched_code else "",
+                    "詳細": f"コード3はH〜U列のみ可。列{idx}に割当",
+                })
+
+            # 違反4: カテ表あり＋H〜U列違反
+            if H_COL_INDEX <= idx <= U_COL_INDEX and sched_code:
+                rows.append({
+                    "違反種別": "カテ表+外病院違反",
+                    "日付": date,
+                    "医師名": doc,
+                    "病院": hosp,
+                    "列番号": idx,
+                    "可否コード": code,
+                    "カテ表": sched_code,
+                    "詳細": f"カテ表（{sched_code}）がある日に外病院（列{idx}）に割当",
+                })
+
+            # 違反5: 水曜日H〜U列禁止医師
+            if dow == 2 and H_COL_INDEX <= idx <= U_COL_INDEX and doc in WED_FORBIDDEN_DOCTORS:
+                rows.append({
+                    "違反種別": "水曜日H〜U列禁止違反",
+                    "日付": date,
+                    "医師名": doc,
+                    "病院": hosp,
+                    "列番号": idx,
+                    "可否コード": code,
+                    "カテ表": sched_code if sched_code else "",
+                    "詳細": f"{doc}は水曜日のH〜U列禁止",
+                })
+
+    cols = ["違反種別", "日付", "医師名", "病院", "列番号", "可否コード", "カテ表", "詳細"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(rows)[cols].sort_values(["違反種別", "日付", "医師名"]).reset_index(drop=True)
+
 def build_diagnostics(pattern_df):
     counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(pattern_df)
     score, raw, metrics = evaluate_schedule_with_raw(
@@ -1460,8 +1573,9 @@ def build_diagnostics(pattern_df):
     df_hdup = build_hosp_dup_details(assigned_hosp_count)
     df_unass = build_unassigned_details(unassigned)
     df_metrics = build_metrics_df(score, raw, metrics)
+    df_hard_violations = build_hard_constraint_violations(pattern_df)
 
-    return df_doctors, df_gap, df_same, df_hdup, df_unass, df_metrics
+    return df_doctors, df_gap, df_same, df_hdup, df_unass, df_metrics, df_hard_violations
 
 # =========================
 # パターン探索（greedy → top候補に局所探索 → top3）
@@ -1573,7 +1687,7 @@ for rank, pattern in enumerate(top_patterns, 1):
 # 出力（pattern + summary + diagnostics）
 # =========================
 base_name = uploaded_filename.rsplit(".", 1)[0]
-output_filename = f"{base_name}_auto_schedules_v2.1.xlsx"
+output_filename = f"{base_name}_auto_schedules_v2.2.xlsx"
 output_path = output_filename
 
 print(f"\n📝 結果をExcelファイルに出力中...")
@@ -1606,11 +1720,12 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         df_total.to_excel(writer, sheet_name=f"{sheet_label}_累計", index=False)
 
         # diagnostics
-        df_doctors, df_gap, df_same, df_hdup, df_unass, df_metrics = build_diagnostics(entry["pattern_df"])
+        df_doctors, df_gap, df_same, df_hdup, df_unass, df_metrics, df_hard_violations = build_diagnostics(entry["pattern_df"])
         write_diagnostics_sheet(
             writer,
             sheet_name=f"{sheet_label}_diag",
             diagnostics=[
+                ("🚨 ハード制約違反", df_hard_violations),
                 ("医師ごとの偏り", df_doctors),
                 ("gap違反", df_gap),
                 ("同日重複", df_same),
@@ -1628,8 +1743,12 @@ print("\n【ファイル内容】")
 print("  - sheet1〜4: 元データ")
 print("  - pattern_01: TOPスケジュール")
 print("  - pattern_01_今月/累計: サマリーシート")
-print("  - pattern_01_diag: 診断シート（gap違反、重複等）")
+print("  - pattern_01_diag: 診断シート（ハード制約違反、gap違反、重複等）")
 print("\n【推奨】")
+print("  🚨 重要: pattern_01_diagの「ハード制約違反」を最優先で確認")
+print("    - 可否コード0違反（絶対不可の日に割当）")
+print("    - カテ表+外病院違反（カテ表がある日に外病院）")
+print("    - 可否コード2/3違反")
 print("  1. pattern_01_diag: gap違反・重複・未割当を確認")
 print("  2. pattern_01_今月/累計: 医師ごとの偏りを確認")
 print("="*60)
