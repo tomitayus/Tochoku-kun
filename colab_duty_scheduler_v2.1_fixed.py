@@ -1,5 +1,8 @@
-# @title 当直くん v2.2 (ハード制約違反修正版)
+# @title 当直くん v2.3 (ハード制約違反修正版)
 # 修正内容:
+# v2.3 (2026-01-21):
+# - B〜K列のカテ表要件をハード制約に変更（relax_scheduleで緩和不可）
+# - B〜K列カテ表コード欠如違反の検出機能を追加
 # v2.2 (2026-01-21):
 # - ハード制約違反の修正（可否コード0、カテ表+外病院、コード2/3違反）
 # - collect_candidates関数でコード0を常に除外するよう修正
@@ -163,8 +166,13 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直スケジュール自動生成ツール v2.2 (ハード制約修正版)")
+print("   当直スケジュール自動生成ツール v2.3 (ハード制約修正版)")
 print("="*60)
+print("\n【v2.3の修正内容】")
+print("🔧 B〜K列（大学系）のカテ表要件をハード制約に変更")
+print("  - B〜K列への割当には必ずカテ表コード（A,B,C,CC,D,E等）が必要")
+print("  - relax_scheduleで緩和不可に変更")
+print("  - 診断シートにB-K列カテ表コード欠如違反の検出を追加")
 print("\n【v2.2の修正内容】")
 print("🔧 ハード制約違反の修正")
 print("  - 可否コード0（絶対不可）の厳格化")
@@ -585,8 +593,8 @@ def choose_doctor_for_slot(
                 if get_sched_code(date, doc):
                     continue
 
-            # ソフト制約: B〜K列はカテ表コードが必要（relax_scheduleで緩和可能）
-            if not relax_schedule and B_COL_INDEX <= idx <= B_K_END_INDEX:
+            # ★ ハード制約3: B〜K列はカテ表コードが必要（絶対に緩和しない）
+            if B_COL_INDEX <= idx <= B_K_END_INDEX:
                 if not get_sched_code(date, doc):
                     continue
 
@@ -1536,7 +1544,20 @@ def build_hard_constraint_violations(pattern_df):
                     "詳細": f"カテ表（{sched_code}）がある日に外病院（列{idx}）に割当",
                 })
 
-            # 違反5: 水曜日H〜U列禁止医師
+            # 違反5: B〜K列でカテ表コードなし
+            if B_COL_INDEX <= idx <= B_K_END_INDEX and not sched_code:
+                rows.append({
+                    "違反種別": "B-K列カテ表コード欠如",
+                    "日付": date,
+                    "医師名": doc,
+                    "病院": hosp,
+                    "列番号": idx,
+                    "可否コード": code,
+                    "カテ表": "",
+                    "詳細": f"B〜K列（大学系）の割当にカテ表コードが必要。列{idx}に割当",
+                })
+
+            # 違反6: 水曜日H〜U列禁止医師
             if dow == 2 and H_COL_INDEX <= idx <= U_COL_INDEX and doc in WED_FORBIDDEN_DOCTORS:
                 rows.append({
                     "違反種別": "水曜日H〜U列禁止違反",
@@ -1687,7 +1708,7 @@ for rank, pattern in enumerate(top_patterns, 1):
 # 出力（pattern + summary + diagnostics）
 # =========================
 base_name = uploaded_filename.rsplit(".", 1)[0]
-output_filename = f"{base_name}_auto_schedules_v2.2.xlsx"
+output_filename = f"{base_name}_auto_schedules_v2.3.xlsx"
 output_path = output_filename
 
 print(f"\n📝 結果をExcelファイルに出力中...")
@@ -1749,6 +1770,7 @@ print("  🚨 重要: pattern_01_diagの「ハード制約違反」を最優先�
 print("    - 可否コード0違反（絶対不可の日に割当）")
 print("    - カテ表+外病院違反（カテ表がある日に外病院）")
 print("    - 可否コード2/3違反")
+print("    - B-K列カテ表コード欠如（大学系にカテ表コードなしで割当）")
 print("  1. pattern_01_diag: gap違反・重複・未割当を確認")
 print("  2. pattern_01_今月/累計: 医師ごとの偏りを確認")
 print("="*60)
