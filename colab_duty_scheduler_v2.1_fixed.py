@@ -568,6 +568,10 @@ def choose_doctor_for_slot(
                 if get_sched_code(date, doc):
                     continue
 
+            if not relax_schedule and B_COL_INDEX <= idx <= B_K_END_INDEX:
+                if not get_sched_code(date, doc):
+                    continue
+
             if not relax_wed and dow == 2 and H_COL_INDEX <= idx <= U_COL_INDEX:
                 if doc in WED_FORBIDDEN_DOCTORS:
                     continue
