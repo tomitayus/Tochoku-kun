@@ -3,6 +3,7 @@
 # v2.3 (2026-01-21):
 # - B〜K列のカテ表要件をハード制約に変更（relax_scheduleで緩和不可）
 # - B〜K列カテ表コード欠如違反の検出機能を追加
+# - can_assign_doc_to_slot関数にB〜K列カテ表チェックを追加（局所探索でも適用）
 # v2.2 (2026-01-21):
 # - ハード制約違反の修正（可否コード0、カテ表+外病院、コード2/3違反）
 # - collect_candidates関数でコード0を常に除外するよう修正
@@ -171,7 +172,7 @@ print("="*60)
 print("\n【v2.3の修正内容】")
 print("🔧 B〜K列（大学系）のカテ表要件をハード制約に変更")
 print("  - B〜K列への割当には必ずカテ表コード（A,B,C,CC,D,E等）が必要")
-print("  - relax_scheduleで緩和不可に変更")
+print("  - Greedy段階とローカル探索段階の両方で適用")
 print("  - 診断シートにB-K列カテ表コード欠如違反の検出を追加")
 print("\n【v2.2の修正内容】")
 print("🔧 ハード制約違反の修正")
@@ -1068,9 +1069,15 @@ def can_assign_doc_to_slot(doc, date, hosp):
         return False
     if code == 3 and not (H_COL_INDEX <= idx <= U_COL_INDEX):
         return False
+    # カテ表あり → H〜U列不可
     if H_COL_INDEX <= idx <= U_COL_INDEX:
         if get_sched_code(date, doc):
             return False
+    # B〜K列はカテ表コードが必要
+    if B_COL_INDEX <= idx <= B_K_END_INDEX:
+        if not get_sched_code(date, doc):
+            return False
+    # 水曜日H〜U列禁止医師
     if dow == 2 and H_COL_INDEX <= idx <= U_COL_INDEX and doc in WED_FORBIDDEN_DOCTORS:
         return False
     return True
