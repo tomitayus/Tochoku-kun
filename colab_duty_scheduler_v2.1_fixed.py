@@ -1,5 +1,12 @@
-# @title 当直くん v2.3 (ハード制約違反修正版)
+# @title 当直くん v2.4 (列構造変更対応版)
 # 修正内容:
+# v2.4 (2026-01-21):
+# - 列構造の変更対応（B〜Y列）
+#   - 可否コード2: B〜Q列のみ可（従来B〜M列）
+#   - 可否コード3: L〜Y列のみ可（従来H〜U列）
+#   - カテ表制約: L〜Y列禁止（従来H〜U列）
+# - B〜H列の2回上限制約を実装
+# - 診断シートにB〜H列2回超過違反検出を追加
 # v2.3 (2026-01-21):
 # - B〜K列のカテ表要件をハード制約に変更（relax_scheduleで緩和不可）
 # - B〜K列カテ表コード欠如違反の検出機能を追加
@@ -167,19 +174,19 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直スケジュール自動生成ツール v2.3 (ハード制約修正版)")
+print("   当直スケジュール自動生成ツール v2.4 (列構造変更対応版)")
 print("="*60)
+print("\n【v2.4の修正内容】")
+print("🔧 列構造の変更対応（B〜Y列）")
+print("  - 可否コード2: B〜Q列のみ可（従来B〜M列）")
+print("  - 可否コード3: L〜Y列のみ可（従来H〜U列）")
+print("  - カテ表制約: L〜Y列禁止（従来H〜U列）")
+print("  - B〜H列: 2回まで（新規制約）")
+print("  - 診断シートにB〜H列2回超過違反検出を追加")
 print("\n【v2.3の修正内容】")
 print("🔧 B〜K列（大学系）のカテ表要件をハード制約に変更")
-print("  - B〜K列への割当には必ずカテ表コード（A,B,C,CC,D,E等）が必要")
-print("  - Greedy段階とローカル探索段階の両方で適用")
-print("  - 診断シートにB-K列カテ表コード欠如違反の検出を追加")
 print("\n【v2.2の修正内容】")
-print("🔧 ハード制約違反の修正")
-print("  - 可否コード0（絶対不可）の厳格化")
-print("  - カテ表がある日の外病院（H〜U列）割当を絶対禁止に")
-print("  - 可否コード2/3の制約を厳格化")
-print("  - 診断シートにハード制約違反チェックを追加")
+print("🔧 ハード制約違反の修正（コード0、カテ表+外病院、コード2/3）")
 print("\n【過去の修正内容】")
 print("✅ タイムゾーン問題の修正")
 print("✅ 医師名の正規化（空白による制約ミスを防止）")
@@ -287,7 +294,7 @@ WED_FORBIDDEN_DOCTORS = {normalize_name(d) for d in WED_FORBIDDEN_DOCTORS}  # �
 hospital_cols = list(shift_df.columns[1:])
 n_cols = len(shift_df.columns)
 
-# 列インデックス（テンプレ依存：B〜U を想定）
+# 列インデックス（テンプレ依存：B〜Y を想定）
 B_COL_INDEX = 1
 C_COL_INDEX = 2
 D_COL_INDEX = min(3, n_cols - 1)
@@ -295,13 +302,24 @@ E_COL_INDEX = min(4, n_cols - 1)
 F_COL_INDEX = min(5, n_cols - 1)
 G_COL_INDEX = min(6, n_cols - 1)
 H_COL_INDEX = min(7, n_cols - 1)
+I_COL_INDEX = min(8, n_cols - 1)
+J_COL_INDEX = min(9, n_cols - 1)
+K_COL_INDEX = min(10, n_cols - 1)
+L_COL_INDEX = min(11, n_cols - 1)
 M_COL_INDEX = min(12, n_cols - 1)
+Q_COL_INDEX = min(16, n_cols - 1)
 U_COL_INDEX = min(20, n_cols - 1)
+Y_COL_INDEX = min(24, n_cols - 1)
 
-B_K_START_INDEX = B_COL_INDEX
-B_K_END_INDEX = min(10, n_cols - 1)
-L_Y_START_INDEX = min(11, n_cols - 1)
-L_Y_END_INDEX = n_cols - 1
+# 列範囲定義
+B_H_START_INDEX = B_COL_INDEX  # 大学系前半（2回まで）
+B_H_END_INDEX = H_COL_INDEX
+I_K_START_INDEX = I_COL_INDEX  # 大学系後半
+I_K_END_INDEX = K_COL_INDEX
+B_K_START_INDEX = B_COL_INDEX  # 大学系全体
+B_K_END_INDEX = K_COL_INDEX
+L_Y_START_INDEX = L_COL_INDEX  # 外病院
+L_Y_END_INDEX = min(Y_COL_INDEX, n_cols - 1)
 
 print(f"✅ Excelファイル読み込み完了")
 print(f"   医師数: {len(doctor_names)}人")
@@ -552,12 +570,14 @@ def choose_doctor_for_slot(
     assigned_fg,
     assigned_bk,
     assigned_ly,
+    assigned_bh,
     assigned_hosp_count,
 ):
     idx = shift_df.columns.get_loc(hospital_name)
     is_BE = B_COL_INDEX <= idx <= E_COL_INDEX
-    is_BG = B_COL_INDEX <= idx <= G_COL_INDEX
-    is_HU = H_COL_INDEX <= idx <= U_COL_INDEX
+    is_BG = B_COL_INDEX <= idx <= K_COL_INDEX
+    is_BH = B_H_START_INDEX <= idx <= B_H_END_INDEX
+    is_LY_range = L_COL_INDEX <= idx <= L_Y_END_INDEX
     is_BK = is_bk_slot(idx)
     is_LY = is_ly_slot(idx)
     dow = pd.to_datetime(date).weekday()
@@ -568,6 +588,7 @@ def choose_doctor_for_slot(
         relax_availability=False,
         relax_schedule=False,
         relax_wed=False,
+        relax_bh_limit=False,
     ):
         candidates = []
         for doc in doctor_names:
@@ -582,15 +603,15 @@ def choose_doctor_for_slot(
 
             # コード2/3のチェック（relax_availability=Trueで緩和可能）
             if not relax_availability:
-                # 2 -> B〜M列以外ダメ
-                if code == 2 and not (B_COL_INDEX <= idx <= M_COL_INDEX):
+                # 2 -> B〜Q列以外ダメ
+                if code == 2 and not (B_COL_INDEX <= idx <= Q_COL_INDEX):
                     continue
-                # 3 -> H〜U列以外ダメ
-                if code == 3 and not (H_COL_INDEX <= idx <= U_COL_INDEX):
+                # 3 -> L〜Y列以外ダメ
+                if code == 3 and not (L_COL_INDEX <= idx <= L_Y_END_INDEX):
                     continue
 
-            # ★ ハード制約2: カテ表あり→H〜U列不可（絶対に緩和しない）
-            if H_COL_INDEX <= idx <= U_COL_INDEX:
+            # ★ ハード制約2: カテ表あり→L〜Y列不可（絶対に緩和しない）
+            if L_COL_INDEX <= idx <= L_Y_END_INDEX:
                 if get_sched_code(date, doc):
                     continue
 
@@ -599,8 +620,12 @@ def choose_doctor_for_slot(
                 if not get_sched_code(date, doc):
                     continue
 
-            # ★ ハード制約3: 水曜日のH〜U列禁止医師
-            if not relax_wed and dow == 2 and H_COL_INDEX <= idx <= U_COL_INDEX:
+            # ★ ハード制約4: B〜H列は2回まで（relax_bh_limitで緩和可能）
+            if not relax_bh_limit and is_BH and assigned_bh[doc] >= 2:
+                continue
+
+            # 水曜日L〜Y列禁止医師
+            if not relax_wed and dow == 2 and is_LY_range:
                 if doc in WED_FORBIDDEN_DOCTORS:
                     continue
 
@@ -616,11 +641,14 @@ def choose_doctor_for_slot(
     if not candidates:
         candidates = collect_candidates(allow_same_day=True, relax_availability=True)
     if not candidates:
+        candidates = collect_candidates(allow_same_day=True, relax_availability=True, relax_bh_limit=True)
+    if not candidates:
         candidates = collect_candidates(
             allow_same_day=True,
             relax_availability=True,
             relax_schedule=True,
             relax_wed=True,
+            relax_bh_limit=True,
         )
 
     if not candidates:
@@ -652,7 +680,7 @@ def choose_doctor_for_slot(
         metric_bg = {d: prev_bg[d] + assigned_bg[d] for d in candidates}
         mb = min(metric_bg.values())
         candidates = [d for d in candidates if metric_bg[d] == mb]
-    elif is_HU:
+    elif is_LY_range:
         metric_ht = {d: prev_ht[d] + assigned_ht[d] for d in candidates}
         mh = min(metric_ht.values())
         candidates = [d for d in candidates if metric_ht[d] == mh]
@@ -738,6 +766,7 @@ def build_schedule_pattern(seed=0):
     assigned_fg = {d: 0 for d in doctor_names}
     assigned_bk = {d: 0 for d in doctor_names}
     assigned_ly = {d: 0 for d in doctor_names}
+    assigned_bh = {d: 0 for d in doctor_names}  # B〜H列の割当回数（2回まで）
     assigned_hosp_count = {d: defaultdict(int) for d in doctor_names}
     bg_cat = {d: defaultdict(int) for d in doctor_names}
 
@@ -750,15 +779,19 @@ def build_schedule_pattern(seed=0):
             assigned_hosp_count[doc][hosp] += 1
 
             hidx = shift_df.columns.get_loc(hosp)
-            if B_COL_INDEX <= hidx <= G_COL_INDEX:
+            if B_COL_INDEX <= hidx <= K_COL_INDEX:
                 assigned_bg[doc] += 1
                 if B_COL_INDEX <= hidx <= E_COL_INDEX:
                     assigned_be[doc] += 1
                 elif F_COL_INDEX <= hidx <= G_COL_INDEX:
                     assigned_fg[doc] += 1
                 bg_cat[doc][classify_bg_category(date, hosp)] += 1
-            elif H_COL_INDEX <= hidx <= U_COL_INDEX:
+            elif L_COL_INDEX <= hidx <= L_Y_END_INDEX:
                 assigned_ht[doc] += 1
+
+            # B〜H列のカウント
+            if B_H_START_INDEX <= hidx <= B_H_END_INDEX:
+                assigned_bh[doc] += 1
 
             dow = date.weekday()
             weekday = dow < 5
@@ -796,6 +829,7 @@ def build_schedule_pattern(seed=0):
                 assigned_fg=assigned_fg,
                 assigned_bk=assigned_bk,
                 assigned_ly=assigned_ly,
+                assigned_bh=assigned_bh,
                 assigned_hosp_count=assigned_hosp_count,
             )
             if chosen is None:
@@ -814,15 +848,19 @@ def build_schedule_pattern(seed=0):
             assigned_hosp_count[chosen][hosp] += 1
 
             hidx = shift_df.columns.get_loc(hosp)
-            if B_COL_INDEX <= hidx <= G_COL_INDEX:
+            if B_COL_INDEX <= hidx <= K_COL_INDEX:
                 assigned_bg[chosen] += 1
                 if B_COL_INDEX <= hidx <= E_COL_INDEX:
                     assigned_be[chosen] += 1
                 elif F_COL_INDEX <= hidx <= G_COL_INDEX:
                     assigned_fg[chosen] += 1
                 bg_cat[chosen][classify_bg_category(date, hosp)] += 1
-            elif H_COL_INDEX <= hidx <= U_COL_INDEX:
+            elif L_COL_INDEX <= hidx <= L_Y_END_INDEX:
                 assigned_ht[chosen] += 1
+
+            # B〜H列のカウント
+            if B_H_START_INDEX <= hidx <= B_H_END_INDEX:
+                assigned_bh[chosen] += 1
 
             dow = date.weekday()
             weekday = dow < 5
@@ -1065,20 +1103,22 @@ def can_assign_doc_to_slot(doc, date, hosp):
     code = get_avail_code(date, doc)
     if code == 0:
         return False
-    if code == 2 and not (B_COL_INDEX <= idx <= M_COL_INDEX):
+    # 可否コード2 → B〜Q列のみ可
+    if code == 2 and not (B_COL_INDEX <= idx <= Q_COL_INDEX):
         return False
-    if code == 3 and not (H_COL_INDEX <= idx <= U_COL_INDEX):
+    # 可否コード3 → L〜Y列のみ可
+    if code == 3 and not (L_COL_INDEX <= idx <= L_Y_END_INDEX):
         return False
-    # カテ表あり → H〜U列不可
-    if H_COL_INDEX <= idx <= U_COL_INDEX:
+    # カテ表あり → L〜Y列不可
+    if L_COL_INDEX <= idx <= L_Y_END_INDEX:
         if get_sched_code(date, doc):
             return False
     # B〜K列はカテ表コードが必要
     if B_COL_INDEX <= idx <= B_K_END_INDEX:
         if not get_sched_code(date, doc):
             return False
-    # 水曜日H〜U列禁止医師
-    if dow == 2 and H_COL_INDEX <= idx <= U_COL_INDEX and doc in WED_FORBIDDEN_DOCTORS:
+    # 水曜日L〜Y列禁止医師
+    if dow == 2 and L_COL_INDEX <= idx <= L_Y_END_INDEX and doc in WED_FORBIDDEN_DOCTORS:
         return False
     return True
 
@@ -1511,9 +1551,8 @@ def build_hard_constraint_violations(pattern_df):
                     "詳細": "コード0（不可）の日に割当",
                 })
 
-            # 違反2: 可否コード2違反（N〜U列に割当）
-            N_COL_INDEX = min(13, n_cols - 1)
-            if code == 2 and not (B_COL_INDEX <= idx <= M_COL_INDEX):
+            # 違反2: 可否コード2違反（Q列より後に割当）
+            if code == 2 and not (B_COL_INDEX <= idx <= Q_COL_INDEX):
                 rows.append({
                     "違反種別": "可否コード2違反",
                     "日付": date,
@@ -1522,11 +1561,11 @@ def build_hard_constraint_violations(pattern_df):
                     "列番号": idx,
                     "可否コード": code,
                     "カテ表": sched_code if sched_code else "",
-                    "詳細": f"コード2はB〜M列のみ可。列{idx}に割当",
+                    "詳細": f"コード2はB〜Q列のみ可。列{idx}に割当",
                 })
 
-            # 違反3: 可否コード3違反（B〜G列に割当）
-            if code == 3 and not (H_COL_INDEX <= idx <= U_COL_INDEX):
+            # 違反3: 可否コード3違反（L〜Y列以外に割当）
+            if code == 3 and not (L_COL_INDEX <= idx <= L_Y_END_INDEX):
                 rows.append({
                     "違反種別": "可否コード3違反",
                     "日付": date,
@@ -1535,11 +1574,11 @@ def build_hard_constraint_violations(pattern_df):
                     "列番号": idx,
                     "可否コード": code,
                     "カテ表": sched_code if sched_code else "",
-                    "詳細": f"コード3はH〜U列のみ可。列{idx}に割当",
+                    "詳細": f"コード3はL〜Y列のみ可。列{idx}に割当",
                 })
 
-            # 違反4: カテ表あり＋H〜U列違反
-            if H_COL_INDEX <= idx <= U_COL_INDEX and sched_code:
+            # 違反4: カテ表あり＋L〜Y列違反
+            if L_COL_INDEX <= idx <= L_Y_END_INDEX and sched_code:
                 rows.append({
                     "違反種別": "カテ表+外病院違反",
                     "日付": date,
@@ -1564,17 +1603,54 @@ def build_hard_constraint_violations(pattern_df):
                     "詳細": f"B〜K列（大学系）の割当にカテ表コードが必要。列{idx}に割当",
                 })
 
-            # 違反6: 水曜日H〜U列禁止医師
-            if dow == 2 and H_COL_INDEX <= idx <= U_COL_INDEX and doc in WED_FORBIDDEN_DOCTORS:
+            # 違反6: 水曜日L〜Y列禁止医師
+            if dow == 2 and L_COL_INDEX <= idx <= L_Y_END_INDEX and doc in WED_FORBIDDEN_DOCTORS:
                 rows.append({
-                    "違反種別": "水曜日H〜U列禁止違反",
+                    "違反種別": "水曜日L〜Y列禁止違反",
                     "日付": date,
                     "医師名": doc,
                     "病院": hosp,
                     "列番号": idx,
                     "可否コード": code,
                     "カテ表": sched_code if sched_code else "",
-                    "詳細": f"{doc}は水曜日のH〜U列禁止",
+                    "詳細": f"{doc}は水曜日のL〜Y列禁止",
+                })
+
+    # B〜H列の2回超過違反をチェック
+    bh_counts = defaultdict(list)
+    for ridx in pattern_df.index:
+        date = pattern_df.at[ridx, date_col_shift]
+        if pd.isna(date):
+            continue
+        date = pd.to_datetime(date).normalize().tz_localize(None)
+
+        for hosp in hospital_cols:
+            val = pattern_df.at[ridx, hosp]
+            if not isinstance(val, str):
+                continue
+            doc = normalize_name(val)
+            if doc not in doctor_names:
+                continue
+
+            idx = shift_df.columns.get_loc(hosp)
+            if B_H_START_INDEX <= idx <= B_H_END_INDEX:
+                bh_counts[doc].append((date, hosp, idx))
+
+    # 違反7: B〜H列が2回超過
+    for doc, assignments in bh_counts.items():
+        if len(assignments) > 2:
+            for date, hosp, idx in assignments[2:]:  # 3回目以降
+                code = get_avail_code(date, doc)
+                sched_code = get_sched_code(date, doc)
+                rows.append({
+                    "違反種別": "B-H列2回超過違反",
+                    "日付": date,
+                    "医師名": doc,
+                    "病院": hosp,
+                    "列番号": idx,
+                    "可否コード": code,
+                    "カテ表": sched_code if sched_code else "",
+                    "詳細": f"B〜H列は2回まで。{len(assignments)}回目の割当",
                 })
 
     cols = ["違反種別", "日付", "医師名", "病院", "列番号", "可否コード", "カテ表", "詳細"]
@@ -1715,7 +1791,7 @@ for rank, pattern in enumerate(top_patterns, 1):
 # 出力（pattern + summary + diagnostics）
 # =========================
 base_name = uploaded_filename.rsplit(".", 1)[0]
-output_filename = f"{base_name}_auto_schedules_v2.3.xlsx"
+output_filename = f"{base_name}_auto_schedules_v2.4.xlsx"
 output_path = output_filename
 
 print(f"\n📝 結果をExcelファイルに出力中...")
@@ -1775,9 +1851,11 @@ print("  - pattern_01_diag: 診断シート（ハード制約違反、gap違反�
 print("\n【推奨】")
 print("  🚨 重要: pattern_01_diagの「ハード制約違反」を最優先で確認")
 print("    - 可否コード0違反（絶対不可の日に割当）")
-print("    - カテ表+外病院違反（カテ表がある日に外病院）")
-print("    - 可否コード2/3違反")
+print("    - カテ表+外病院違反（カテ表がある日にL〜Y列）")
+print("    - 可否コード2違反（B〜Q列以外に割当）")
+print("    - 可否コード3違反（L〜Y列以外に割当）")
 print("    - B-K列カテ表コード欠如（大学系にカテ表コードなしで割当）")
+print("    - B-H列2回超過違反（B〜H列に3回以上割当）")
 print("  1. pattern_01_diag: gap違反・重複・未割当を確認")
 print("  2. pattern_01_今月/累計: 医師ごとの偏りを確認")
 print("="*60)
