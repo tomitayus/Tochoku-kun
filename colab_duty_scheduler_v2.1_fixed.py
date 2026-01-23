@@ -7,23 +7,36 @@
 # - 同日重複チェックの強化
 # - エラーハンドリングの改善
 
-from google.colab import files
 import io
 import pandas as pd
 import numpy as np
 from collections import defaultdict
 import random
+import importlib.util
+import os
+
+COLAB_AVAILABLE = (
+    importlib.util.find_spec("google") is not None
+    and importlib.util.find_spec("google.colab") is not None
+)
+if COLAB_AVAILABLE:
+    from google.colab import files
 
 # =========================
-# ユーザー設定
+# @title ユーザー設定
 # =========================
+# @markdown **入力方法（Colab）**  
+# @markdown - `INPUT_MODE = "upload"`: ファイルをアップロード  
+# @markdown - `INPUT_MODE = "path"`: 指定パスのExcelを読み込み
+INPUT_MODE = "upload"
+INPUT_EXCEL_PATH = "/content/Tochoku.ver9_2026.01.xlsx"
 HOLIDAYS = set()  # 祝日を入れるならここ（例: {pd.Timestamp("2026-01-01"), ...}）
 BG_DAY_COLS = set()    # 列名で「昼」固定したい大学枠があれば追加
 BG_NIGHT_COLS = set()  # 列名で「夜」固定したい大学枠があれば追加
 
 WED_FORBIDDEN_DOCTORS = {'金城', '山田', '野寺'}  # 水曜の H〜U を禁止したい医師
 
-NUM_PATTERNS = 10000  # 100/1000/10000 など
+NUM_PATTERNS = int(os.getenv("NUM_PATTERNS", "10000"))  # 100/1000/10000 など
 
 # sheet1 の「枠」扱いする入力値（1以外の記号も許容したい場合）
 SLOT_MARKERS = {1, 1.0, "1", "〇", "○", "◯", "◎"}
@@ -46,6 +59,7 @@ W_BG_SPREAD = 3            # 大学合計（累計）ばらつき
 W_HT_SPREAD = 3            # 外病院合計（累計）ばらつき
 W_WD_SPREAD = 2            # 平日（累計）ばらつき
 W_WE_SPREAD = 3            # 休日合計（累計）ばらつき
+W_BK_LY_BALANCE = 2        # B-K/L-Y の比率バランス（なるべく1:1）
 
 # =========================
 # ユーティリティ
@@ -145,7 +159,7 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
     return data
 
 # =========================
-# 入力ファイルのアップロード
+# @title 入力ファイルの読み込み
 # =========================
 print("="*60)
 print("   当直スケジュール自動生成ツール v2.1 (バグ修正版)")
@@ -164,38 +178,68 @@ print("3. 完了したらダウンロードリンクが表示されます")
 print("="*60)
 print("\nsheet1〜sheet4（またはSheet4）が入った当直Excelファイルを選択してください")
 
-uploaded = files.upload()
-uploaded_filename = list(uploaded.keys())[0]
+if COLAB_AVAILABLE:
+    if INPUT_MODE == "upload":
+        uploaded = files.upload()
+        uploaded_filename = list(uploaded.keys())[0]
+        try:
+            xls = pd.ExcelFile(io.BytesIO(uploaded[uploaded_filename]))
+        except Exception as e:
+            raise ValueError(f"❌ Excelファイルの読み込みに失敗しました: {e}")
+    else:
+        uploaded_filename = os.path.basename(INPUT_EXCEL_PATH)
+        try:
+            xls = pd.ExcelFile(INPUT_EXCEL_PATH)
+        except Exception as e:
+            raise ValueError(f"❌ Excelファイルの読み込みに失敗しました: {e}")
 
-try:
-    xls = pd.ExcelFile(io.BytesIO(uploaded[uploaded_filename]))
-except Exception as e:
-    raise ValueError(f"❌ Excelファイルの読み込みに失敗しました: {e}")
+    sheet1_name = find_sheet_name(xls, "sheet1")
+    sheet2_name = find_sheet_name(xls, "sheet2")
+    sheet3_name = find_sheet_name(xls, "sheet3")
+    sheet4_name = find_sheet_name(xls, "sheet4") or find_sheet_name(xls, "Sheet4")
 
-sheet1_name = find_sheet_name(xls, "sheet1")
-sheet2_name = find_sheet_name(xls, "sheet2")
-sheet3_name = find_sheet_name(xls, "sheet3")
-sheet4_name = find_sheet_name(xls, "sheet4") or find_sheet_name(xls, "Sheet4")
+    missing = [k for k, v in [("sheet1", sheet1_name), ("sheet2", sheet2_name), ("sheet3", sheet3_name), ("sheet4", sheet4_name)] if v is None]
+    if missing:
+        raise ValueError(f"❌ 必要なシートが見つかりません: {missing}\n実際のシート名: {xls.sheet_names}")
 
-missing = [k for k, v in [("sheet1", sheet1_name), ("sheet2", sheet2_name), ("sheet3", sheet3_name), ("sheet4", sheet4_name)] if v is None]
-if missing:
-    raise ValueError(f"❌ 必要なシートが見つかりません: {missing}\n実際のシート名: {xls.sheet_names}")
+    # --------- Excel 読み込み ---------
+    shift_df = strip_cols(pd.read_excel(xls, sheet_name=sheet1_name))
+    availability_raw = strip_cols(pd.read_excel(xls, sheet_name=sheet2_name))
+    schedule_raw = strip_cols(pd.read_excel(xls, sheet_name=sheet3_name))
 
-# --------- Excel 読み込み ---------
-shift_df = strip_cols(pd.read_excel(xls, sheet_name=sheet1_name))
-availability_raw = strip_cols(pd.read_excel(xls, sheet_name=sheet2_name))
-schedule_raw = strip_cols(pd.read_excel(xls, sheet_name=sheet3_name))
+    shift_df.columns = make_unique(list(shift_df.columns))
+    availability_raw.columns = make_unique(list(availability_raw.columns))
+    schedule_raw.columns = make_unique(list(schedule_raw.columns))
 
-shift_df.columns = make_unique(list(shift_df.columns))
-availability_raw.columns = make_unique(list(availability_raw.columns))
-schedule_raw.columns = make_unique(list(schedule_raw.columns))
+    # sheet4 は「出力用」と「解析用（header=None）」を分ける
+    sheet4_raw_out = strip_cols(pd.read_excel(xls, sheet_name=sheet4_name))
+    sheet4_raw_out.columns = make_unique(list(sheet4_raw_out.columns))
 
-# sheet4 は「出力用」と「解析用（header=None）」を分ける
-sheet4_raw_out = strip_cols(pd.read_excel(xls, sheet_name=sheet4_name))
-sheet4_raw_out.columns = make_unique(list(sheet4_raw_out.columns))
+    sheet4_grid = pd.read_excel(xls, sheet_name=sheet4_name, header=None)
+    sheet4_data = parse_sheet4_from_grid(sheet4_grid)
+else:
+    from tochoku_data_complete import DATA as LOCAL_DATA
 
-sheet4_grid = pd.read_excel(xls, sheet_name=sheet4_name, header=None)
-sheet4_data = parse_sheet4_from_grid(sheet4_grid)
+    uploaded_filename = "Tochoku.local.xlsx"
+    shift_df = strip_cols(pd.DataFrame(LOCAL_DATA["sheet1"]))
+    availability_raw = strip_cols(pd.DataFrame(LOCAL_DATA["sheet2"]))
+    schedule_raw = strip_cols(pd.DataFrame(LOCAL_DATA["sheet3"]))
+
+    shift_df.columns = make_unique(list(shift_df.columns))
+    availability_raw.columns = make_unique(list(availability_raw.columns))
+    schedule_raw.columns = make_unique(list(schedule_raw.columns))
+
+    sheet4_raw_out = strip_cols(pd.DataFrame(LOCAL_DATA["Sheet4"]))
+    sheet4_raw_out.columns = make_unique(list(sheet4_raw_out.columns))
+
+    sheet4_data = sheet4_raw_out.copy()
+    if "氏名" not in sheet4_data.columns:
+        raise ValueError("❌ Sheet4 の '氏名' 列が見つかりません（ローカルデータを確認してください）")
+    sheet4_data["氏名"] = sheet4_data["氏名"].astype(str).str.strip()
+    for col in sheet4_data.columns:
+        if col == "氏名":
+            continue
+        sheet4_data[col] = pd.to_numeric(sheet4_data[col], errors="coerce").fillna(0)
 
 # =========================
 # 日付列の整形
@@ -243,6 +287,11 @@ G_COL_INDEX = min(6, n_cols - 1)
 H_COL_INDEX = min(7, n_cols - 1)
 M_COL_INDEX = min(12, n_cols - 1)
 U_COL_INDEX = min(20, n_cols - 1)
+
+B_K_START_INDEX = B_COL_INDEX
+B_K_END_INDEX = min(10, n_cols - 1)
+L_Y_START_INDEX = min(11, n_cols - 1)
+L_Y_END_INDEX = n_cols - 1
 
 print(f"✅ Excelファイル読み込み完了")
 print(f"   医師数: {len(doctor_names)}人")
@@ -384,7 +433,7 @@ all_dates = sorted(slots_by_date.keys())
 all_shift_dates = sorted(pd.to_datetime(shift_df[date_col_shift].dropna()).dt.normalize().dt.tz_localize(None).unique())  # 🔧 FIX
 
 # =========================
-# cap設計：3回ベース＋余りは右側から4回目
+# cap設計：n回ベース＋余りは「下の方（後ろ）」の医師に+1
 # =========================
 def is_always_unavailable(doc):
     if preassigned_count.get(doc, 0) > 0:
@@ -399,8 +448,8 @@ if len(active_doctors) == 0:
 BASE_TARGET = total_slots // len(active_doctors)
 EXTRA_SLOTS = total_slots - BASE_TARGET * len(active_doctors)
 
-active_sorted_right = sorted(active_doctors, key=lambda d: doctor_col_index[d], reverse=True)
-EXTRA_ALLOWED = set(active_sorted_right[:EXTRA_SLOTS])
+active_sorted_bottom = sorted(active_doctors, key=lambda d: doctor_col_index[d])
+EXTRA_ALLOWED = set(active_sorted_bottom[-EXTRA_SLOTS:]) if EXTRA_SLOTS > 0 else set()
 
 TARGET_CAP = {d: 0 for d in doctor_names}
 for d in active_doctors:
@@ -416,7 +465,20 @@ print(f"   全枠数: {total_slots}")
 print(f"   active医師: {len(active_doctors)}人")
 print(f"   inactive医師: {len(inactive_doctors)}人")
 print(f"   基本割当数: {BASE_TARGET}回")
-print(f"   余り枠: {EXTRA_SLOTS}枠（右側{EXTRA_SLOTS}人が+1回）")
+print(f"   余り枠: {EXTRA_SLOTS}枠（下の方の医師に+1回）")
+
+# =========================
+# B-K / L-Y 比率バランス（sheet3で「3」記載の医師は除外）
+# =========================
+def has_sheet3_code_3(doc):
+    if doc not in schedule_df.columns:
+        return False
+    values = schedule_df[doc].dropna()
+    return any(str(v).strip() == "3" for v in values)
+
+RATIO_EXEMPT_DOCTORS = {doc for doc in doctor_names if has_sheet3_code_3(doc)}
+if RATIO_EXEMPT_DOCTORS:
+    print(f"   比率バランス除外（sheet3に3あり）: {sorted(RATIO_EXEMPT_DOCTORS)}")
 
 # =========================
 # 大学(B〜G)の昼夜判定 & 7分類
@@ -433,6 +495,12 @@ def is_bg_day_shift(hosp_name, col_idx):
         return False
     mid = (B_COL_INDEX + G_COL_INDEX) // 2
     return col_idx <= mid
+
+def is_bk_slot(col_idx):
+    return B_K_START_INDEX <= col_idx <= B_K_END_INDEX
+
+def is_ly_slot(col_idx):
+    return L_Y_START_INDEX <= col_idx <= L_Y_END_INDEX
 
 def classify_bg_category(date, hosp_name):
     idx = shift_df.columns.get_loc(hosp_name)
@@ -470,49 +538,76 @@ def choose_doctor_for_slot(
     assigned_weekend,
     assigned_be,
     assigned_fg,
+    assigned_bk,
+    assigned_ly,
     assigned_hosp_count,
 ):
     idx = shift_df.columns.get_loc(hospital_name)
     is_BE = B_COL_INDEX <= idx <= E_COL_INDEX
     is_BG = B_COL_INDEX <= idx <= G_COL_INDEX
     is_HU = H_COL_INDEX <= idx <= U_COL_INDEX
+    is_BK = is_bk_slot(idx)
+    is_LY = is_ly_slot(idx)
     dow = pd.to_datetime(date).weekday()
     weekday = dow < 5
 
-    # ハード制約候補
-    base_candidates = []
-    for doc in doctor_names:
-        if date in assigned_dates[doc]:
-            continue
-
-        code = get_avail_code(date, doc)
-        if code == 0:
-            continue
-        # 2 -> B〜M列以外ダメ
-        if code == 2 and not (B_COL_INDEX <= idx <= M_COL_INDEX):
-            continue
-        # 3 -> H〜U列以外ダメ
-        if code == 3 and not (H_COL_INDEX <= idx <= U_COL_INDEX):
-            continue
-
-        # H〜U でカテ表ありは不可
-        if H_COL_INDEX <= idx <= U_COL_INDEX:
-            if get_sched_code(date, doc):
+    def collect_candidates(
+        allow_same_day=False,
+        relax_availability=False,
+        relax_schedule=False,
+        relax_wed=False,
+    ):
+        candidates = []
+        for doc in doctor_names:
+            if not allow_same_day and date in assigned_dates[doc]:
                 continue
 
-        # 水曜 H〜U 禁止
-        if dow == 2 and H_COL_INDEX <= idx <= U_COL_INDEX:
-            if doc in WED_FORBIDDEN_DOCTORS:
+            if not relax_availability:
+                code = get_avail_code(date, doc)
+                if code == 0:
+                    continue
+                # 2 -> B〜M列以外ダメ
+                if code == 2 and not (B_COL_INDEX <= idx <= M_COL_INDEX):
+                    continue
+                # 3 -> H〜U列以外ダメ
+                if code == 3 and not (H_COL_INDEX <= idx <= U_COL_INDEX):
+                    continue
+
+            if not relax_schedule and H_COL_INDEX <= idx <= U_COL_INDEX:
+                if get_sched_code(date, doc):
+                    continue
+
+            if not relax_wed and dow == 2 and H_COL_INDEX <= idx <= U_COL_INDEX:
+                if doc in WED_FORBIDDEN_DOCTORS:
+                    continue
+
+            if assigned_count[doc] >= TARGET_CAP.get(doc, 0):
                 continue
 
-        base_candidates.append(doc)
+            candidates.append(doc)
+        return candidates
 
-    if not base_candidates:
+    candidates = collect_candidates()
+    if not candidates:
+        candidates = collect_candidates(allow_same_day=True)
+    if not candidates:
+        candidates = collect_candidates(allow_same_day=True, relax_availability=True)
+    if not candidates:
+        candidates = collect_candidates(
+            allow_same_day=True,
+            relax_availability=True,
+            relax_schedule=True,
+            relax_wed=True,
+        )
+
+    if not candidates:
         return None
 
-    # cap未満だけ優先（埋まらない時だけcap破り）
-    cap_ok = [d for d in base_candidates if assigned_count[d] < TARGET_CAP.get(d, 0)]
-    candidates = cap_ok if cap_ok else base_candidates
+    any_under_floor = any(assigned_count[d] < floor_shifts for d in active_doctors)
+    if any_under_floor:
+        under_floor = [d for d in candidates if assigned_count[d] < floor_shifts]
+        if under_floor:
+            candidates = under_floor
 
     # gap
     gaps = {}
@@ -522,7 +617,7 @@ def choose_doctor_for_slot(
         else:
             gaps[d] = min(abs((pd.to_datetime(date) - x).days) for x in assigned_dates[d])
 
-    # 優先順位: 7,4,5,2,3,6,8,1(>=4),10
+    # 優先順位: 7,4,5,比率(B-K/L-Y),2,3,6,8,1(>=4),10
 
     # 7 全体（前月+今月）
     metric_total = {d: prev_total[d] + assigned_count[d] for d in candidates}
@@ -548,6 +643,18 @@ def choose_doctor_for_slot(
             mfg = min(assigned_fg[d] for d in candidates)
             candidates = [d for d in candidates if assigned_fg[d] == mfg]
 
+    # B-K / L-Y の比率バランス（除外医師以外）
+    if (is_BK or is_LY) and candidates:
+        def imbalance_score(doc):
+            if doc in RATIO_EXEMPT_DOCTORS:
+                return 0
+            bk = assigned_bk[doc] + (1 if is_BK else 0)
+            ly = assigned_ly[doc] + (1 if is_LY else 0)
+            return abs(bk - ly)
+
+        min_imbalance = min(imbalance_score(d) for d in candidates)
+        candidates = [d for d in candidates if imbalance_score(d) == min_imbalance]
+
     # 2 同一病院0回優先
     no_dup = [d for d in candidates if assigned_hosp_count[d].get(hospital_name, 0) == 0]
     if no_dup:
@@ -555,7 +662,7 @@ def choose_doctor_for_slot(
 
     # 3 B〜G はカテ表あり優先（ソフト優先）
     if is_BG:
-        with_sched = [d for d in candidates if get_sched_code(date, doc)]
+        with_sched = [d for d in candidates if get_sched_code(date, d)]
         if with_sched:
             candidates = with_sched
 
@@ -606,6 +713,8 @@ def build_schedule_pattern(seed=0):
     assigned_weekend = {d: 0 for d in doctor_names}
     assigned_be = {d: 0 for d in doctor_names}
     assigned_fg = {d: 0 for d in doctor_names}
+    assigned_bk = {d: 0 for d in doctor_names}
+    assigned_ly = {d: 0 for d in doctor_names}
     assigned_hosp_count = {d: defaultdict(int) for d in doctor_names}
     bg_cat = {d: defaultdict(int) for d in doctor_names}
 
@@ -640,6 +749,11 @@ def build_schedule_pattern(seed=0):
             else:
                 assigned_weekday[doc] += 1
 
+            if is_bk_slot(hidx):
+                assigned_bk[doc] += 1
+            elif is_ly_slot(hidx):
+                assigned_ly[doc] += 1
+
     # 自動割当
     for date in all_dates:
         free_slots = slots_by_date[date]["free"].copy()
@@ -657,40 +771,64 @@ def build_schedule_pattern(seed=0):
                 assigned_weekend=assigned_weekend,
                 assigned_be=assigned_be,
                 assigned_fg=assigned_fg,
+                assigned_bk=assigned_bk,
+                assigned_ly=assigned_ly,
                 assigned_hosp_count=assigned_hosp_count,
             )
             if chosen is None:
-                df.at[ridx, hosp] = "UNASSIGNED"
+                remaining = [d for d in doctor_names if assigned_count[d] < TARGET_CAP.get(d, 0)]
+                if remaining:
+                    fallback_doc = min(remaining, key=lambda d: (assigned_count[d], doctor_col_index[d]))
+                else:
+                    fallback_doc = min(doctor_names, key=lambda d: (assigned_count[d], doctor_col_index[d]))
+                df.at[ridx, hosp] = fallback_doc
+                chosen = fallback_doc
             else:
                 df.at[ridx, hosp] = chosen
-                assigned_count[chosen] += 1
-                assigned_dates[chosen].add(date)
-                assigned_hosp_count[chosen][hosp] += 1
 
-                hidx = shift_df.columns.get_loc(hosp)
-                if B_COL_INDEX <= hidx <= G_COL_INDEX:
-                    assigned_bg[chosen] += 1
-                    if B_COL_INDEX <= hidx <= E_COL_INDEX:
-                        assigned_be[chosen] += 1
-                    elif F_COL_INDEX <= hidx <= G_COL_INDEX:
-                        assigned_fg[chosen] += 1
-                    bg_cat[chosen][classify_bg_category(date, hosp)] += 1
-                elif H_COL_INDEX <= hidx <= U_COL_INDEX:
-                    assigned_ht[chosen] += 1
+            assigned_count[chosen] += 1
+            assigned_dates[chosen].add(date)
+            assigned_hosp_count[chosen][hosp] += 1
 
-                dow = date.weekday()
-                weekday = dow < 5
-                holi_flag = (
-                    is_holiday(date)
-                    or dow >= 5
-                    or (weekday and hidx in (C_COL_INDEX, D_COL_INDEX, F_COL_INDEX, G_COL_INDEX))
-                )
-                if holi_flag:
-                    assigned_weekend[chosen] += 1
-                else:
-                    assigned_weekday[chosen] += 1
+            hidx = shift_df.columns.get_loc(hosp)
+            if B_COL_INDEX <= hidx <= G_COL_INDEX:
+                assigned_bg[chosen] += 1
+                if B_COL_INDEX <= hidx <= E_COL_INDEX:
+                    assigned_be[chosen] += 1
+                elif F_COL_INDEX <= hidx <= G_COL_INDEX:
+                    assigned_fg[chosen] += 1
+                bg_cat[chosen][classify_bg_category(date, hosp)] += 1
+            elif H_COL_INDEX <= hidx <= U_COL_INDEX:
+                assigned_ht[chosen] += 1
 
-    return df, assigned_count, assigned_bg, assigned_ht, assigned_weekday, assigned_weekend, bg_cat
+            dow = date.weekday()
+            weekday = dow < 5
+            holi_flag = (
+                is_holiday(date)
+                or dow >= 5
+                or (weekday and hidx in (C_COL_INDEX, D_COL_INDEX, F_COL_INDEX, G_COL_INDEX))
+            )
+            if holi_flag:
+                assigned_weekend[chosen] += 1
+            else:
+                assigned_weekday[chosen] += 1
+
+            if is_bk_slot(hidx):
+                assigned_bk[chosen] += 1
+            elif is_ly_slot(hidx):
+                assigned_ly[chosen] += 1
+
+    return (
+        df,
+        assigned_count,
+        assigned_bg,
+        assigned_ht,
+        assigned_weekday,
+        assigned_weekend,
+        assigned_bk,
+        assigned_ly,
+        bg_cat,
+    )
 
 # =========================
 # slot_meta / movable_positions（ローカル探索用）
@@ -714,6 +852,8 @@ def recompute_stats(pattern_df):
     ht_counts = {d: 0 for d in doctor_names}
     wd_counts = {d: 0 for d in doctor_names}
     we_counts = {d: 0 for d in doctor_names}
+    bk_counts = {d: 0 for d in doctor_names}
+    ly_counts = {d: 0 for d in doctor_names}
     bg_cat = {d: defaultdict(int) for d in doctor_names}
     assigned_hosp_count = {d: defaultdict(int) for d in doctor_names}
     doc_assignments = {d: [] for d in doctor_names}  # (date,hosp)
@@ -755,12 +895,38 @@ def recompute_stats(pattern_df):
         else:
             wd_counts[doc] += 1
 
-    return counts, bg_counts, ht_counts, wd_counts, we_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned
+        if is_bk_slot(hidx):
+            bk_counts[doc] += 1
+        elif is_ly_slot(hidx):
+            ly_counts[doc] += 1
+
+    return (
+        counts,
+        bg_counts,
+        ht_counts,
+        wd_counts,
+        we_counts,
+        bk_counts,
+        ly_counts,
+        bg_cat,
+        assigned_hosp_count,
+        doc_assignments,
+        unassigned,
+    )
 
 # =========================
 # スコア評価（raw_scoreも保持して 0 で潰れないように）
 # =========================
-def evaluate_schedule_with_raw(pattern_df, assigned_count, assigned_bg, assigned_ht, assigned_weekday, assigned_weekend):
+def evaluate_schedule_with_raw(
+    pattern_df,
+    assigned_count,
+    assigned_bg,
+    assigned_ht,
+    assigned_weekday,
+    assigned_weekend,
+    assigned_bk,
+    assigned_ly,
+):
     # UNASSIGNED
     unassigned_slots = 0
     for ridx in pattern_df.index:
@@ -823,6 +989,14 @@ def evaluate_schedule_with_raw(pattern_df, assigned_count, assigned_bg, assigned
     wd_spread = (max(wd_vals) - min(wd_vals)) if wd_vals else 0
     we_spread = (max(we_vals) - min(we_vals)) if we_vals else 0
 
+    bk_ly_imbalance = 0
+    for doc in active_doctors:
+        if doc in RATIO_EXEMPT_DOCTORS:
+            continue
+        bk_val = assigned_bk.get(doc, 0)
+        ly_val = assigned_ly.get(doc, 0)
+        bk_ly_imbalance += abs(bk_val - ly_val)
+
     penalty = 0
     penalty += fairness_penalty * W_FAIR_TOTAL
     penalty += gap_violations * W_GAP
@@ -834,6 +1008,7 @@ def evaluate_schedule_with_raw(pattern_df, assigned_count, assigned_bg, assigned
     penalty += max(0, ht_spread - 1) * W_HT_SPREAD
     penalty += max(0, wd_spread - 1) * W_WD_SPREAD
     penalty += max(0, we_spread - 1) * W_WE_SPREAD
+    penalty += bk_ly_imbalance * W_BK_LY_BALANCE
 
     raw_score = 100 - penalty
     score = max(raw_score, 0)
@@ -850,6 +1025,7 @@ def evaluate_schedule_with_raw(pattern_df, assigned_count, assigned_bg, assigned
         "ht_spread_cum": float(ht_spread),
         "weekday_spread_cum": float(wd_spread),
         "weekend_spread_cum": float(we_spread),
+        "bk_ly_imbalance": int(bk_ly_imbalance),
     }
     return score, raw_score, metrics
 
@@ -916,6 +1092,7 @@ def is_better_raw(new_raw, new_metrics, cur_raw, cur_metrics):
         "gap_violations",
         "hospital_dup_violations",
         "max_minus_min_total_active",
+        "bk_ly_imbalance",
         "bg_spread_cum",
         "ht_spread_cum",
         "weekday_spread_cum",
@@ -927,15 +1104,33 @@ def local_search_swap(pattern_df, max_iters=2000, patience=800, refresh_every=20
     """入替（swap）局所探索：preassignedは動かさず、free枠のみを対象に改善する"""
     if not movable_positions:
         # 動かせる枠が無い（全部固定など）
-        counts, bg_counts, ht_counts, wd_counts, we_counts, bg_cat, *_ = recompute_stats(pattern_df)
-        score, raw_score, metrics = evaluate_schedule_with_raw(pattern_df, counts, bg_counts, ht_counts, wd_counts, we_counts)
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(pattern_df)
+        score, raw_score, metrics = evaluate_schedule_with_raw(
+            pattern_df,
+            counts,
+            bg_counts,
+            ht_counts,
+            wd_counts,
+            we_counts,
+            bk_counts,
+            ly_counts,
+        )
         return pattern_df.copy(), score, raw_score, metrics
 
     rng = random.Random(seed)
     df = pattern_df.copy()
 
-    counts, bg_counts, ht_counts, wd_counts, we_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
-    cur_score, cur_raw, cur_metrics = evaluate_schedule_with_raw(df, counts, bg_counts, ht_counts, wd_counts, we_counts)
+    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+    cur_score, cur_raw, cur_metrics = evaluate_schedule_with_raw(
+        df,
+        counts,
+        bg_counts,
+        ht_counts,
+        wd_counts,
+        we_counts,
+        bk_counts,
+        ly_counts,
+    )
     date_doc_count = build_date_doc_count(df)
 
     no_improve = 0
@@ -1018,8 +1213,17 @@ def local_search_swap(pattern_df, max_iters=2000, patience=800, refresh_every=20
             date_doc_count[d2][doc1] += 1
 
         # 再評価（全再計算）
-        counts2, bg2, ht2, wd2, we2, bg_cat2, assigned_hosp_count2, doc_assignments2, unassigned2 = recompute_stats(df)
-        new_score, new_raw, new_metrics = evaluate_schedule_with_raw(df, counts2, bg2, ht2, wd2, we2)
+        counts2, bg2, ht2, wd2, we2, bk2, ly2, bg_cat2, assigned_hosp_count2, doc_assignments2, unassigned2 = recompute_stats(df)
+        new_score, new_raw, new_metrics = evaluate_schedule_with_raw(
+            df,
+            counts2,
+            bg2,
+            ht2,
+            wd2,
+            we2,
+            bk2,
+            ly2,
+        )
 
         if is_better_raw(new_raw, new_metrics, cur_raw, cur_metrics):
             cur_score, cur_raw, cur_metrics = new_score, new_raw, new_metrics
@@ -1243,8 +1447,17 @@ def build_metrics_df(score_clamped, raw_score, metrics):
     return pd.DataFrame([row])
 
 def build_diagnostics(pattern_df):
-    counts, bg_counts, ht_counts, wd_counts, we_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(pattern_df)
-    score, raw, metrics = evaluate_schedule_with_raw(pattern_df, counts, bg_counts, ht_counts, wd_counts, we_counts)
+    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(pattern_df)
+    score, raw, metrics = evaluate_schedule_with_raw(
+        pattern_df,
+        counts,
+        bg_counts,
+        ht_counts,
+        wd_counts,
+        we_counts,
+        bk_counts,
+        ly_counts,
+    )
 
     df_doctors = build_doctor_diag(counts, bg_counts, ht_counts, wd_counts, we_counts, doc_assignments, assigned_hosp_count)
     df_gap = build_gap_details(doc_assignments)
@@ -1270,8 +1483,27 @@ for i in range(1, NUM_PATTERNS + 1):
     if i % 100 == 0 or i == 1:
         print(f"   進捗: {i}/{NUM_PATTERNS} パターン生成中...")
 
-    pattern_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bg_cat = build_schedule_pattern(seed=i)
-    score, raw_score, metrics = evaluate_schedule_with_raw(pattern_df, counts, bg_counts, ht_counts, wd_counts, we_counts)
+    (
+        pattern_df,
+        counts,
+        bg_counts,
+        ht_counts,
+        wd_counts,
+        we_counts,
+        bk_counts,
+        ly_counts,
+        bg_cat,
+    ) = build_schedule_pattern(seed=i)
+    score, raw_score, metrics = evaluate_schedule_with_raw(
+        pattern_df,
+        counts,
+        bg_counts,
+        ht_counts,
+        wd_counts,
+        we_counts,
+        bk_counts,
+        ly_counts,
+    )
 
     score_rows.append({"seed": i, "score": score, "raw_score": raw_score, **metrics})
 
@@ -1348,54 +1580,82 @@ output_path = output_filename
 
 print(f"\n📝 結果をExcelファイルに出力中...")
 
+best_pattern = top_patterns[0]["pattern_df"]
+counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(best_pattern)
+df_month, df_total = build_summaries(best_pattern, counts, bg_counts, ht_counts, wd_counts, we_counts, bg_cat)
+df_doctors, df_gap, df_same, df_hdup, df_unass, df_metrics = build_diagnostics(best_pattern)
+
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-    # 元シート
-    shift_df.to_excel(writer, sheet_name="sheet1", index=False)
-    availability_raw.to_excel(writer, sheet_name="sheet2", index=False)
-    schedule_raw.to_excel(writer, sheet_name="sheet3", index=False)
-    sheet4_raw_out.to_excel(writer, sheet_name="sheet4", index=False)
+    best_pattern.to_excel(writer, sheet_name="schedule", index=False)
+    df_month.to_excel(writer, sheet_name="summary_今月", index=False)
+    df_total.to_excel(writer, sheet_name="summary_累計", index=False)
 
-    # スコア一覧
-    scores_df.to_excel(writer, sheet_name="scores", index=False)
+analysis_path = f"{base_name}_analysis.txt"
+sorted_counts = sorted(
+    counts.items(),
+    key=lambda item: (item[1], doctor_col_index[item[0]]),
+    reverse=True,
+)
 
-    # ローカル探索の改善一覧
-    refined_df.to_excel(writer, sheet_name="refined_candidates", index=False)
+with open(analysis_path, "w", encoding="utf-8") as f:
+    f.write("当直スケジュール解析結果\n")
+    f.write("=" * 60 + "\n")
+    f.write(f"出力Excel: {output_path}\n")
+    f.write(f"全枠数: {total_slots}\n")
+    f.write(f"active医師: {len(active_doctors)}人\n")
+    f.write(f"基本割当数: {BASE_TARGET}回\n")
+    f.write(f"余り枠: {EXTRA_SLOTS}枠（下の方の医師に+1回）\n")
+    f.write("\n--- メトリクス ---\n")
+    if not df_metrics.empty:
+        metrics_row = df_metrics.iloc[0].to_dict()
+        for key, value in metrics_row.items():
+            f.write(f"{key}: {value}\n")
+    f.write("\n--- 当直回数一覧 ---\n")
+    for doc, cnt in sorted_counts:
+        f.write(f"{doc}: {cnt}回\n")
+    f.write("\n--- 未割当枠 ---\n")
+    if df_unass.empty:
+        f.write("なし\n")
+    else:
+        for _, row in df_unass.iterrows():
+            f.write(f"{row['日付']} {row['病院']} (row_index={row['row_index']})\n")
+    f.write("\n--- gap違反 ---\n")
+    if df_gap.empty:
+        f.write("なし\n")
+    else:
+        for _, row in df_gap.iterrows():
+            f.write(
+                f"{row['氏名']} {row['前回日付']}({row['前回病院']}) -> "
+                f"{row['今回日付']}({row['今回病院']}) gap={row['間隔(日)']}\n"
+            )
+    f.write("\n--- 同日重複 ---\n")
+    if df_same.empty:
+        f.write("なし\n")
+    else:
+        for _, row in df_same.iterrows():
+            f.write(f"{row['氏名']} {row['日付']} 件数={row['件数']} 病院={row['病院']}\n")
+    f.write("\n--- 同一病院重複超過 ---\n")
+    if df_hdup.empty:
+        f.write("なし\n")
+    else:
+        for _, row in df_hdup.iterrows():
+            f.write(f"{row['氏名']} {row['病院']} 回数={row['回数']} 超過={row['超過']}\n")
 
-    # TOP3出力
-    for rank, entry in enumerate(top_patterns, start=1):
-        sheet_label = f"pattern_{rank:02d}"
-        entry["pattern_df"].to_excel(writer, sheet_name=sheet_label, index=False)
+print("\n📄 解析結果（txt）を出力しました:")
+print(f"   {analysis_path}")
 
-        # summary（今月/累計）
-        counts, bg_counts, ht_counts, wd_counts, we_counts, bg_cat, *_ = recompute_stats(entry["pattern_df"])
-        df_month, df_total = build_summaries(entry["pattern_df"], counts, bg_counts, ht_counts, wd_counts, we_counts, bg_cat)
-        df_month.to_excel(writer, sheet_name=f"{sheet_label}_今月", index=False)
-        df_total.to_excel(writer, sheet_name=f"{sheet_label}_累計", index=False)
-
-        # diagnostics
-        df_doctors, df_gap, df_same, df_hdup, df_unass, df_metrics = build_diagnostics(entry["pattern_df"])
-        df_doctors.to_excel(writer, sheet_name=f"{sheet_label}_diag_doctors", index=False)
-        df_gap.to_excel(writer, sheet_name=f"{sheet_label}_diag_gap", index=False)
-        df_same.to_excel(writer, sheet_name=f"{sheet_label}_diag_sameday", index=False)
-        df_hdup.to_excel(writer, sheet_name=f"{sheet_label}_diag_hospdup", index=False)
-        df_unass.to_excel(writer, sheet_name=f"{sheet_label}_diag_unassigned", index=False)
-        df_metrics.to_excel(writer, sheet_name=f"{sheet_label}_diag_metrics", index=False)
+print("\n📌 当直回数一覧")
+for doc, cnt in sorted_counts:
+    print(f"   {doc}: {cnt}回")
 
 print("\n" + "="*60)
 print("   🎉 完了！")
 print("="*60)
 print(f"\n📥 出力ファイル: {output_path}")
 print("\n【ファイル内容】")
-print("  - sheet1〜4: 元データ")
-print("  - scores: 全パターンのスコア一覧")
-print("  - refined_candidates: 局所探索の改善結果")
-print("  - pattern_01〜03: TOP3のスケジュール")
-print("  - pattern_XX_今月/累計: サマリーシート")
-print("  - pattern_XX_diag_*: 診断シート（gap違反、重複等）")
-print("\n【推奨】")
-print("  1. pattern_01_diag_gap: gap違反を確認")
-print("  2. pattern_01_diag_doctors: 医師ごとの偏りを確認")
-print("  3. 問題があればpattern_02, pattern_03も確認")
+print("  - schedule: 最良パターンのスケジュール")
+print("  - summary_今月 / summary_累計: サマリー")
 print("="*60)
 
-files.download(output_path)
+if COLAB_AVAILABLE:
+    files.download(output_path)
