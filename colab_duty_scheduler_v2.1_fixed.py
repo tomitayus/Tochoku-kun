@@ -5,6 +5,9 @@
 #   - sheet3で少なくとも1つのカテ表コード（A,B,C,CC,D,E等）を持つ医師を特定
 #   - カテ表コード保有医師は、カテ表コードがない日にB〜K列に割り当てられない
 #   - カテ表コード非保有医師は、B〜K列に自由に割り当て可能
+# - L〜Y列の制約を修正：カテ表コード保有医師は常にL〜Y列禁止
+#   - 従来：その日にカテ表コードがある場合のみL〜Y列禁止
+#   - 修正後：カテ表コード保有医師は全日程でL〜Y列禁止
 # - 出力パターンを1個から3個に変更（TOP3候補を提示）
 # v2.4 (2026-01-21):
 # - 列構造の変更対応（B〜Y列）
@@ -183,8 +186,9 @@ print("="*60)
 print("   当直スケジュール自動生成ツール v2.5 (カテ表コード保有医師制約修正版)")
 print("="*60)
 print("\n【v2.5の修正内容】")
-print("🔧 B〜K列の制約を修正")
-print("  - カテ表コード保有医師のみカテ表コードが必要")
+print("🔧 カテ表コード保有医師の制約を修正")
+print("  - B〜K列: カテ表コード保有医師のみカテ表コードが必要")
+print("  - L〜Y列: カテ表コード保有医師は常に割当不可（全日程）")
 print("  - カテ表コード非保有医師はB〜K列に自由に割り当て可能")
 print("  - 出力パターンをTOP3候補に変更（従来1個）")
 print("\n【v2.4の修正内容】")
@@ -633,9 +637,9 @@ def choose_doctor_for_slot(
                 if code == 3 and not (L_COL_INDEX <= idx <= L_Y_END_INDEX):
                     continue
 
-            # ★ ハード制約2: カテ表あり→L〜Y列不可（絶対に緩和しない）
+            # ★ ハード制約2: カテ表コード保有医師→L〜Y列不可（絶対に緩和しない）
             if L_COL_INDEX <= idx <= L_Y_END_INDEX:
-                if get_sched_code(date, doc):
+                if doc in SCHEDULE_CODE_HOLDERS:
                     continue
 
             # ★ ハード制約3: B〜K列はカテ表コード保有医師のみカテ表コードが必要（絶対に緩和しない）
@@ -1133,9 +1137,9 @@ def can_assign_doc_to_slot(doc, date, hosp):
     # 可否コード3 → L〜Y列のみ可
     if code == 3 and not (L_COL_INDEX <= idx <= L_Y_END_INDEX):
         return False
-    # カテ表あり → L〜Y列不可
+    # カテ表コード保有医師 → L〜Y列不可
     if L_COL_INDEX <= idx <= L_Y_END_INDEX:
-        if get_sched_code(date, doc):
+        if doc in SCHEDULE_CODE_HOLDERS:
             return False
     # B〜K列はカテ表コード保有医師のみカテ表コードが必要
     if B_COL_INDEX <= idx <= B_K_END_INDEX:
@@ -1601,17 +1605,17 @@ def build_hard_constraint_violations(pattern_df):
                     "詳細": f"コード3はL〜Y列のみ可。列{idx}に割当",
                 })
 
-            # 違反4: カテ表あり＋L〜Y列違反
-            if L_COL_INDEX <= idx <= L_Y_END_INDEX and sched_code:
+            # 違反4: カテ表コード保有医師＋L〜Y列違反
+            if L_COL_INDEX <= idx <= L_Y_END_INDEX and doc in SCHEDULE_CODE_HOLDERS:
                 rows.append({
-                    "違反種別": "カテ表+外病院違反",
+                    "違反種別": "カテ表コード保有医師+外病院違反",
                     "日付": date,
                     "医師名": doc,
                     "病院": hosp,
                     "列番号": idx,
                     "可否コード": code,
-                    "カテ表": sched_code,
-                    "詳細": f"カテ表（{sched_code}）がある日に外病院（列{idx}）に割当",
+                    "カテ表": sched_code if sched_code else "",
+                    "詳細": f"カテ表コード保有医師は外病院（L〜Y列）に割当不可。列{idx}に割当",
                 })
 
             # 違反5: B〜K列でカテ表コードなし（カテ表コード保有医師のみ）
@@ -1875,7 +1879,7 @@ print("  - pattern_XX_diag: 各パターンの診断シート（ハード制約�
 print("\n【推奨】")
 print("  🚨 重要: 各pattern_XX_diagの「ハード制約違反」を最優先で確認")
 print("    - 可否コード0違反（絶対不可の日に割当）")
-print("    - カテ表+外病院違反（カテ表がある日にL〜Y列）")
+print("    - カテ表コード保有医師+外病院違反（L〜Y列に割当）")
 print("    - 可否コード2違反（B〜Q列以外に割当）")
 print("    - 可否コード3違反（L〜Y列以外に割当）")
 print("    - B-K列カテ表コード欠如（カテ表コード保有医師がコードなし日に割当）")
