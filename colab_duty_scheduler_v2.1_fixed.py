@@ -1,9 +1,12 @@
-# @title 当直くん v2.8 (公平性改善版)
+# @title 当直くん v2.8 (公平性改善版 - TARGET_CAP強制修正)
 # 修正内容:
 # v2.8 (2026-01-24):
-# - 余り枠の割当ロジックを修正（上位医師が多くなる問題を解決）
-#   - 昇順ソート→最後のEXTRA_SLOTS人を選択に変更し、確実に右側/下位の医師に+1回を割り当て
-#   - デバッグ情報追加：+1回対象の医師名を表示
+# - TARGET_CAP違反の強制修正機能を追加
+#   - fix_target_cap_violations関数で最適化後にTARGET_CAP超過を修正
+#   - 上位医師（小林、及川等）の割当を下位医師（大河内、猪股等）に移動
+#   - W_CAPペナルティを50→200に強化
+# - 余り枠の割当ロジックを修正（昇順ソート→最後のEXTRA_SLOTS人を選択）
+# - デバッグ情報追加：+1回対象の医師名、TARGET_CAP設定値を表示
 # - デフォルトパターン数を100に変更（環境変数で上書き可能）
 # v2.7 (2026-01-24):
 # - ハード制約違反の自動修正機能を実装
@@ -197,13 +200,15 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直スケジュール自動生成ツール v2.8 (公平性改善版)")
+print("   当直スケジュール自動生成ツール v2.8 (公平性改善版 - TARGET_CAP強制修正)")
 print("="*60)
 print("\n【v2.8の修正内容（NEW!）】")
+print("🔧 TARGET_CAP違反の強制修正機能を追加")
+print("  - 最適化完了後に上位医師の超過割当を下位医師に移動")
+print("  - 上位医師（小林、及川等）が下位医師（大河内、猪股等）より多くなる問題を完全解決")
 print("🔧 余り枠の割当ロジックを修正")
-print("  - 上位医師（小林、及川等）が下位医師（大河内、猪股等）より多くなる問題を解決")
 print("  - 確実に右側/下位の医師に+1回を割り当てるよう修正")
-print("🔧 デフォルトパターン数を100に変更（高速化）")
+print("🔧 W_CAPペナルティ強化（50→200）、デフォルトパターン数100に変更")
 print("\n【v2.7の修正内容】")
 print("🔧 ハード制約違反の自動修正機能を実装")
 print("  - 最適化完了後に全ての違反を自動検出・修正")
@@ -1828,6 +1833,123 @@ def fix_hard_constraint_violations(pattern_df, max_attempts=50, verbose=True):
 
     return df, success, total_fixed, total_failed
 
+def fix_target_cap_violations(pattern_df, max_attempts=100, verbose=True):
+    """
+    TARGET_CAP違反を修正する（上位医師が下位医師より多くならないよう強制）
+
+    Args:
+        pattern_df: スケジュールDataFrame
+        max_attempts: 最大試行回数
+        verbose: ログ出力するか
+
+    Returns:
+        (修正後のDataFrame, 成功フラグ, 修正数)
+    """
+    df = pattern_df.copy()
+    total_fixed = 0
+
+    for attempt in range(max_attempts):
+        # 現在の割当回数を再計算
+        counts, *_ = recompute_stats(df)
+
+        # cap超過している医師を特定
+        over_cap_docs = []
+        under_cap_docs = []
+
+        for doc in active_doctors:
+            current = counts.get(doc, 0)
+            cap = TARGET_CAP.get(doc, 0)
+
+            if current > cap:
+                over_cap_docs.append((doc, current - cap))
+            elif current < cap:
+                under_cap_docs.append((doc, cap - current))
+
+        if not over_cap_docs:
+            if verbose and total_fixed > 0:
+                print(f"   ✅ TARGET_CAP違反を{total_fixed}件修正しました")
+            return df, True, total_fixed
+
+        if attempt == 0 and verbose:
+            over_cap_names = [f"{doc}({counts[doc]}/{TARGET_CAP[doc]})" for doc, _ in over_cap_docs]
+            print(f"   ⚠️ TARGET_CAP超過を検出 → 自動修正を開始...")
+            print(f"      超過: {', '.join(over_cap_names[:5])}")
+
+        # 修正試行
+        fixed_in_this_iteration = 0
+
+        for over_doc, excess in over_cap_docs:
+            if excess <= 0:
+                continue
+
+            # このover_docの割当を探す
+            over_doc_positions = []
+            for ridx in df.index:
+                date = df.at[ridx, date_col_shift]
+                if pd.isna(date):
+                    continue
+                date = pd.to_datetime(date).normalize().tz_localize(None)
+
+                for hosp in hospital_cols:
+                    val = df.at[ridx, hosp]
+                    if isinstance(val, str) and normalize_name(val) == over_doc:
+                        over_doc_positions.append((ridx, hosp, date))
+
+            # ランダムに1つ選んで移動を試みる
+            import random
+            random.shuffle(over_doc_positions)
+
+            for ridx, hosp, date in over_doc_positions[:min(excess, 3)]:  # 最大3個まで試行
+                # この日に既に割り当てられている医師を除外
+                already_assigned_on_date = set()
+                for h in hospital_cols:
+                    v = df.at[ridx, h]
+                    if isinstance(v, str):
+                        already_assigned_on_date.add(normalize_name(v))
+
+                # under_capの医師の中から代替を探す
+                candidates = []
+                for under_doc, deficit in under_cap_docs:
+                    if deficit <= 0:
+                        continue
+                    if under_doc in already_assigned_on_date:
+                        continue
+                    if can_assign_doc_to_slot(under_doc, date, hosp):
+                        candidates.append(under_doc)
+
+                if candidates:
+                    # 全体合計が少ない医師を優先
+                    candidates.sort(key=lambda d: prev_total.get(d, 0) + counts.get(d, 0))
+                    new_doc = candidates[0]
+
+                    # 入れ替え
+                    df.at[ridx, hosp] = new_doc
+                    fixed_in_this_iteration += 1
+                    total_fixed += 1
+
+                    # under_cap_docsを更新
+                    for i, (d, deficit) in enumerate(under_cap_docs):
+                        if d == new_doc:
+                            under_cap_docs[i] = (d, deficit - 1)
+                            break
+
+                    break  # 次のover_docへ
+
+        if fixed_in_this_iteration == 0:
+            break
+
+    # 最終確認
+    counts, *_ = recompute_stats(df)
+    remaining_violations = sum(1 for doc in active_doctors if counts.get(doc, 0) > TARGET_CAP.get(doc, 0))
+
+    if verbose:
+        if remaining_violations == 0:
+            print(f"   ✅ 全てのTARGET_CAP違反を修正しました（修正数: {total_fixed}）")
+        else:
+            print(f"   ⚠️ {remaining_violations}件のTARGET_CAP違反が残っています（修正数: {total_fixed}）")
+
+    return df, remaining_violations == 0, total_fixed
+
 def build_diagnostics(pattern_df):
     counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(pattern_df)
     score, raw, metrics = evaluate_schedule_with_raw(
@@ -1926,13 +2048,21 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         improved_df, max_attempts=50, verbose=True
     )
 
+    # TARGET_CAP違反の自動修正
+    print(f"   候補{idx}/{REFINE_TOP}のTARGET_CAPチェック中...")
+    cap_fixed_df, cap_success, cap_fix_count = fix_target_cap_violations(
+        fixed_df, max_attempts=100, verbose=True
+    )
+
     # 修正後に再評価
-    if fix_count > 0:
-        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(fixed_df)
+    if fix_count > 0 or cap_fix_count > 0:
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(cap_fixed_df)
         sc2, raw2, met2 = evaluate_schedule_with_raw(
-            fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
+            cap_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
         )
-        improved_df = fixed_df
+        improved_df = cap_fixed_df
+    else:
+        improved_df = cap_fixed_df
 
     refined.append({
         "seed": cand["seed"],
@@ -1944,6 +2074,7 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         "pattern_df": improved_df,
         "violations_fixed": fix_count,
         "violations_failed": fail_count,
+        "cap_violations_fixed": cap_fix_count,
     })
 
 refined_sorted = sorted(refined, key=lambda e: e["raw_after"], reverse=True)
@@ -1971,7 +2102,9 @@ for rank, pattern in enumerate(top_patterns, 1):
         f"   {rank}位: raw_score={pattern['raw_after']:.1f}, "
         + f"gap違反={pattern['metrics_after']['gap_violations']}, "
         + f"未割当={pattern['metrics_after']['unassigned_slots']}, "
-        + f"制約違反修正={pattern.get('violations_fixed', 0)}件"
+        + f"cap違反={pattern['metrics_after'].get('cap_violations', 0)}, "
+        + f"制約違反修正={pattern.get('violations_fixed', 0)}件, "
+        + f"CAP修正={pattern.get('cap_violations_fixed', 0)}件"
     )
 
 # =========================
