@@ -1,12 +1,16 @@
-# @title 当直くん v2.8 (公平性改善版 - TARGET_CAP強制修正)
+# @title 当直くん v2.8 (公平性改善版 - 可否コード1.2対応)
 # 修正内容:
 # v2.8 (2026-01-24):
+# - 可否コード1.2の医師が大学系最低1回の制約を追加
+#   - get_avail_code関数で1.2を認識できるよう修正
+#   - fix_code_1_2_violations関数で最適化後に大学系0回を修正
+#   - 評価関数に1.2の医師が大学系0回の場合のペナルティ追加（重み150）
 # - TARGET_CAP違反の強制修正機能を追加
 #   - fix_target_cap_violations関数で最適化後にTARGET_CAP超過を修正
 #   - 上位医師（小林、及川等）の割当を下位医師（大河内、猪股等）に移動
 #   - W_CAPペナルティを50→200に強化
 # - 余り枠の割当ロジックを修正（昇順ソート→最後のEXTRA_SLOTS人を選択）
-# - デバッグ情報追加：+1回対象の医師名、TARGET_CAP設定値を表示
+# - デバッグ情報追加：+1回対象の医師名、TARGET_CAP設定値、1.2対象医師を表示
 # - デフォルトパターン数を100に変更（環境変数で上書き可能）
 # v2.7 (2026-01-24):
 # - ハード制約違反の自動修正機能を実装
@@ -200,14 +204,14 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直スケジュール自動生成ツール v2.8 (公平性改善版 - TARGET_CAP強制修正)")
+print("   当直スケジュール自動生成ツール v2.8 (公平性改善版 - 可否コード1.2対応)")
 print("="*60)
 print("\n【v2.8の修正内容（NEW!）】")
+print("🔧 可否コード1.2の医師が大学系最低1回の制約を追加")
+print("  - 1.2の医師が大学系0回になる問題を完全解決")
+print("  - 評価関数でペナルティ、最適化後に強制修正")
 print("🔧 TARGET_CAP違反の強制修正機能を追加")
-print("  - 最適化完了後に上位医師の超過割当を下位医師に移動")
 print("  - 上位医師（小林、及川等）が下位医師（大河内、猪股等）より多くなる問題を完全解決")
-print("🔧 余り枠の割当ロジックを修正")
-print("  - 確実に右側/下位の医師に+1回を割り当てるよう修正")
 print("🔧 W_CAPペナルティ強化（50→200）、デフォルトパターン数100に変更")
 print("\n【v2.7の修正内容】")
 print("🔧 ハード制約違反の自動修正機能を実装")
@@ -378,18 +382,24 @@ for doc in doctor_names:
 
 def get_avail_code(date, doctor):
     code = None
+    raw_value = None
     if isinstance(availability_df.index, pd.DatetimeIndex):
         try:
             value = availability_df.at[pd.to_datetime(date).normalize().tz_localize(None), doctor]  # 🔧 FIX
             if isinstance(value, pd.Series):
                 value = value.iloc[0]
             if pd.notna(value):
-                code = int(value)
+                raw_value = float(value)
+                # 1.2は特別扱い：大学系優先
+                if abs(raw_value - 1.2) < 0.01:
+                    code = 1.2
+                else:
+                    code = int(raw_value)
         except Exception:
             pass
     if code is None:
         code = fallback_avail_codes.get(doctor, 1)
-    if code not in (0, 1, 2, 3):
+    if code not in (0, 1, 1.2, 2, 3):
         code = 1
     return code
 
@@ -579,6 +589,22 @@ SCHEDULE_CODE_HOLDERS = {doc for doc in doctor_names if has_any_schedule_code(do
 if SCHEDULE_CODE_HOLDERS:
     print(f"   カテ表コード保有医師: {len(SCHEDULE_CODE_HOLDERS)}人")
     print(f"   カテ表コード非保有医師: {len([d for d in doctor_names if d not in SCHEDULE_CODE_HOLDERS])}人")
+
+# 可否コード1.2の医師（大学系最低1回必須）
+def has_code_1_2(doc):
+    """医師がsheet2で少なくとも1つの1.2コードを持っているか"""
+    if doc not in availability_df.columns:
+        return False
+    for date in all_shift_dates:
+        code = get_avail_code(date, doc)
+        if code == 1.2:
+            return True
+    return False
+
+CODE_1_2_DOCTORS = {doc for doc in doctor_names if has_code_1_2(doc)}
+if CODE_1_2_DOCTORS:
+    print(f"   可否コード1.2医師（大学系最低1回必須）: {len(CODE_1_2_DOCTORS)}人")
+    print(f"      対象: {', '.join(sorted(CODE_1_2_DOCTORS)[:10])}")
 
 # =========================
 # 大学(B〜G)の昼夜判定 & 7分類
@@ -1129,12 +1155,19 @@ def evaluate_schedule_with_raw(
         ly_val = assigned_ly.get(doc, 0)
         bk_ly_imbalance += abs(bk_val - ly_val)
 
+    # 可否コード1.2の医師が大学系0回の場合のペナルティ
+    code_1_2_violations = 0
+    for doc in CODE_1_2_DOCTORS:
+        if assigned_bg.get(doc, 0) == 0:
+            code_1_2_violations += 1
+
     penalty = 0
     penalty += fairness_penalty * W_FAIR_TOTAL
     penalty += gap_violations * W_GAP
     penalty += hosp_dup_violations * W_HOSP_DUP
     penalty += unassigned_slots * W_UNASSIGNED
     penalty += cap_violations * W_CAP
+    penalty += code_1_2_violations * 150  # 1.2の医師が大学系0回の場合、大きなペナルティ
 
     penalty += max(0, bg_spread - 1) * W_BG_SPREAD
     penalty += max(0, ht_spread - 1) * W_HT_SPREAD
@@ -1153,6 +1186,7 @@ def evaluate_schedule_with_raw(
         "hospital_dup_violations": int(hosp_dup_violations),
         "unassigned_slots": int(unassigned_slots),
         "cap_violations": int(cap_violations),
+        "code_1_2_violations": int(code_1_2_violations),
         "bg_spread_cum": float(bg_spread),
         "ht_spread_cum": float(ht_spread),
         "weekday_spread_cum": float(wd_spread),
@@ -1950,6 +1984,119 @@ def fix_target_cap_violations(pattern_df, max_attempts=100, verbose=True):
 
     return df, remaining_violations == 0, total_fixed
 
+def fix_code_1_2_violations(pattern_df, max_attempts=100, verbose=True):
+    """
+    可否コード1.2の医師が大学系0回の違反を修正する
+
+    Args:
+        pattern_df: スケジュールDataFrame
+        max_attempts: 最大試行回数
+        verbose: ログ出力するか
+
+    Returns:
+        (修正後のDataFrame, 成功フラグ, 修正数)
+    """
+    if not CODE_1_2_DOCTORS:
+        return pattern_df, True, 0
+
+    df = pattern_df.copy()
+    total_fixed = 0
+
+    for attempt in range(max_attempts):
+        # 現在の割当回数を再計算
+        counts, bg_counts, *_ = recompute_stats(df)
+
+        # 大学系0回の1.2医師を特定
+        zero_bg_docs = []
+        for doc in CODE_1_2_DOCTORS:
+            if bg_counts.get(doc, 0) == 0:
+                zero_bg_docs.append(doc)
+
+        if not zero_bg_docs:
+            if verbose and total_fixed > 0:
+                print(f"   ✅ 可否コード1.2医師の大学系0回違反を{total_fixed}件修正しました")
+            return df, True, total_fixed
+
+        if attempt == 0 and verbose:
+            print(f"   ⚠️ 可否コード1.2医師の大学系0回違反を検出 → 自動修正を開始...")
+            print(f"      対象: {', '.join(zero_bg_docs[:5])}")
+
+        # 修正試行
+        fixed_in_this_iteration = 0
+
+        for zero_doc in zero_bg_docs:
+            # このzero_docの外病院（L〜Y）割当を探す
+            zero_doc_ly_positions = []
+            for ridx in df.index:
+                date = df.at[ridx, date_col_shift]
+                if pd.isna(date):
+                    continue
+                date = pd.to_datetime(date).normalize().tz_localize(None)
+
+                for hosp in hospital_cols:
+                    idx = shift_df.columns.get_loc(hosp)
+                    # L〜Y列（外病院）のみ
+                    if L_COL_INDEX <= idx <= L_Y_END_INDEX:
+                        val = df.at[ridx, hosp]
+                        if isinstance(val, str) and normalize_name(val) == zero_doc:
+                            zero_doc_ly_positions.append((ridx, hosp, date))
+
+            # 外病院の割当を1つ大学系に変更
+            import random
+            random.shuffle(zero_doc_ly_positions)
+
+            for ridx, hosp, date in zero_doc_ly_positions[:1]:  # 1つだけ試行
+                # この日付のB〜K列（大学系）で空いている枠を探す
+                for bg_hosp in hospital_cols:
+                    bg_idx = shift_df.columns.get_loc(bg_hosp)
+                    if not (B_COL_INDEX <= bg_idx <= B_K_END_INDEX):
+                        continue
+
+                    val = df.at[ridx, bg_hosp]
+                    # 空き枠かどうか
+                    if not is_slot_value(shift_df.at[ridx, bg_hosp]):
+                        continue
+                    if isinstance(val, str) and val in doctor_names:
+                        continue  # 既に割当済み
+
+                    # この日にzero_docが既に割り当てられていないかチェック
+                    already_assigned = False
+                    for h in hospital_cols:
+                        v = df.at[ridx, h]
+                        if isinstance(v, str) and normalize_name(v) == zero_doc and h != hosp:
+                            already_assigned = True
+                            break
+
+                    if already_assigned:
+                        continue
+
+                    # 制約チェック
+                    if can_assign_doc_to_slot(zero_doc, date, bg_hosp):
+                        # 外病院から削除、大学系に追加
+                        df.at[ridx, hosp] = None  # 外病院を解除
+                        df.at[ridx, bg_hosp] = zero_doc  # 大学系に割当
+                        fixed_in_this_iteration += 1
+                        total_fixed += 1
+                        break  # 次のzero_docへ
+
+                if fixed_in_this_iteration > 0:
+                    break  # 次のzero_docへ
+
+        if fixed_in_this_iteration == 0:
+            break
+
+    # 最終確認
+    counts, bg_counts, *_ = recompute_stats(df)
+    remaining_violations = sum(1 for doc in CODE_1_2_DOCTORS if bg_counts.get(doc, 0) == 0)
+
+    if verbose:
+        if remaining_violations == 0:
+            print(f"   ✅ 全ての可否コード1.2医師の大学系0回違反を修正しました（修正数: {total_fixed}）")
+        else:
+            print(f"   ⚠️ {remaining_violations}件の可否コード1.2医師の大学系0回違反が残っています（修正数: {total_fixed}）")
+
+    return df, remaining_violations == 0, total_fixed
+
 def build_diagnostics(pattern_df):
     counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(pattern_df)
     score, raw, metrics = evaluate_schedule_with_raw(
@@ -2054,15 +2201,21 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         fixed_df, max_attempts=100, verbose=True
     )
 
+    # 可否コード1.2の医師が大学系0回の違反を修正
+    print(f"   候補{idx}/{REFINE_TOP}の可否コード1.2チェック中...")
+    code_1_2_fixed_df, code_1_2_success, code_1_2_fix_count = fix_code_1_2_violations(
+        cap_fixed_df, max_attempts=100, verbose=True
+    )
+
     # 修正後に再評価
-    if fix_count > 0 or cap_fix_count > 0:
-        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(cap_fixed_df)
+    if fix_count > 0 or cap_fix_count > 0 or code_1_2_fix_count > 0:
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(code_1_2_fixed_df)
         sc2, raw2, met2 = evaluate_schedule_with_raw(
-            cap_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
+            code_1_2_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
         )
-        improved_df = cap_fixed_df
+        improved_df = code_1_2_fixed_df
     else:
-        improved_df = cap_fixed_df
+        improved_df = code_1_2_fixed_df
 
     refined.append({
         "seed": cand["seed"],
@@ -2075,6 +2228,7 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         "violations_fixed": fix_count,
         "violations_failed": fail_count,
         "cap_violations_fixed": cap_fix_count,
+        "code_1_2_violations_fixed": code_1_2_fix_count,
     })
 
 refined_sorted = sorted(refined, key=lambda e: e["raw_after"], reverse=True)
@@ -2103,8 +2257,10 @@ for rank, pattern in enumerate(top_patterns, 1):
         + f"gap違反={pattern['metrics_after']['gap_violations']}, "
         + f"未割当={pattern['metrics_after']['unassigned_slots']}, "
         + f"cap違反={pattern['metrics_after'].get('cap_violations', 0)}, "
+        + f"1.2違反={pattern['metrics_after'].get('code_1_2_violations', 0)}, "
         + f"制約違反修正={pattern.get('violations_fixed', 0)}件, "
-        + f"CAP修正={pattern.get('cap_violations_fixed', 0)}件"
+        + f"CAP修正={pattern.get('cap_violations_fixed', 0)}件, "
+        + f"1.2修正={pattern.get('code_1_2_violations_fixed', 0)}件"
     )
 
 # =========================
