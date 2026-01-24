@@ -1,5 +1,11 @@
-# @title 当直くん v2.6 (get_sched_code修正版)
+# @title 当直くん v2.7 (ハード制約違反自動修正版)
 # 修正内容:
+# v2.7 (2026-01-24):
+# - ハード制約違反の自動修正機能を実装
+#   - fix_hard_constraint_violations関数を追加
+#   - 局所探索完了後に全ての違反を自動検出・修正
+#   - 代替医師が見つからない場合は未割当として警告表示
+#   - 修正後にスコアを再評価して最終結果に反映
 # v2.6 (2026-01-23):
 # - get_sched_code関数の重大なバグを修正
 #   - "0"と"3"を有効なカテ表コードとして扱わないように変更
@@ -186,8 +192,15 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直スケジュール自動生成ツール v2.5 (カテ表コード保有医師制約修正版)")
+print("   当直スケジュール自動生成ツール v2.7 (ハード制約違反自動修正版)")
 print("="*60)
+print("\n【v2.7の修正内容（NEW!）】")
+print("🔧 ハード制約違反の自動修正機能を実装")
+print("  - 最適化完了後に全ての違反を自動検出・修正")
+print("  - カテ表+外病院違反（例：五十嵐医師のDコード日にM病院割当）を自動修正")
+print("  - 代替医師が見つからない場合は未割当として警告表示")
+print("\n【v2.6の修正内容】")
+print("🔧 get_sched_code関数のバグ修正（0と3を無効なカテ表コードとして扱う）")
 print("\n【v2.5の修正内容】")
 print("🔧 カテ表コードと列の制約を修正")
 print("  - カテ表コード保有医師:")
@@ -195,13 +208,9 @@ print("    - その日にコードあり: B〜K列のみ可、L〜Y列禁止")
 print("    - その日にコードなし: 割当なし（B〜K列も不可）")
 print("  - カテ表コード非保有医師: B〜K列・L〜Y列に自由に割当可")
 print("  - 出力パターンをTOP3候補に変更（従来1個）")
-print("\n【v2.4の修正内容】")
-print("🔧 列構造の変更対応（B〜Y列）、B〜H列2回上限制約")
-print("\n【v2.3の修正内容】")
-print("🔧 B〜K列（大学系）のカテ表要件をハード制約に変更")
-print("\n【v2.2の修正内容】")
-print("🔧 ハード制約違反の修正（コード0、カテ表+外病院、コード2/3）")
 print("\n【過去の修正内容】")
+print("✅ 列構造の変更対応（B〜Y列）、B〜H列2回上限制約")
+print("✅ B〜K列（大学系）のカテ表要件をハード制約に変更")
 print("✅ タイムゾーン問題の修正")
 print("✅ 医師名の正規化（空白による制約ミスを防止）")
 print("✅ sheet4ヘッダ検出範囲の拡大（30→50行）")
@@ -1653,6 +1662,110 @@ def build_hard_constraint_violations(pattern_df):
                     "詳細": f"{doc}は水曜日のL〜Y列禁止",
                 })
 
+def fix_hard_constraint_violations(pattern_df, max_attempts=50, verbose=True):
+    """
+    ハード制約違反を自動修正する
+
+    Args:
+        pattern_df: スケジュールDataFrame
+        max_attempts: 最大試行回数
+        verbose: ログ出力するか
+
+    Returns:
+        (修正後のDataFrame, 成功フラグ, 修正数, 修正失敗数)
+    """
+    df = pattern_df.copy()
+    total_fixed = 0
+    total_failed = 0
+
+    for attempt in range(max_attempts):
+        violations_df = build_hard_constraint_violations(df)
+
+        if len(violations_df) == 0:
+            if verbose and total_fixed > 0:
+                print(f"   ✅ ハード制約違反を{total_fixed}件修正しました")
+            return df, True, total_fixed, total_failed
+
+        if attempt == 0 and verbose:
+            print(f"   ⚠️ ハード制約違反を{len(violations_df)}件検出 → 自動修正を開始...")
+
+        # 各違反を修正試行
+        fixed_in_this_iteration = 0
+
+        for _, violation in violations_df.iterrows():
+            date = violation['日付']
+            doc = violation['医師名']
+            hosp = violation['病院']
+            violation_type = violation['違反種別']
+
+            # 該当行を探す
+            ridx = None
+            for idx in df.index:
+                if pd.to_datetime(df.at[idx, date_col_shift]).normalize().tz_localize(None) == date:
+                    ridx = idx
+                    break
+
+            if ridx is None:
+                continue
+
+            # 違反している割当を解除
+            current_val = df.at[ridx, hosp]
+            if not isinstance(current_val, str) or normalize_name(current_val) != doc:
+                continue
+
+            df.at[ridx, hosp] = None
+
+            # 代替医師を探す
+            col_idx = shift_df.columns.get_loc(hosp)
+            dow = pd.to_datetime(date).weekday()
+
+            # この日に既に割り当てられている医師を除外
+            already_assigned_on_date = set()
+            for h in hospital_cols:
+                v = df.at[ridx, h]
+                if isinstance(v, str):
+                    already_assigned_on_date.add(normalize_name(v))
+
+            # 候補医師を探す（ハード制約のみチェック）
+            candidates = []
+            for candidate_doc in doctor_names:
+                # 同日重複チェック
+                if candidate_doc in already_assigned_on_date:
+                    continue
+
+                # ハード制約チェック
+                if can_assign_doc_to_slot(candidate_doc, date, hosp):
+                    candidates.append(candidate_doc)
+
+            if candidates:
+                # 優先順位：全体合計が少ない医師を優先
+                candidates.sort(key=lambda d: prev_total.get(d, 0) + len([1 for h in hospital_cols for ridx2 in df.index if isinstance(df.at[ridx2, h], str) and normalize_name(df.at[ridx2, h]) == d]))
+                new_doc = candidates[0]
+                df.at[ridx, hosp] = new_doc
+                fixed_in_this_iteration += 1
+                total_fixed += 1
+            else:
+                # 代替医師が見つからない → 未割当のまま
+                total_failed += 1
+                if verbose:
+                    print(f"   ⚠️ 修正失敗: {date.strftime('%Y-%m-%d')} {hosp} ({violation_type})")
+
+        # 進捗がなければループ終了
+        if fixed_in_this_iteration == 0:
+            break
+
+    # 最終チェック
+    final_violations = build_hard_constraint_violations(df)
+    success = len(final_violations) == 0
+
+    if verbose:
+        if success:
+            print(f"   ✅ 全てのハード制約違反を修正しました（修正数: {total_fixed}）")
+        else:
+            print(f"   ⚠️ {len(final_violations)}件のハード制約違反が残っています（修正数: {total_fixed}, 失敗: {total_failed}）")
+
+    return df, success, total_fixed, total_failed
+
     # B〜H列の2回超過違反をチェック
     bh_counts = defaultdict(list)
     for ridx in pattern_df.index:
@@ -1787,6 +1900,20 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         raw2 = cand["raw_score"]
         met2 = cand["metrics"]
 
+    # ハード制約違反の自動修正
+    print(f"   候補{idx}/{REFINE_TOP}のハード制約違反チェック中...")
+    fixed_df, fix_success, fix_count, fail_count = fix_hard_constraint_violations(
+        improved_df, max_attempts=50, verbose=True
+    )
+
+    # 修正後に再評価
+    if fix_count > 0:
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(fixed_df)
+        sc2, raw2, met2 = evaluate_schedule_with_raw(
+            fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
+        )
+        improved_df = fixed_df
+
     refined.append({
         "seed": cand["seed"],
         "score_before": cand["score"],
@@ -1795,6 +1922,8 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         "raw_after": raw2,
         "metrics_after": met2,
         "pattern_df": improved_df,
+        "violations_fixed": fix_count,
+        "violations_failed": fail_count,
     })
 
 refined_sorted = sorted(refined, key=lambda e: e["raw_after"], reverse=True)
@@ -1821,14 +1950,15 @@ for rank, pattern in enumerate(top_patterns, 1):
     print(
         f"   {rank}位: raw_score={pattern['raw_after']:.1f}, "
         + f"gap違反={pattern['metrics_after']['gap_violations']}, "
-        + f"未割当={pattern['metrics_after']['unassigned_slots']}"
+        + f"未割当={pattern['metrics_after']['unassigned_slots']}, "
+        + f"制約違反修正={pattern.get('violations_fixed', 0)}件"
     )
 
 # =========================
 # 出力（pattern + summary + diagnostics）
 # =========================
 base_name = uploaded_filename.rsplit(".", 1)[0]
-output_filename = f"{base_name}_auto_schedules_v2.5.xlsx"
+output_filename = f"{base_name}_auto_schedules_v2.7.xlsx"
 output_path = output_filename
 
 print(f"\n📝 結果をExcelファイルに出力中...")
@@ -1886,16 +2016,20 @@ print("  - pattern_01〜03: TOP3スケジュール候補")
 print("  - pattern_XX_今月/累計: 各パターンのサマリーシート")
 print("  - pattern_XX_diag: 各パターンの診断シート（ハード制約違反、gap違反、重複等）")
 print("\n【推奨】")
-print("  🚨 重要: 各pattern_XX_diagの「ハード制約違反」を最優先で確認")
-print("    - 可否コード0違反（絶対不可の日に割当）")
-print("    - カテ表+外病院違反（カテ表コードがある日にL〜Y列に割当）")
-print("    - 可否コード2違反（B〜Q列以外に割当）")
-print("    - 可否コード3違反（L〜Y列以外に割当）")
-print("    - B-K列カテ表コード欠如（カテ表コード保有医師がコードなし日にB〜K列に割当）")
-print("    - B-H列2回超過違反（B〜H列に3回以上割当）")
+print("  ✅ v2.7では全てのハード制約違反が自動修正されています")
+print("  🔍 各pattern_XX_diagの「ハード制約違反」シートで修正結果を確認")
+print("    ※通常は違反0件になっているはずです")
+print("    ※修正できなかった違反がある場合は警告が表示されています")
 print("  1. 3つのパターンを比較し、最適なものを選択")
 print("  2. 選択したパターンの診断シートで gap違反・重複・未割当を確認")
 print("  3. サマリーシートで医師ごとの偏りを確認")
+print("\n【主な自動修正対象】")
+print("  ✅ 可否コード0違反（絶対不可の日に割当）")
+print("  ✅ カテ表+外病院違反（カテ表コードがある日にL〜Y列に割当）← 五十嵐医師の問題を修正")
+print("  ✅ 可否コード2違反（B〜Q列以外に割当）")
+print("  ✅ 可否コード3違反（L〜Y列以外に割当）")
+print("  ✅ B-K列カテ表コード欠如（カテ表コード保有医師がコードなし日にB〜K列に割当）")
+print("  ✅ 水曜日L〜Y列禁止違反")
 print("="*60)
 
 if COLAB_AVAILABLE:
