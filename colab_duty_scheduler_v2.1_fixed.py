@@ -89,7 +89,7 @@ W_FAIR_TOTAL = 10          # 全合計（active内 max-min-1）
 W_GAP = 3                  # gap(4日未満)
 W_HOSP_DUP = 1             # 同一病院複数回
 W_UNASSIGNED = 100         # 未割当
-W_CAP = 50                 # cap超え
+W_CAP = 200                # cap超え（厳格化：上位医師が下位医師より多くなるのを防ぐ）
 W_BG_SPREAD = 3            # 大学合計（累計）ばらつき
 W_HT_SPREAD = 3            # 外病院合計（累計）ばらつき
 W_WD_SPREAD = 2            # 平日（累計）ばらつき
@@ -529,6 +529,21 @@ print(f"   余り枠: {EXTRA_SLOTS}枠（右側/下位の医師に+1回）")
 if EXTRA_ALLOWED:
     extra_docs_display = sorted(EXTRA_ALLOWED, key=lambda d: doctor_col_index[d])
     print(f"   +1回対象: {', '.join(extra_docs_display)}")
+
+    # デバッグ：上位医師が含まれていないことを確認
+    upper_doctors = [d for d in active_doctors if doctor_col_index[d] < 10]  # 最初の10人
+    upper_in_extra = [d for d in upper_doctors if d in EXTRA_ALLOWED]
+    if upper_in_extra:
+        print(f"   ⚠️ 警告: 上位医師が+1回対象に含まれています: {', '.join(upper_in_extra)}")
+
+    # 各医師のTARGET_CAPを表示（最初の5人と最後の5人）
+    cap_display = []
+    for d in active_sorted_by_index[:5]:
+        cap_display.append(f"{d}={TARGET_CAP[d]}")
+    cap_display.append("...")
+    for d in active_sorted_by_index[-5:]:
+        cap_display.append(f"{d}={TARGET_CAP[d]}")
+    print(f"   TARGET_CAP: {' / '.join(cap_display)}")
 
 # =========================
 # B-K / L-Y 比率バランス（sheet3で「3」記載の医師は除外）
