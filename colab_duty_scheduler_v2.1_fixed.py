@@ -1662,6 +1662,48 @@ def build_hard_constraint_violations(pattern_df):
                     "詳細": f"{doc}は水曜日のL〜Y列禁止",
                 })
 
+    # B〜H列の2回超過違反をチェック
+    bh_counts = defaultdict(list)
+    for ridx in pattern_df.index:
+        date = pattern_df.at[ridx, date_col_shift]
+        if pd.isna(date):
+            continue
+        date = pd.to_datetime(date).normalize().tz_localize(None)
+
+        for hosp in hospital_cols:
+            val = pattern_df.at[ridx, hosp]
+            if not isinstance(val, str):
+                continue
+            doc = normalize_name(val)
+            if doc not in doctor_names:
+                continue
+
+            idx = shift_df.columns.get_loc(hosp)
+            if B_H_START_INDEX <= idx <= B_H_END_INDEX:
+                bh_counts[doc].append((date, hosp, idx))
+
+    # 違反7: B〜H列が2回超過
+    for doc, assignments in bh_counts.items():
+        if len(assignments) > 2:
+            for date, hosp, idx in assignments[2:]:  # 3回目以降
+                code = get_avail_code(date, doc)
+                sched_code = get_sched_code(date, doc)
+                rows.append({
+                    "違反種別": "B-H列2回超過違反",
+                    "日付": date,
+                    "医師名": doc,
+                    "病院": hosp,
+                    "列番号": idx,
+                    "可否コード": code,
+                    "カテ表": sched_code if sched_code else "",
+                    "詳細": f"B〜H列は2回まで。{len(assignments)}回目の割当",
+                })
+
+    cols = ["違反種別", "日付", "医師名", "病院", "列番号", "可否コード", "カテ表", "詳細"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(rows)[cols].sort_values(["違反種別", "日付", "医師名"]).reset_index(drop=True)
+
 def fix_hard_constraint_violations(pattern_df, max_attempts=50, verbose=True):
     """
     ハード制約違反を自動修正する
@@ -1765,48 +1807,6 @@ def fix_hard_constraint_violations(pattern_df, max_attempts=50, verbose=True):
             print(f"   ⚠️ {len(final_violations)}件のハード制約違反が残っています（修正数: {total_fixed}, 失敗: {total_failed}）")
 
     return df, success, total_fixed, total_failed
-
-    # B〜H列の2回超過違反をチェック
-    bh_counts = defaultdict(list)
-    for ridx in pattern_df.index:
-        date = pattern_df.at[ridx, date_col_shift]
-        if pd.isna(date):
-            continue
-        date = pd.to_datetime(date).normalize().tz_localize(None)
-
-        for hosp in hospital_cols:
-            val = pattern_df.at[ridx, hosp]
-            if not isinstance(val, str):
-                continue
-            doc = normalize_name(val)
-            if doc not in doctor_names:
-                continue
-
-            idx = shift_df.columns.get_loc(hosp)
-            if B_H_START_INDEX <= idx <= B_H_END_INDEX:
-                bh_counts[doc].append((date, hosp, idx))
-
-    # 違反7: B〜H列が2回超過
-    for doc, assignments in bh_counts.items():
-        if len(assignments) > 2:
-            for date, hosp, idx in assignments[2:]:  # 3回目以降
-                code = get_avail_code(date, doc)
-                sched_code = get_sched_code(date, doc)
-                rows.append({
-                    "違反種別": "B-H列2回超過違反",
-                    "日付": date,
-                    "医師名": doc,
-                    "病院": hosp,
-                    "列番号": idx,
-                    "可否コード": code,
-                    "カテ表": sched_code if sched_code else "",
-                    "詳細": f"B〜H列は2回まで。{len(assignments)}回目の割当",
-                })
-
-    cols = ["違反種別", "日付", "医師名", "病院", "列番号", "可否コード", "カテ表", "詳細"]
-    if not rows:
-        return pd.DataFrame(columns=cols)
-    return pd.DataFrame(rows)[cols].sort_values(["違反種別", "日付", "医師名"]).reset_index(drop=True)
 
 def build_diagnostics(pattern_df):
     counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(pattern_df)
