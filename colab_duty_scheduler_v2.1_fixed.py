@@ -1419,7 +1419,22 @@ def local_search_swap(pattern_df, max_iters=2000, patience=800, refresh_every=20
             ly2,
         )
 
-        if is_better_raw(new_raw, new_metrics, cur_raw, cur_metrics):
+        # gap違反が3未満のパターンは採用しない（ハード制約）
+        new_gap_violations = new_metrics.get("gap_violations", 0)
+        if new_gap_violations < 3:
+            # revert
+            df.at[r1, h1], df.at[r2, h2] = doc1, doc2
+            if d1 != d2:
+                date_doc_count[d1][doc2] -= 1
+                if date_doc_count[d1][doc2] <= 0:
+                    del date_doc_count[d1][doc2]
+                date_doc_count[d2][doc1] -= 1
+                if date_doc_count[d2][doc1] <= 0:
+                    del date_doc_count[d2][doc1]
+                date_doc_count[d1][doc1] += 1
+                date_doc_count[d2][doc2] += 1
+            no_improve += 1
+        elif is_better_raw(new_raw, new_metrics, cur_raw, cur_metrics):
             cur_score, cur_raw, cur_metrics = new_score, new_raw, new_metrics
             counts, bg_counts, ht_counts, wd_counts, we_counts, bg_cat = counts2, bg2, ht2, wd2, we2, bg_cat2
             assigned_hosp_count, doc_assignments = assigned_hosp_count2, doc_assignments2
@@ -2306,17 +2321,42 @@ for i in range(1, NUM_PATTERNS + 1):
 
     score_rows.append({"seed": i, "score": score, "raw_score": raw_score, **metrics})
 
-    candidates.append({
-        "seed": i,
-        "score": score,
-        "raw_score": raw_score,
-        "metrics": metrics,
-        "pattern_df": pattern_df,
-    })
-    candidates = sorted(candidates, key=lambda e: e["raw_score"], reverse=True)[:TOP_KEEP]
+    # gap違反が0, 1, 2のパターンは除外（gap違反3以上のみ採用）
+    gap_violations = metrics.get("gap_violations", 0)
+    if gap_violations >= 3:
+        candidates.append({
+            "seed": i,
+            "score": score,
+            "raw_score": raw_score,
+            "metrics": metrics,
+            "pattern_df": pattern_df,
+        })
+
+# gap違反3以上の候補をスコア順にソート
+candidates = sorted(candidates, key=lambda e: e["raw_score"], reverse=True)[:TOP_KEEP]
 
 print(f"\n✅ {NUM_PATTERNS}パターンの生成完了")
-print(f"   TOP{TOP_KEEP}候補を局所探索で最適化中...")
+print(f"   gap違反3以上の候補: {len(candidates)}個")
+if len(candidates) == 0:
+    print("   ⚠️ 警告: gap違反3以上の候補が見つかりませんでした。制約を緩和します...")
+    # gap違反の制約を緩和して再選択
+    candidates = []
+    for row in score_rows:
+        candidates.append({
+            "seed": row["seed"],
+            "score": row["score"],
+            "raw_score": row["raw_score"],
+            "metrics": {k: v for k, v in row.items() if k not in ["seed", "score", "raw_score"]},
+            "pattern_df": None,  # 再生成が必要
+        })
+    candidates = sorted(candidates, key=lambda e: e["raw_score"], reverse=True)[:TOP_KEEP]
+    # パターンを再生成
+    for cand in candidates:
+        if cand["pattern_df"] is None:
+            pattern_df, *_ = build_schedule_pattern(seed=cand["seed"])
+            cand["pattern_df"] = pattern_df
+
+print(f"   TOP{min(TOP_KEEP, len(candidates))}候補を局所探索で最適化中...")
 
 # ローカル探索で候補を改善
 refined = []
