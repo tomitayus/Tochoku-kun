@@ -1,16 +1,12 @@
-# @title 当直くん v3.0 (gap違反修正対応)
+# @title 当直くん v3.0 (gap違反完全排除対応)
 # 修正内容:
 # v3.0 (2026-01-28):
-# - gap違反（4日未満の間隔での割当）の修正機能を追加
-#   - fix_gap_violations関数で最適化後にgap違反を自動修正
-#   - 違反のある割当を4日以上離れた日に移動
-#   - 初期パターン生成時にgap違反3以上の候補のみ選択
-#   - 局所探索でgap違反3未満になるswapを拒否
-# v2.9 (2026-01-28):
-# - gap違反フィルタリング制約を追加（gap違反は3以上必須）
-#   - 候補選択時にgap違反0,1,2のパターンを除外
-#   - local_search_swapでgap違反3未満になるswapを拒否
-#   - 候補が見つからない場合のフォールバック機構を追加
+# - gap違反（4日未満の間隔での割当）を完全に排除
+#   - 初期パターン生成時にgap違反0個の候補のみ選択
+#   - 局所探索でgap違反1以上になるswapを拒否
+#   - fix_gap_violations関数で最適化後にgap違反を強制修正
+#   - 移動先が見つからない場合は割当を削除して違反を解消
+#   - 同じ病院だけでなく他の病院の空き枠も探索
 # v2.8 (2026-01-24):
 # - 大学系と外病院の差が3未満になる制約を追加
 #   - 評価関数に差が3以上の場合のペナルティ追加（重み100）
@@ -220,34 +216,7 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直スケジュール自動生成ツール v2.8 (公平性改善版 - BG/HTバランス対応)")
-print("="*60)
-print("\n【v2.8の修正内容（NEW!）】")
-print("🔧 大学系と外病院の差が3未満になる制約を追加")
-print("  - 評価関数でペナルティ（重み100）、最適化後に強制修正")
-print("🔧 recompute_stats関数のBG/HT範囲を修正")
-print("  - 出力Excelの今月/累計の大学合計・外病院合計が正しく計算されるように修正")
-print("🔧 可否コード1.2の医師が大学系最低1回の制約を追加")
-print("  - 1.2の医師が大学系0回になる問題を完全解決")
-print("🔧 TARGET_CAP違反の強制修正機能を追加")
-print("  - 上位医師が下位医師より多くなる問題を完全解決")
-print("\n【v2.7の修正内容】")
-print("🔧 ハード制約違反の自動修正機能を実装")
-print("  - 最適化完了後に全ての違反を自動検出・修正")
-print("  - カテ表+外病院違反（例：五十嵐医師のDコード日にM病院割当）を自動修正")
-print("\n【過去の修正内容】")
-print("✅ get_sched_code関数のバグ修正（0と3を無効なカテ表コードとして扱う）")
-print("✅ カテ表コードと列の制約を修正")
-print("✅ 列構造の変更対応（B〜Y列）、B〜H列2回上限制約")
-print("✅ タイムゾーン問題の修正、医師名の正規化")
-print("✅ sheet4ヘッダ検出範囲の拡大（30→50行）")
-print("✅ date_doc_countのKeyError対策")
-print("✅ 同日重複チェックの強化")
-print("="*60)
-print("\n【使い方】")
-print("1. 下のファイル選択ダイアログでExcelファイルを選択")
-print("2. 処理が自動で開始されます（5-10分かかります）")
-print("3. 完了したらダウンロードリンクが表示されます")
+print("   当直くん v3.0 (gap違反修正対応)")
 print("="*60)
 print("\nsheet1〜sheet4（またはSheet4）が入った当直Excelファイルを選択してください")
 
@@ -1430,9 +1399,9 @@ def local_search_swap(pattern_df, max_iters=2000, patience=800, refresh_every=20
             ly2,
         )
 
-        # gap違反が3未満のパターンは採用しない（ハード制約）
+        # gap違反が1以上のパターンは採用しない（ハード制約）
         new_gap_violations = new_metrics.get("gap_violations", 0)
-        if new_gap_violations < 3:
+        if new_gap_violations > 0:
             # revert
             df.at[r1, h1], df.at[r2, h2] = doc1, doc2
             if d1 != d2:
@@ -2336,7 +2305,7 @@ def fix_gap_violations(pattern_df, max_attempts=100, verbose=True):
             for ridx_src, hosp_src, date_src in positions_at_date2:
                 moved = False
 
-                # 別の日の空き枠を探す
+                # 別の日の空き枠を探す（まず同じ病院、次に他の病院）
                 for ridx_tgt in df.index:
                     date_tgt = df.at[ridx_tgt, date_col_shift]
                     if pd.isna(date_tgt):
@@ -2362,33 +2331,48 @@ def fix_gap_violations(pattern_df, max_attempts=100, verbose=True):
                     if not valid_gap:
                         continue
 
-                    # 同じ病院の空き枠を探す
-                    if pd.isna(df.at[ridx_tgt, hosp_src]):
-                        # その日にdocが既に別の病院に割当られていないかチェック
-                        already_assigned = False
-                        for hosp_check in hospital_cols:
-                            val = df.at[ridx_tgt, hosp_check]
-                            if isinstance(val, str) and normalize_name(val) == doc:
-                                already_assigned = True
-                                break
+                    # その日にdocが既に別の病院に割当られていないかチェック
+                    already_assigned = False
+                    for hosp_check in hospital_cols:
+                        val = df.at[ridx_tgt, hosp_check]
+                        if isinstance(val, str) and normalize_name(val) == doc:
+                            already_assigned = True
+                            break
 
-                        if already_assigned:
-                            continue
+                    if already_assigned:
+                        continue
 
-                        # ハード制約チェック
-                        if not can_assign_doc_to_slot(doc, date_tgt, hosp_src):
-                            continue
+                    # 全ての病院で空き枠を探す（同じ病院を優先）
+                    hospitals_to_try = [hosp_src] + [h for h in hospital_cols if h != hosp_src]
+                    for hosp_tgt in hospitals_to_try:
+                        if pd.isna(df.at[ridx_tgt, hosp_tgt]):
+                            # ハード制約チェック
+                            if not can_assign_doc_to_slot(doc, date_tgt, hosp_tgt):
+                                continue
 
-                        # 移動実行
-                        df.at[ridx_src, hosp_src] = None  # 元の日から削除
-                        df.at[ridx_tgt, hosp_src] = doc   # 新しい日に割当
-                        fixed_in_this_iteration += 1
-                        total_fixed += 1
-                        moved = True
+                            # 移動実行
+                            df.at[ridx_src, hosp_src] = None  # 元の日から削除
+                            df.at[ridx_tgt, hosp_tgt] = doc   # 新しい日に割当
+                            fixed_in_this_iteration += 1
+                            total_fixed += 1
+                            moved = True
+                            break
+
+                    if moved:
                         break
 
                 if moved:
                     # doc_assignmentsを更新
+                    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+                    break  # 次のviolationへ
+
+                # 移動先が見つからない場合は削除（最後の手段）
+                if not moved and attempt >= max_attempts - 10:
+                    if verbose:
+                        print(f"      移動先が見つからないため、{doc}の{date_src.strftime('%m/%d')}の割当を削除します")
+                    df.at[ridx_src, hosp_src] = None
+                    fixed_in_this_iteration += 1
+                    total_fixed += 1
                     counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
                     break  # 次のviolationへ
 
@@ -2477,9 +2461,9 @@ for i in range(1, NUM_PATTERNS + 1):
 
     score_rows.append({"seed": i, "score": score, "raw_score": raw_score, **metrics})
 
-    # gap違反が0, 1, 2のパターンは除外（gap違反3以上のみ採用）
+    # gap違反が0個のパターンのみ採用（完全なgap制約遵守）
     gap_violations = metrics.get("gap_violations", 0)
-    if gap_violations >= 3:
+    if gap_violations == 0:
         candidates.append({
             "seed": i,
             "score": score,
@@ -2488,13 +2472,13 @@ for i in range(1, NUM_PATTERNS + 1):
             "pattern_df": pattern_df,
         })
 
-# gap違反3以上の候補をスコア順にソート
+# gap違反0個の候補をスコア順にソート
 candidates = sorted(candidates, key=lambda e: e["raw_score"], reverse=True)[:TOP_KEEP]
 
 print(f"\n✅ {NUM_PATTERNS}パターンの生成完了")
-print(f"   gap違反3以上の候補: {len(candidates)}個")
+print(f"   gap違反0個の候補: {len(candidates)}個")
 if len(candidates) == 0:
-    print("   ⚠️ 警告: gap違反3以上の候補が見つかりませんでした。制約を緩和します...")
+    print("   ⚠️ 警告: gap違反0個の候補が見つかりませんでした。制約を緩和します...")
     # gap違反の制約を緩和して再選択
     candidates = []
     for row in score_rows:
