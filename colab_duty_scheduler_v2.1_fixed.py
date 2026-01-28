@@ -1,5 +1,16 @@
-# @title 当直くん v3.0 (gap違反完全排除対応)
+# @title 当直くん v3.1 (外病院重複排除+品質向上対応)
 # 修正内容:
+# v3.1 (2026-01-28):
+# - 外病院（L～Y列）重複を厳格化、大学病院（B～K列）重複は許容
+#   - 評価関数で外病院重複と大学病院重複を分離
+#   - W_EXTERNAL_HOSP_DUP=70（優先度3位：TARGET_CAP > gap > 外病院DUP）
+#   - fix_external_hospital_dup_violations関数で最適化後に外病院重複を修正
+#   - 同じ日の他の外病院に移動、または割当削除で修正
+# - 生成パターン数を大幅増加（品質向上）
+#   - NUM_PATTERNS: 100 → 10000（100倍）
+#   - TOP_KEEP: 15 → 100（上位候補数増加）
+#   - REFINE_TOP: 15 → 20（最適化対象増加）
+#   - より良い初期パターンが見つかりやすくなる
 # v3.0 (2026-01-28):
 # - gap違反（4日未満の間隔での割当）を完全に排除
 #   - 初期パターン生成時にgap違反0個の候補のみ選択
@@ -90,15 +101,15 @@ BG_NIGHT_COLS = set()  # 列名で「夜」固定したい大学枠があれば�
 
 WED_FORBIDDEN_DOCTORS = {'金城', '山田', '野寺'}  # 水曜の H〜U を禁止したい医師
 
-NUM_PATTERNS = int(os.getenv("NUM_PATTERNS", "100"))  # デフォルト100パターン
+NUM_PATTERNS = int(os.getenv("NUM_PATTERNS", "10000"))  # デフォルト10000パターン（高品質）
 
 # sheet1 の「枠」扱いする入力値（1以外の記号も許容したい場合）
 SLOT_MARKERS = {1, 1.0, "1", "〇", "○", "◯", "◎"}
 
 # --- ローカル探索（入替）設定 ---
 LOCAL_SEARCH_ENABLED = True
-TOP_KEEP = 15                 # greedyで残す候補数（この中に最良が残る確率↑）
-REFINE_TOP = 15               # ローカル探索をかける候補数（<= TOP_KEEP）
+TOP_KEEP = 100                # greedyで残す候補数（10000パターンから上位100候補を保持）
+REFINE_TOP = 20               # ローカル探索をかける候補数（上位20候補を最適化）
 LOCAL_MAX_ITERS = 3000        # 1候補あたりの入替試行回数
 LOCAL_PATIENCE = 1200         # 改善が出ない試行がこの回数続いたら打ち切り
 LOCAL_REFRESH_EVERY = 200     # 問題医師（gap/重複）を再抽出する間隔
@@ -106,9 +117,10 @@ LOCAL_REFRESH_EVERY = 200     # 問題医師（gap/重複）を再抽出する�
 # スコア重み（必要なら調整）
 W_FAIR_TOTAL = 10          # 全合計（active内 max-min-1）
 W_GAP = 3                  # gap(4日未満)
-W_HOSP_DUP = 1             # 同一病院複数回
+W_HOSP_DUP = 1             # 同一病院複数回（大学病院：許容）
+W_EXTERNAL_HOSP_DUP = 70   # 外病院重複（厳格：優先度3位）
 W_UNASSIGNED = 100         # 未割当
-W_CAP = 200                # cap超え（厳格化：上位医師が下位医師より多くなるのを防ぐ）
+W_CAP = 200                # cap超え（厳格化：優先度1位）
 W_BG_SPREAD = 3            # 大学合計（累計）ばらつき
 W_HT_SPREAD = 3            # 外病院合計（累計）ばらつき
 W_WD_SPREAD = 2            # 平日（累計）ばらつき
@@ -216,7 +228,7 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直くん v3.0 (gap違反修正対応)")
+print("   当直くん v3.1 (外病院重複排除+品質向上)")
 print("="*60)
 print("\nsheet1〜sheet4（またはSheet4）が入った当直Excelファイルを選択してください")
 
@@ -1120,10 +1132,16 @@ def evaluate_schedule_with_raw(
                 gap_violations += 1
 
     hosp_dup_violations = 0
+    external_hosp_dup_violations = 0  # 外病院重複（厳しく扱う）
     for doc, hdict in hosp_counts_by_doc.items():
-        for _, c in hdict.items():
+        for hosp, c in hdict.items():
             if c > 1:
-                hosp_dup_violations += (c - 1)
+                # 病院が外病院（L～Y列）かどうかを判定
+                hidx = shift_df.columns.get_loc(hosp)
+                if L_COL_INDEX <= hidx <= L_Y_END_INDEX:
+                    external_hosp_dup_violations += (c - 1)
+                else:
+                    hosp_dup_violations += (c - 1)
 
     # 偏り（累計：前月+今月）の spread
     bg_vals = [prev_bg[d] + assigned_bg.get(d, 0) for d in active_doctors]
@@ -1163,6 +1181,7 @@ def evaluate_schedule_with_raw(
     penalty += fairness_penalty * W_FAIR_TOTAL
     penalty += gap_violations * W_GAP
     penalty += hosp_dup_violations * W_HOSP_DUP
+    penalty += external_hosp_dup_violations * W_EXTERNAL_HOSP_DUP  # 外病院重複は厳格
     penalty += unassigned_slots * W_UNASSIGNED
     penalty += cap_violations * W_CAP
     penalty += code_1_2_violations * 150  # 1.2の医師が大学系0回の場合、大きなペナルティ
@@ -1183,6 +1202,7 @@ def evaluate_schedule_with_raw(
         "max_minus_min_total_active": int(diff_total),
         "gap_violations": int(gap_violations),
         "hospital_dup_violations": int(hosp_dup_violations),
+        "external_hosp_dup_violations": int(external_hosp_dup_violations),
         "unassigned_slots": int(unassigned_slots),
         "cap_violations": int(cap_violations),
         "code_1_2_violations": int(code_1_2_violations),
@@ -2404,6 +2424,139 @@ def fix_gap_violations(pattern_df, max_attempts=200, verbose=True):
 
     return df, remaining_violations == 0, total_fixed
 
+def fix_external_hospital_dup_violations(pattern_df, max_attempts=150, verbose=True):
+    """
+    外病院（L～Y列）の重複を修正する（大学病院の重複は許容）
+
+    Args:
+        pattern_df: スケジュールDataFrame
+        max_attempts: 最大試行回数
+        verbose: ログ出力するか
+
+    Returns:
+        (修正後のDataFrame, 成功フラグ, 修正数)
+    """
+    df = pattern_df.copy()
+    total_fixed = 0
+    consecutive_failures = 0
+
+    for attempt in range(max_attempts):
+        # 現在の割当状態を再計算
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+
+        # 外病院重複を検出
+        external_dup_list = []
+        for doc, hosp_dict in assigned_hosp_count.items():
+            for hosp, count in hosp_dict.items():
+                if count > 1:
+                    # 外病院かどうかを判定
+                    hidx = shift_df.columns.get_loc(hosp)
+                    if L_COL_INDEX <= hidx <= L_Y_END_INDEX:
+                        external_dup_list.append((doc, hosp, count))
+
+        if not external_dup_list:
+            if verbose and total_fixed > 0:
+                print(f"   ✅ 外病院重複を{total_fixed}件修正しました")
+            return df, True, total_fixed
+
+        if attempt == 0 and verbose:
+            dup_names = [f"{doc}({hosp}={count}回)" for doc, hosp, count in external_dup_list[:5]]
+            print(f"   ⚠️ 外病院重複を{len(external_dup_list)}件検出 → 自動修正を開始...")
+            print(f"      例: {', '.join(dup_names)}")
+
+        # 修正試行
+        fixed_in_this_iteration = 0
+
+        for doc, dup_hosp, count in external_dup_list:
+            if count <= 1:
+                continue
+
+            # この医師のこの病院への割当を探す
+            dup_positions = []
+            for ridx in df.index:
+                date = df.at[ridx, date_col_shift]
+                if pd.isna(date):
+                    continue
+                date = pd.to_datetime(date).normalize().tz_localize(None)
+
+                val = df.at[ridx, dup_hosp]
+                if isinstance(val, str) and normalize_name(val) == doc:
+                    dup_positions.append((ridx, dup_hosp, date))
+
+            # 重複のうち1つを残して、残りを別の病院に移動または削除
+            import random
+            random.shuffle(dup_positions)
+
+            for ridx, hosp, date in dup_positions[1:]:  # 最初の1つは残す
+                moved = False
+
+                # 同じ日の他の外病院（L～Y列）の空き枠を探す
+                for other_hosp in hospital_cols:
+                    other_hidx = shift_df.columns.get_loc(other_hosp)
+                    # 外病院かつ重複病院でない
+                    if not (L_COL_INDEX <= other_hidx <= L_Y_END_INDEX):
+                        continue
+                    if other_hosp == dup_hosp:
+                        continue
+
+                    # この病院にこの医師が既に割当られていないか
+                    if assigned_hosp_count[doc].get(other_hosp, 0) >= 1:
+                        continue
+
+                    # 空き枠があるか
+                    if pd.isna(df.at[ridx, other_hosp]):
+                        # ハード制約チェック
+                        if not can_assign_doc_to_slot(doc, date, other_hosp):
+                            continue
+
+                        # 移動実行
+                        df.at[ridx, dup_hosp] = None
+                        df.at[ridx, other_hosp] = doc
+                        fixed_in_this_iteration += 1
+                        total_fixed += 1
+                        moved = True
+                        break
+
+                # 移動先が見つからない場合は削除
+                if not moved and attempt >= 5:
+                    df.at[ridx, dup_hosp] = None
+                    fixed_in_this_iteration += 1
+                    total_fixed += 1
+                    if verbose and attempt < 10:
+                        print(f"      移動先が見つからないため、{doc}の{date.strftime('%m/%d')}の{dup_hosp}割当を削除します")
+                    break  # この重複の他のpositionは次回
+
+            if fixed_in_this_iteration > 0:
+                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+
+        # 進捗チェック
+        if fixed_in_this_iteration == 0:
+            consecutive_failures += 1
+        else:
+            consecutive_failures = 0
+
+        # 連続で20回修正できなければ諦める
+        if consecutive_failures >= 20:
+            break
+
+    # 最終確認
+    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+    remaining_violations = 0
+    for doc, hosp_dict in assigned_hosp_count.items():
+        for hosp, count in hosp_dict.items():
+            if count > 1:
+                hidx = shift_df.columns.get_loc(hosp)
+                if L_COL_INDEX <= hidx <= L_Y_END_INDEX:
+                    remaining_violations += (count - 1)
+
+    if verbose:
+        if remaining_violations == 0:
+            print(f"   ✅ 全ての外病院重複を修正しました（修正数: {total_fixed}）")
+        else:
+            print(f"   ⚠️ {remaining_violations}件の外病院重複が残っています（修正数: {total_fixed}）")
+
+    return df, remaining_violations == 0, total_fixed
+
 def build_diagnostics(pattern_df):
     counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(pattern_df)
     score, raw, metrics = evaluate_schedule_with_raw(
@@ -2551,15 +2704,21 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         bg_ht_fixed_df, max_attempts=200, verbose=True
     )
 
+    # 外病院重複を修正（優先度3位）
+    print(f"   候補{idx}/{REFINE_TOP}の外病院重複チェック中...")
+    ext_dup_fixed_df, ext_dup_success, ext_dup_fix_count = fix_external_hospital_dup_violations(
+        gap_fixed_df, max_attempts=150, verbose=True
+    )
+
     # 修正後に再評価
-    if fix_count > 0 or cap_fix_count > 0 or code_1_2_fix_count > 0 or bg_ht_fix_count > 0 or gap_fix_count > 0:
-        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(gap_fixed_df)
+    if fix_count > 0 or cap_fix_count > 0 or code_1_2_fix_count > 0 or bg_ht_fix_count > 0 or gap_fix_count > 0 or ext_dup_fix_count > 0:
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(ext_dup_fixed_df)
         sc2, raw2, met2 = evaluate_schedule_with_raw(
-            gap_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
+            ext_dup_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
         )
-        improved_df = gap_fixed_df
+        improved_df = ext_dup_fixed_df
     else:
-        improved_df = gap_fixed_df
+        improved_df = ext_dup_fixed_df
 
     refined.append({
         "seed": cand["seed"],
@@ -2575,6 +2734,7 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         "code_1_2_violations_fixed": code_1_2_fix_count,
         "bg_ht_imbalance_fixed": bg_ht_fix_count,
         "gap_violations_fixed": gap_fix_count,
+        "external_dup_violations_fixed": ext_dup_fix_count,
     })
 
 refined_sorted = sorted(refined, key=lambda e: e["raw_after"], reverse=True)
