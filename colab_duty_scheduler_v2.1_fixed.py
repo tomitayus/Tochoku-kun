@@ -1,6 +1,11 @@
-# @title 当直くん v2.8 (公平性改善版 - 可否コード1.2対応)
+# @title 当直くん v2.8 (公平性改善版 - BG/HTバランス対応)
 # 修正内容:
 # v2.8 (2026-01-24):
+# - 大学系と外病院の差が3未満になる制約を追加
+#   - 評価関数に差が3以上の場合のペナルティ追加（重み100）
+#   - fix_bg_ht_imbalance_violations関数で最適化後に差3以上を修正
+# - recompute_stats関数のBG/HT範囲を修正（B〜G→B〜K、H〜U→L〜Y）
+#   - これにより出力Excelの今月/累計の大学合計・外病院合計が正しく計算される
 # - 可否コード1.2の医師が大学系最低1回の制約を追加
 #   - get_avail_code関数で1.2を認識できるよう修正
 #   - fix_code_1_2_violations関数で最適化後に大学系0回を修正
@@ -204,15 +209,17 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直スケジュール自動生成ツール v2.8 (公平性改善版 - 可否コード1.2対応)")
+print("   当直スケジュール自動生成ツール v2.8 (公平性改善版 - BG/HTバランス対応)")
 print("="*60)
 print("\n【v2.8の修正内容（NEW!）】")
+print("🔧 大学系と外病院の差が3未満になる制約を追加")
+print("  - 評価関数でペナルティ（重み100）、最適化後に強制修正")
+print("🔧 recompute_stats関数のBG/HT範囲を修正")
+print("  - 出力Excelの今月/累計の大学合計・外病院合計が正しく計算されるように修正")
 print("🔧 可否コード1.2の医師が大学系最低1回の制約を追加")
 print("  - 1.2の医師が大学系0回になる問題を完全解決")
-print("  - 評価関数でペナルティ、最適化後に強制修正")
 print("🔧 TARGET_CAP違反の強制修正機能を追加")
-print("  - 上位医師（小林、及川等）が下位医師（大河内、猪股等）より多くなる問題を完全解決")
-print("🔧 W_CAPペナルティ強化（50→200）、デフォルトパターン数100に変更")
+print("  - 上位医師が下位医師より多くなる問題を完全解決")
 print("\n【v2.7の修正内容】")
 print("🔧 ハード制約違反の自動修正機能を実装")
 print("  - 最適化完了後に全ての違反を自動検出・修正")
@@ -1035,10 +1042,12 @@ def recompute_stats(pattern_df):
         doc_assignments[doc].append((date, hosp))
 
         hidx = shift_df.columns.get_loc(hosp)
-        if B_COL_INDEX <= hidx <= G_COL_INDEX:
+        # 大学系はB〜K列（B_COL_INDEX=1 〜 K_COL_INDEX=10）
+        if B_COL_INDEX <= hidx <= B_K_END_INDEX:
             bg_counts[doc] += 1
             bg_cat[doc][classify_bg_category(date, hosp)] += 1
-        elif H_COL_INDEX <= hidx <= U_COL_INDEX:
+        # 外病院はL〜Y列（L_COL_INDEX=11 〜 Y_COL_INDEX=24）
+        elif L_COL_INDEX <= hidx <= L_Y_END_INDEX:
             ht_counts[doc] += 1
 
         dow = date.weekday()
@@ -1161,6 +1170,15 @@ def evaluate_schedule_with_raw(
         if assigned_bg.get(doc, 0) == 0:
             code_1_2_violations += 1
 
+    # 大学系と外病院の差が3以上の場合のペナルティ
+    bg_ht_imbalance_violations = 0
+    for doc in active_doctors:
+        bg = assigned_bg.get(doc, 0)
+        ht = assigned_ht.get(doc, 0)
+        diff = abs(bg - ht)
+        if diff >= 3:
+            bg_ht_imbalance_violations += (diff - 2)  # 差が3以上の超過分をカウント
+
     penalty = 0
     penalty += fairness_penalty * W_FAIR_TOTAL
     penalty += gap_violations * W_GAP
@@ -1168,6 +1186,7 @@ def evaluate_schedule_with_raw(
     penalty += unassigned_slots * W_UNASSIGNED
     penalty += cap_violations * W_CAP
     penalty += code_1_2_violations * 150  # 1.2の医師が大学系0回の場合、大きなペナルティ
+    penalty += bg_ht_imbalance_violations * 100  # 大学系と外病院の差が3以上の場合、大きなペナルティ
 
     penalty += max(0, bg_spread - 1) * W_BG_SPREAD
     penalty += max(0, ht_spread - 1) * W_HT_SPREAD
@@ -1187,6 +1206,7 @@ def evaluate_schedule_with_raw(
         "unassigned_slots": int(unassigned_slots),
         "cap_violations": int(cap_violations),
         "code_1_2_violations": int(code_1_2_violations),
+        "bg_ht_imbalance_violations": int(bg_ht_imbalance_violations),
         "bg_spread_cum": float(bg_spread),
         "ht_spread_cum": float(ht_spread),
         "weekday_spread_cum": float(wd_spread),
@@ -2097,6 +2117,133 @@ def fix_code_1_2_violations(pattern_df, max_attempts=100, verbose=True):
 
     return df, remaining_violations == 0, total_fixed
 
+def fix_bg_ht_imbalance_violations(pattern_df, max_attempts=100, verbose=True):
+    """
+    大学系と外病院の差が3以上の違反を修正する
+
+    Args:
+        pattern_df: スケジュールDataFrame
+        max_attempts: 最大試行回数
+        verbose: ログ出力するか
+
+    Returns:
+        (修正後のDataFrame, 成功フラグ, 修正数)
+    """
+    df = pattern_df.copy()
+    total_fixed = 0
+
+    for attempt in range(max_attempts):
+        # 現在の割当回数を再計算
+        counts, bg_counts, ht_counts, *_ = recompute_stats(df)
+
+        # 大学系と外病院の差が3以上の医師を特定
+        imbalance_docs = []
+        for doc in active_doctors:
+            bg = bg_counts.get(doc, 0)
+            ht = ht_counts.get(doc, 0)
+            diff = abs(bg - ht)
+            if diff >= 3:
+                imbalance_docs.append((doc, bg, ht, diff))
+
+        if not imbalance_docs:
+            if verbose and total_fixed > 0:
+                print(f"   ✅ 大学系と外病院の差3以上の違反を{total_fixed}件修正しました")
+            return df, True, total_fixed
+
+        if attempt == 0 and verbose:
+            imbalance_names = [f"{doc}(BG={bg}/HT={ht})" for doc, bg, ht, diff in imbalance_docs[:5]]
+            print(f"   ⚠️ 大学系と外病院の差3以上の違反を検出 → 自動修正を開始...")
+            print(f"      対象: {', '.join(imbalance_names)}")
+
+        # 修正試行
+        fixed_in_this_iteration = 0
+
+        for doc, bg, ht, diff in imbalance_docs:
+            if diff < 3:
+                continue
+
+            # BGが多い場合: BG→HTに移動
+            # HTが多い場合: HT→BGに移動
+            if bg > ht:
+                # BGの割当を1つHTに変更
+                source_range = (B_COL_INDEX, B_K_END_INDEX)
+                target_range = (L_COL_INDEX, L_Y_END_INDEX)
+            else:
+                # HTの割当を1つBGに変更
+                source_range = (L_COL_INDEX, L_Y_END_INDEX)
+                target_range = (B_COL_INDEX, B_K_END_INDEX)
+
+            # source範囲の割当を探す
+            source_positions = []
+            for ridx in df.index:
+                date = df.at[ridx, date_col_shift]
+                if pd.isna(date):
+                    continue
+                date = pd.to_datetime(date).normalize().tz_localize(None)
+
+                for hosp in hospital_cols:
+                    idx = shift_df.columns.get_loc(hosp)
+                    if source_range[0] <= idx <= source_range[1]:
+                        val = df.at[ridx, hosp]
+                        if isinstance(val, str) and normalize_name(val) == doc:
+                            source_positions.append((ridx, hosp, date))
+
+            # 1つ移動を試みる
+            import random
+            random.shuffle(source_positions)
+
+            for ridx, hosp, date in source_positions[:1]:
+                # target範囲で空いている枠を探す
+                for target_hosp in hospital_cols:
+                    target_idx = shift_df.columns.get_loc(target_hosp)
+                    if not (target_range[0] <= target_idx <= target_range[1]):
+                        continue
+
+                    val = df.at[ridx, target_hosp]
+                    # 空き枠かどうか
+                    if not is_slot_value(shift_df.at[ridx, target_hosp]):
+                        continue
+                    if isinstance(val, str) and val in doctor_names:
+                        continue  # 既に割当済み
+
+                    # この日にdocが既に割り当てられていないかチェック
+                    already_assigned = False
+                    for h in hospital_cols:
+                        v = df.at[ridx, h]
+                        if isinstance(v, str) and normalize_name(v) == doc and h != hosp:
+                            already_assigned = True
+                            break
+
+                    if already_assigned:
+                        continue
+
+                    # 制約チェック
+                    if can_assign_doc_to_slot(doc, date, target_hosp):
+                        # sourceから削除、targetに追加
+                        df.at[ridx, hosp] = None
+                        df.at[ridx, target_hosp] = doc
+                        fixed_in_this_iteration += 1
+                        total_fixed += 1
+                        break  # 次のdocへ
+
+                if fixed_in_this_iteration > 0:
+                    break  # 次のdocへ
+
+        if fixed_in_this_iteration == 0:
+            break
+
+    # 最終確認
+    counts, bg_counts, ht_counts, *_ = recompute_stats(df)
+    remaining_violations = sum(1 for doc in active_doctors if abs(bg_counts.get(doc, 0) - ht_counts.get(doc, 0)) >= 3)
+
+    if verbose:
+        if remaining_violations == 0:
+            print(f"   ✅ 全ての大学系と外病院の差3以上の違反を修正しました（修正数: {total_fixed}）")
+        else:
+            print(f"   ⚠️ {remaining_violations}件の大学系と外病院の差3以上の違反が残っています（修正数: {total_fixed}）")
+
+    return df, remaining_violations == 0, total_fixed
+
 def build_diagnostics(pattern_df):
     counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(pattern_df)
     score, raw, metrics = evaluate_schedule_with_raw(
@@ -2207,15 +2354,21 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         cap_fixed_df, max_attempts=100, verbose=True
     )
 
+    # 大学系と外病院の差が3以上の違反を修正
+    print(f"   候補{idx}/{REFINE_TOP}の大学系/外病院バランスチェック中...")
+    bg_ht_fixed_df, bg_ht_success, bg_ht_fix_count = fix_bg_ht_imbalance_violations(
+        code_1_2_fixed_df, max_attempts=100, verbose=True
+    )
+
     # 修正後に再評価
-    if fix_count > 0 or cap_fix_count > 0 or code_1_2_fix_count > 0:
-        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(code_1_2_fixed_df)
+    if fix_count > 0 or cap_fix_count > 0 or code_1_2_fix_count > 0 or bg_ht_fix_count > 0:
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(bg_ht_fixed_df)
         sc2, raw2, met2 = evaluate_schedule_with_raw(
-            code_1_2_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
+            bg_ht_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
         )
-        improved_df = code_1_2_fixed_df
+        improved_df = bg_ht_fixed_df
     else:
-        improved_df = code_1_2_fixed_df
+        improved_df = bg_ht_fixed_df
 
     refined.append({
         "seed": cand["seed"],
@@ -2229,6 +2382,7 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         "violations_failed": fail_count,
         "cap_violations_fixed": cap_fix_count,
         "code_1_2_violations_fixed": code_1_2_fix_count,
+        "bg_ht_imbalance_fixed": bg_ht_fix_count,
     })
 
 refined_sorted = sorted(refined, key=lambda e: e["raw_after"], reverse=True)
@@ -2258,9 +2412,11 @@ for rank, pattern in enumerate(top_patterns, 1):
         + f"未割当={pattern['metrics_after']['unassigned_slots']}, "
         + f"cap違反={pattern['metrics_after'].get('cap_violations', 0)}, "
         + f"1.2違反={pattern['metrics_after'].get('code_1_2_violations', 0)}, "
-        + f"制約違反修正={pattern.get('violations_fixed', 0)}件, "
+        + f"BG/HT差3以上={pattern['metrics_after'].get('bg_ht_imbalance_violations', 0)}, "
+        + f"制約修正={pattern.get('violations_fixed', 0)}件, "
         + f"CAP修正={pattern.get('cap_violations_fixed', 0)}件, "
-        + f"1.2修正={pattern.get('code_1_2_violations_fixed', 0)}件"
+        + f"1.2修正={pattern.get('code_1_2_violations_fixed', 0)}件, "
+        + f"BG/HT修正={pattern.get('bg_ht_imbalance_fixed', 0)}件"
     )
 
 # =========================
