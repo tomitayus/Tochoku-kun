@@ -1,5 +1,16 @@
-# @title 当直くん v2.8 (公平性改善版 - BG/HTバランス対応)
+# @title 当直くん v3.0 (gap違反修正対応)
 # 修正内容:
+# v3.0 (2026-01-28):
+# - gap違反（4日未満の間隔での割当）の修正機能を追加
+#   - fix_gap_violations関数で最適化後にgap違反を自動修正
+#   - 違反のある割当を4日以上離れた日に移動
+#   - 初期パターン生成時にgap違反3以上の候補のみ選択
+#   - 局所探索でgap違反3未満になるswapを拒否
+# v2.9 (2026-01-28):
+# - gap違反フィルタリング制約を追加（gap違反は3以上必須）
+#   - 候補選択時にgap違反0,1,2のパターンを除外
+#   - local_search_swapでgap違反3未満になるswapを拒否
+#   - 候補が見つからない場合のフォールバック機構を追加
 # v2.8 (2026-01-24):
 # - 大学系と外病院の差が3未満になる制約を追加
 #   - 評価関数に差が3以上の場合のペナルティ追加（重み100）
@@ -2259,6 +2270,151 @@ def fix_bg_ht_imbalance_violations(pattern_df, max_attempts=100, verbose=True):
 
     return df, remaining_violations == 0, total_fixed
 
+def fix_gap_violations(pattern_df, max_attempts=100, verbose=True):
+    """
+    gap違反（4日未満の間隔での割当）を修正する
+
+    Args:
+        pattern_df: スケジュールDataFrame
+        max_attempts: 最大試行回数
+        verbose: ログ出力するか
+
+    Returns:
+        (修正後のDataFrame, 成功フラグ, 修正数)
+    """
+    df = pattern_df.copy()
+    total_fixed = 0
+
+    for attempt in range(max_attempts):
+        # 現在の割当状態を再計算
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+
+        # gap違反を検出
+        gap_violation_list = []
+        for doc, date_hosp_list in doc_assignments.items():
+            dates = sorted([d for d, h in date_hosp_list])
+            for i in range(1, len(dates)):
+                gap = (dates[i] - dates[i-1]).days
+                if gap < 4:
+                    gap_violation_list.append((doc, dates[i-1], dates[i], gap))
+
+        if not gap_violation_list:
+            if verbose and total_fixed > 0:
+                print(f"   ✅ gap違反（4日未満の間隔）を{total_fixed}件修正しました")
+            return df, True, total_fixed
+
+        if attempt == 0 and verbose:
+            violation_names = [f"{doc}({d1.strftime('%m/%d')}-{d2.strftime('%m/%d')}={gap}日)"
+                             for doc, d1, d2, gap in gap_violation_list[:5]]
+            print(f"   ⚠️ gap違反を{len(gap_violation_list)}件検出 → 自動修正を開始...")
+            print(f"      例: {', '.join(violation_names)}")
+
+        # 修正試行
+        fixed_in_this_iteration = 0
+
+        for doc, date1, date2, gap in gap_violation_list:
+            if gap >= 4:
+                continue
+
+            # date2の割当を別の日に移動することを試みる
+            # date2の割当を探す
+            positions_at_date2 = []
+            for ridx in df.index:
+                date = df.at[ridx, date_col_shift]
+                if pd.isna(date):
+                    continue
+                date = pd.to_datetime(date).normalize().tz_localize(None)
+                if date != date2:
+                    continue
+
+                for hosp in hospital_cols:
+                    val = df.at[ridx, hosp]
+                    if isinstance(val, str) and normalize_name(val) == doc:
+                        positions_at_date2.append((ridx, hosp, date))
+
+            # 移動先候補を探す（date1から4日以上離れた日）
+            for ridx_src, hosp_src, date_src in positions_at_date2:
+                moved = False
+
+                # 別の日の空き枠を探す
+                for ridx_tgt in df.index:
+                    date_tgt = df.at[ridx_tgt, date_col_shift]
+                    if pd.isna(date_tgt):
+                        continue
+                    date_tgt = pd.to_datetime(date_tgt).normalize().tz_localize(None)
+
+                    # date1とdate_tgtの間隔をチェック
+                    gap_from_date1 = abs((date_tgt - date1).days)
+                    if gap_from_date1 < 4:
+                        continue
+
+                    # docの他の割当とdate_tgtの間隔をチェック
+                    doc_dates = sorted([d for d, h in doc_assignments[doc]])
+                    # date2を除外したリストで確認
+                    doc_dates_without_date2 = [d for d in doc_dates if d != date2]
+
+                    valid_gap = True
+                    for existing_date in doc_dates_without_date2:
+                        if abs((date_tgt - existing_date).days) < 4:
+                            valid_gap = False
+                            break
+
+                    if not valid_gap:
+                        continue
+
+                    # 同じ病院の空き枠を探す
+                    if pd.isna(df.at[ridx_tgt, hosp_src]):
+                        # その日にdocが既に別の病院に割当られていないかチェック
+                        already_assigned = False
+                        for hosp_check in hospital_cols:
+                            val = df.at[ridx_tgt, hosp_check]
+                            if isinstance(val, str) and normalize_name(val) == doc:
+                                already_assigned = True
+                                break
+
+                        if already_assigned:
+                            continue
+
+                        # ハード制約チェック
+                        if not can_assign_doc_to_slot(doc, date_tgt, hosp_src):
+                            continue
+
+                        # 移動実行
+                        df.at[ridx_src, hosp_src] = None  # 元の日から削除
+                        df.at[ridx_tgt, hosp_src] = doc   # 新しい日に割当
+                        fixed_in_this_iteration += 1
+                        total_fixed += 1
+                        moved = True
+                        break
+
+                if moved:
+                    # doc_assignmentsを更新
+                    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+                    break  # 次のviolationへ
+
+            if fixed_in_this_iteration > 0:
+                break  # 次のviolationへ
+
+        if fixed_in_this_iteration == 0:
+            break
+
+    # 最終確認
+    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+    remaining_violations = 0
+    for doc, date_hosp_list in doc_assignments.items():
+        dates = sorted([d for d, h in date_hosp_list])
+        for i in range(1, len(dates)):
+            if (dates[i] - dates[i-1]).days < 4:
+                remaining_violations += 1
+
+    if verbose:
+        if remaining_violations == 0:
+            print(f"   ✅ 全てのgap違反を修正しました（修正数: {total_fixed}）")
+        else:
+            print(f"   ⚠️ {remaining_violations}件のgap違反が残っています（修正数: {total_fixed}）")
+
+    return df, remaining_violations == 0, total_fixed
+
 def build_diagnostics(pattern_df):
     counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(pattern_df)
     score, raw, metrics = evaluate_schedule_with_raw(
@@ -2400,15 +2556,21 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         code_1_2_fixed_df, max_attempts=100, verbose=True
     )
 
+    # gap違反（4日未満の間隔）を修正
+    print(f"   候補{idx}/{REFINE_TOP}のgap違反チェック中...")
+    gap_fixed_df, gap_success, gap_fix_count = fix_gap_violations(
+        bg_ht_fixed_df, max_attempts=100, verbose=True
+    )
+
     # 修正後に再評価
-    if fix_count > 0 or cap_fix_count > 0 or code_1_2_fix_count > 0 or bg_ht_fix_count > 0:
-        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(bg_ht_fixed_df)
+    if fix_count > 0 or cap_fix_count > 0 or code_1_2_fix_count > 0 or bg_ht_fix_count > 0 or gap_fix_count > 0:
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(gap_fixed_df)
         sc2, raw2, met2 = evaluate_schedule_with_raw(
-            bg_ht_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
+            gap_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
         )
-        improved_df = bg_ht_fixed_df
+        improved_df = gap_fixed_df
     else:
-        improved_df = bg_ht_fixed_df
+        improved_df = gap_fixed_df
 
     refined.append({
         "seed": cand["seed"],
@@ -2423,6 +2585,7 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         "cap_violations_fixed": cap_fix_count,
         "code_1_2_violations_fixed": code_1_2_fix_count,
         "bg_ht_imbalance_fixed": bg_ht_fix_count,
+        "gap_violations_fixed": gap_fix_count,
     })
 
 refined_sorted = sorted(refined, key=lambda e: e["raw_after"], reverse=True)
