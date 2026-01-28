@@ -1867,8 +1867,9 @@ def fix_hard_constraint_violations(pattern_df, max_attempts=50, verbose=True):
                     print(f"   ⚠️ 修正失敗: {date.strftime('%Y-%m-%d')} {hosp} ({violation_type})")
 
         # 進捗がなければループ終了
-        if fixed_in_this_iteration == 0:
-            break
+        # 修正が進まなくてもmax_attemptsまで試行を続ける
+        # if fixed_in_this_iteration == 0:
+        #     break
 
     # 最終チェック
     final_violations = build_hard_constraint_violations(df)
@@ -1984,8 +1985,9 @@ def fix_target_cap_violations(pattern_df, max_attempts=100, verbose=True):
 
                     break  # 次のover_docへ
 
-        if fixed_in_this_iteration == 0:
-            break
+        # 修正が進まなくてもmax_attemptsまで試行を続ける
+        # if fixed_in_this_iteration == 0:
+        #     break
 
     # 最終確認
     counts, *_ = recompute_stats(df)
@@ -2097,8 +2099,9 @@ def fix_code_1_2_violations(pattern_df, max_attempts=100, verbose=True):
                 if fixed_in_this_iteration > 0:
                     break  # 次のzero_docへ
 
-        if fixed_in_this_iteration == 0:
-            break
+        # 修正が進まなくてもmax_attemptsまで試行を続ける
+        # if fixed_in_this_iteration == 0:
+        #     break
 
     # 最終確認
     counts, bg_counts, *_ = recompute_stats(df)
@@ -2224,8 +2227,9 @@ def fix_bg_ht_imbalance_violations(pattern_df, max_attempts=100, verbose=True):
                 if fixed_in_this_iteration > 0:
                     break  # 次のdocへ
 
-        if fixed_in_this_iteration == 0:
-            break
+        # 修正が進まなくてもmax_attemptsまで試行を続ける
+        # if fixed_in_this_iteration == 0:
+        #     break
 
     # 最終確認
     counts, bg_counts, ht_counts, *_ = recompute_stats(df)
@@ -2239,7 +2243,7 @@ def fix_bg_ht_imbalance_violations(pattern_df, max_attempts=100, verbose=True):
 
     return df, remaining_violations == 0, total_fixed
 
-def fix_gap_violations(pattern_df, max_attempts=100, verbose=True):
+def fix_gap_violations(pattern_df, max_attempts=200, verbose=True):
     """
     gap違反（4日未満の間隔での割当）を修正する
 
@@ -2253,6 +2257,7 @@ def fix_gap_violations(pattern_df, max_attempts=100, verbose=True):
     """
     df = pattern_df.copy()
     total_fixed = 0
+    consecutive_failures = 0
 
     for attempt in range(max_attempts):
         # 現在の割当状態を再計算
@@ -2278,14 +2283,13 @@ def fix_gap_violations(pattern_df, max_attempts=100, verbose=True):
             print(f"   ⚠️ gap違反を{len(gap_violation_list)}件検出 → 自動修正を開始...")
             print(f"      例: {', '.join(violation_names)}")
 
-        # 修正試行
+        # 修正試行（1イテレーションで複数の違反を修正）
         fixed_in_this_iteration = 0
 
         for doc, date1, date2, gap in gap_violation_list:
             if gap >= 4:
                 continue
 
-            # date2の割当を別の日に移動することを試みる
             # date2の割当を探す
             positions_at_date2 = []
             for ridx in df.index:
@@ -2301,11 +2305,11 @@ def fix_gap_violations(pattern_df, max_attempts=100, verbose=True):
                     if isinstance(val, str) and normalize_name(val) == doc:
                         positions_at_date2.append((ridx, hosp, date))
 
-            # 移動先候補を探す（date1から4日以上離れた日）
+            # 各positionに対して修正を試みる
             for ridx_src, hosp_src, date_src in positions_at_date2:
                 moved = False
 
-                # 別の日の空き枠を探す（まず同じ病院、次に他の病院）
+                # 移動先候補を探す
                 for ridx_tgt in df.index:
                     date_tgt = df.at[ridx_tgt, date_col_shift]
                     if pd.isna(date_tgt):
@@ -2319,7 +2323,6 @@ def fix_gap_violations(pattern_df, max_attempts=100, verbose=True):
 
                     # docの他の割当とdate_tgtの間隔をチェック
                     doc_dates = sorted([d for d, h in doc_assignments[doc]])
-                    # date2を除外したリストで確認
                     doc_dates_without_date2 = [d for d in doc_dates if d != date2]
 
                     valid_gap = True
@@ -2331,7 +2334,7 @@ def fix_gap_violations(pattern_df, max_attempts=100, verbose=True):
                     if not valid_gap:
                         continue
 
-                    # その日にdocが既に別の病院に割当られていないかチェック
+                    # その日にdocが既に割当られていないかチェック
                     already_assigned = False
                     for hosp_check in hospital_cols:
                         val = df.at[ridx_tgt, hosp_check]
@@ -2342,7 +2345,7 @@ def fix_gap_violations(pattern_df, max_attempts=100, verbose=True):
                     if already_assigned:
                         continue
 
-                    # 全ての病院で空き枠を探す（同じ病院を優先）
+                    # 全ての病院で空き枠を探す
                     hospitals_to_try = [hosp_src] + [h for h in hospital_cols if h != hosp_src]
                     for hosp_tgt in hospitals_to_try:
                         if pd.isna(df.at[ridx_tgt, hosp_tgt]):
@@ -2351,8 +2354,8 @@ def fix_gap_violations(pattern_df, max_attempts=100, verbose=True):
                                 continue
 
                             # 移動実行
-                            df.at[ridx_src, hosp_src] = None  # 元の日から削除
-                            df.at[ridx_tgt, hosp_tgt] = doc   # 新しい日に割当
+                            df.at[ridx_src, hosp_src] = None
+                            df.at[ridx_tgt, hosp_tgt] = doc
                             fixed_in_this_iteration += 1
                             total_fixed += 1
                             moved = True
@@ -2361,25 +2364,27 @@ def fix_gap_violations(pattern_df, max_attempts=100, verbose=True):
                     if moved:
                         break
 
-                if moved:
-                    # doc_assignmentsを更新
-                    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
-                    break  # 次のviolationへ
-
-                # 移動先が見つからない場合は削除（最後の手段）
-                if not moved and attempt >= max_attempts - 10:
-                    if verbose:
-                        print(f"      移動先が見つからないため、{doc}の{date_src.strftime('%m/%d')}の割当を削除します")
+                # 移動先が見つからない場合は削除（積極的に実行）
+                if not moved and attempt >= 5:  # 5回目以降は削除も検討
                     df.at[ridx_src, hosp_src] = None
                     fixed_in_this_iteration += 1
                     total_fixed += 1
-                    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
-                    break  # 次のviolationへ
+                    if verbose and attempt < 10:
+                        print(f"      移動先が見つからないため、{doc}の{date_src.strftime('%m/%d')}の割当を削除します")
+                    break  # この違反の他のpositionは試さない
 
+            # この違反を修正したら、doc_assignmentsを更新
             if fixed_in_this_iteration > 0:
-                break  # 次のviolationへ
+                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
 
+        # 進捗チェック
         if fixed_in_this_iteration == 0:
+            consecutive_failures += 1
+        else:
+            consecutive_failures = 0
+
+        # 連続で20回修正できなければ諦める
+        if consecutive_failures >= 20:
             break
 
     # 最終確認
@@ -2543,7 +2548,7 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
     # gap違反（4日未満の間隔）を修正
     print(f"   候補{idx}/{REFINE_TOP}のgap違反チェック中...")
     gap_fixed_df, gap_success, gap_fix_count = fix_gap_violations(
-        bg_ht_fixed_df, max_attempts=100, verbose=True
+        bg_ht_fixed_df, max_attempts=200, verbose=True
     )
 
     # 修正後に再評価
