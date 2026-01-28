@@ -2,16 +2,20 @@
 # 修正内容:
 # v3.3 (2026-01-28):
 # - 大学病院3回以上を禁止（不満が高い）
-#   - bg_over_2_violations: 大学3回以上の違反を検出
-#   - ペナルティ: 150（厳格）
-#   - 大学は最大2回までに制限
+#   - bg_over_2_violations: 大学3回以上の違反を検出（ペナルティ150）
+#   - fix_university_over_2_violations: 最適化後に大学3回以上を修正
+#   - 大学の割当を外病院に移動、または削除して2回以下に制限
 # - 大学病院の平日偏り制約を追加（平日2回以上は不満）
-#   - bg_weekday_over_violations: 大学の平日2回以上の違反を検出
-#   - ペナルティ: 80
+#   - bg_weekday_over_violations: 大学の平日2回以上の違反を検出（ペナルティ80）
+#   - fix_university_weekday_balance_violations: 最適化後に平日偏りを修正
+#   - 大学平日の割当を外病院に移動、または削除
 # - 全体の公平性を強化（2回の医師がいるなら4回の医師から渡す）
 #   - fairness_penalty計算を強化: diff_total >= 2の場合、2倍のペナルティ
 #   - W_FAIR_TOTAL: 10 → 30（公平性の重要度を上げる）
 #   - min=2, max=4のような差が大きい場合に強く制約
+# - 修正パイプラインを拡充
+#   - 最適化後に全ての制約違反を強制的に修正
+#   - 順序: ハード制約 → TARGET_CAP → 1.2 → BG/HT → gap → 外病院DUP → 大学3+ → 大学平日偏り
 # v3.2 (2026-01-28):
 # - 生成パターン数をデフォルト100に戻す（処理時間の最適化）
 #   - NUM_PATTERNS: 10000 → 100
@@ -2609,6 +2613,265 @@ def fix_external_hospital_dup_violations(pattern_df, max_attempts=150, verbose=T
 
     return df, remaining_violations == 0, total_fixed
 
+def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True):
+    """
+    大学病院（B～K列）が3回以上の医師の違反を修正する
+
+    Args:
+        pattern_df: スケジュールDataFrame
+        max_attempts: 最大試行回数
+        verbose: ログ出力するか
+
+    Returns:
+        (修正後のDataFrame, 成功フラグ, 修正数)
+    """
+    df = pattern_df.copy()
+    total_fixed = 0
+    consecutive_failures = 0
+
+    for attempt in range(max_attempts):
+        # 現在の割当状態を再計算
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+
+        # 大学3回以上の医師を検出
+        over_2_list = []
+        for doc in active_doctors:
+            bg_count = bg_counts.get(doc, 0)
+            if bg_count >= 3:
+                over_2_list.append((doc, bg_count))
+
+        if not over_2_list:
+            if verbose and total_fixed > 0:
+                print(f"   ✅ 大学3回以上違反を{total_fixed}件修正しました")
+            return df, True, total_fixed
+
+        if attempt == 0 and verbose:
+            over_names = [f"{doc}({bg_count}回)" for doc, bg_count in over_2_list[:5]]
+            print(f"   ⚠️ 大学3回以上違反を{len(over_2_list)}件検出 → 自動修正を開始...")
+            print(f"      対象: {', '.join(over_names)}")
+
+        # 修正試行
+        fixed_in_this_iteration = 0
+
+        for doc, bg_count in over_2_list:
+            if bg_count < 3:
+                continue
+
+            # この医師の大学病院への割当を探す
+            bg_positions = []
+            for ridx in df.index:
+                date = df.at[ridx, date_col_shift]
+                if pd.isna(date):
+                    continue
+                date = pd.to_datetime(date).normalize().tz_localize(None)
+
+                for hosp in hospital_cols:
+                    hidx = shift_df.columns.get_loc(hosp)
+                    # 大学病院（B～K列）か
+                    if not (B_COL_INDEX <= hidx <= B_K_END_INDEX):
+                        continue
+
+                    val = df.at[ridx, hosp]
+                    if isinstance(val, str) and normalize_name(val) == doc:
+                        bg_positions.append((ridx, hosp, date))
+
+            # 3回以上のうち、削減する（2回まで減らす）
+            excess = bg_count - 2
+            import random
+            random.shuffle(bg_positions)
+
+            for ridx, hosp, date in bg_positions[:excess]:
+                moved = False
+
+                # 同じ日の外病院（L～Y列）の空き枠に移動を試みる
+                for other_hosp in hospital_cols:
+                    other_hidx = shift_df.columns.get_loc(other_hosp)
+                    # 外病院か
+                    if not (L_COL_INDEX <= other_hidx <= L_Y_END_INDEX):
+                        continue
+
+                    # この病院にこの医師が既に割当られていないか
+                    if assigned_hosp_count[doc].get(other_hosp, 0) >= 1:
+                        continue
+
+                    # 空き枠があるか
+                    if pd.isna(df.at[ridx, other_hosp]):
+                        # ハード制約チェック
+                        if not can_assign_doc_to_slot(doc, date, other_hosp):
+                            continue
+
+                        # 移動実行
+                        df.at[ridx, hosp] = None
+                        df.at[ridx, other_hosp] = doc
+                        fixed_in_this_iteration += 1
+                        total_fixed += 1
+                        moved = True
+                        break
+
+                # 移動先が見つからない場合は削除
+                if not moved and attempt >= 5:
+                    df.at[ridx, hosp] = None
+                    fixed_in_this_iteration += 1
+                    total_fixed += 1
+                    if verbose and attempt < 10:
+                        print(f"      {doc}の{date.strftime('%m/%d')}の大学病院割当を削除します（3回以上→2回）")
+
+            if fixed_in_this_iteration > 0:
+                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+
+        # 進捗チェック
+        if fixed_in_this_iteration == 0:
+            consecutive_failures += 1
+        else:
+            consecutive_failures = 0
+
+        # 連続で20回修正できなければ諦める
+        if consecutive_failures >= 20:
+            break
+
+    # 最終確認
+    counts, bg_counts, *_ = recompute_stats(df)
+    remaining_violations = sum(1 for doc in active_doctors if bg_counts.get(doc, 0) >= 3)
+
+    if verbose:
+        if remaining_violations == 0:
+            print(f"   ✅ 全ての大学3回以上違反を修正しました（修正数: {total_fixed}）")
+        else:
+            print(f"   ⚠️ {remaining_violations}件の大学3回以上違反が残っています（修正数: {total_fixed}）")
+
+    return df, remaining_violations == 0, total_fixed
+
+def fix_university_weekday_balance_violations(pattern_df, max_attempts=150, verbose=True):
+    """
+    大学病院の平日偏り（平日2回以上）の違反を修正する
+
+    Args:
+        pattern_df: スケジュールDataFrame
+        max_attempts: 最大試行回数
+        verbose: ログ出力するか
+
+    Returns:
+        (修正後のDataFrame, 成功フラグ, 修正数)
+    """
+    df = pattern_df.copy()
+    total_fixed = 0
+    consecutive_failures = 0
+
+    for attempt in range(max_attempts):
+        # 現在の割当状態を再計算
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+
+        # 大学の平日2回以上の医師を検出
+        weekday_over_list = []
+        for doc in active_doctors:
+            weekday_count = bg_cat[doc].get("平日", 0)
+            if weekday_count >= 2:
+                weekday_over_list.append((doc, weekday_count, bg_counts.get(doc, 0)))
+
+        if not weekday_over_list:
+            if verbose and total_fixed > 0:
+                print(f"   ✅ 大学平日偏り違反を{total_fixed}件修正しました")
+            return df, True, total_fixed
+
+        if attempt == 0 and verbose:
+            over_names = [f"{doc}(平日{wd}回/大学{total}回)" for doc, wd, total in weekday_over_list[:5]]
+            print(f"   ⚠️ 大学平日偏り違反を{len(weekday_over_list)}件検出 → 自動修正を開始...")
+            print(f"      対象: {', '.join(over_names)}")
+
+        # 修正試行
+        fixed_in_this_iteration = 0
+
+        for doc, weekday_count, bg_total in weekday_over_list:
+            if weekday_count < 2:
+                continue
+
+            # この医師の大学病院平日の割当を探す
+            bg_weekday_positions = []
+            for ridx in df.index:
+                date = df.at[ridx, date_col_shift]
+                if pd.isna(date):
+                    continue
+                date = pd.to_datetime(date).normalize().tz_localize(None)
+
+                for hosp in hospital_cols:
+                    hidx = shift_df.columns.get_loc(hosp)
+                    # 大学病院（B～K列）か
+                    if not (B_COL_INDEX <= hidx <= B_K_END_INDEX):
+                        continue
+
+                    val = df.at[ridx, hosp]
+                    if isinstance(val, str) and normalize_name(val) == doc:
+                        # 平日か
+                        category = classify_bg_category(date, hosp)
+                        if category == "平日":
+                            bg_weekday_positions.append((ridx, hosp, date))
+
+            # 平日のうち1つを外病院に移動または削除
+            import random
+            random.shuffle(bg_weekday_positions)
+
+            for ridx, hosp, date in bg_weekday_positions[:1]:  # 1つだけ試行
+                moved = False
+
+                # 同じ日の外病院（L～Y列）の空き枠に移動を試みる
+                for other_hosp in hospital_cols:
+                    other_hidx = shift_df.columns.get_loc(other_hosp)
+                    # 外病院か
+                    if not (L_COL_INDEX <= other_hidx <= L_Y_END_INDEX):
+                        continue
+
+                    # この病院にこの医師が既に割当られていないか
+                    if assigned_hosp_count[doc].get(other_hosp, 0) >= 1:
+                        continue
+
+                    # 空き枠があるか
+                    if pd.isna(df.at[ridx, other_hosp]):
+                        # ハード制約チェック
+                        if not can_assign_doc_to_slot(doc, date, other_hosp):
+                            continue
+
+                        # 移動実行
+                        df.at[ridx, hosp] = None
+                        df.at[ridx, other_hosp] = doc
+                        fixed_in_this_iteration += 1
+                        total_fixed += 1
+                        moved = True
+                        break
+
+                # 移動先が見つからない場合は削除
+                if not moved and attempt >= 5:
+                    df.at[ridx, hosp] = None
+                    fixed_in_this_iteration += 1
+                    total_fixed += 1
+                    if verbose and attempt < 10:
+                        print(f"      {doc}の{date.strftime('%m/%d')}の大学平日割当を削除します")
+                    break
+
+            if fixed_in_this_iteration > 0:
+                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+
+        # 進捗チェック
+        if fixed_in_this_iteration == 0:
+            consecutive_failures += 1
+        else:
+            consecutive_failures = 0
+
+        # 連続で20回修正できなければ諦める
+        if consecutive_failures >= 20:
+            break
+
+    # 最終確認
+    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(df)
+    remaining_violations = sum(1 for doc in active_doctors if bg_cat[doc].get("平日", 0) >= 2)
+
+    if verbose:
+        if remaining_violations == 0:
+            print(f"   ✅ 全ての大学平日偏り違反を修正しました（修正数: {total_fixed}）")
+        else:
+            print(f"   ⚠️ {remaining_violations}件の大学平日偏り違反が残っています（修正数: {total_fixed}）")
+
+    return df, remaining_violations == 0, total_fixed
+
 def build_diagnostics(pattern_df):
     counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(pattern_df)
     score, raw, metrics = evaluate_schedule_with_raw(
@@ -2762,15 +3025,27 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         gap_fixed_df, max_attempts=150, verbose=True
     )
 
+    # 大学3回以上違反を修正
+    print(f"   候補{idx}/{REFINE_TOP}の大学3回以上チェック中...")
+    univ_over_2_fixed_df, univ_over_2_success, univ_over_2_fix_count = fix_university_over_2_violations(
+        ext_dup_fixed_df, max_attempts=150, verbose=True
+    )
+
+    # 大学平日偏り違反を修正
+    print(f"   候補{idx}/{REFINE_TOP}の大学平日偏りチェック中...")
+    univ_weekday_fixed_df, univ_weekday_success, univ_weekday_fix_count = fix_university_weekday_balance_violations(
+        univ_over_2_fixed_df, max_attempts=150, verbose=True
+    )
+
     # 修正後に再評価
-    if fix_count > 0 or cap_fix_count > 0 or code_1_2_fix_count > 0 or bg_ht_fix_count > 0 or gap_fix_count > 0 or ext_dup_fix_count > 0:
-        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(ext_dup_fixed_df)
+    if fix_count > 0 or cap_fix_count > 0 or code_1_2_fix_count > 0 or bg_ht_fix_count > 0 or gap_fix_count > 0 or ext_dup_fix_count > 0 or univ_over_2_fix_count > 0 or univ_weekday_fix_count > 0:
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(univ_weekday_fixed_df)
         sc2, raw2, met2 = evaluate_schedule_with_raw(
-            ext_dup_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
+            univ_weekday_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
         )
-        improved_df = ext_dup_fixed_df
+        improved_df = univ_weekday_fixed_df
     else:
-        improved_df = ext_dup_fixed_df
+        improved_df = univ_weekday_fixed_df
 
     refined.append({
         "seed": cand["seed"],
@@ -2787,6 +3062,8 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         "bg_ht_imbalance_fixed": bg_ht_fix_count,
         "gap_violations_fixed": gap_fix_count,
         "external_dup_violations_fixed": ext_dup_fix_count,
+        "univ_over_2_violations_fixed": univ_over_2_fix_count,
+        "univ_weekday_violations_fixed": univ_weekday_fix_count,
     })
 
 refined_sorted = sorted(refined, key=lambda e: e["raw_after"], reverse=True)
