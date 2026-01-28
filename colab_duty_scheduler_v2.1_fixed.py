@@ -1,5 +1,17 @@
-# @title 当直くん v3.2 (優先順位厳格化+大学病院平日休日バランス対応)
+# @title 当直くん v3.3 (大学3回禁止+公平性強化対応)
 # 修正内容:
+# v3.3 (2026-01-28):
+# - 大学病院3回以上を禁止（不満が高い）
+#   - bg_over_2_violations: 大学3回以上の違反を検出
+#   - ペナルティ: 150（厳格）
+#   - 大学は最大2回までに制限
+# - 大学病院の平日偏り制約を追加（平日2回以上は不満）
+#   - bg_weekday_over_violations: 大学の平日2回以上の違反を検出
+#   - ペナルティ: 80
+# - 全体の公平性を強化（2回の医師がいるなら4回の医師から渡す）
+#   - fairness_penalty計算を強化: diff_total >= 2の場合、2倍のペナルティ
+#   - W_FAIR_TOTAL: 10 → 30（公平性の重要度を上げる）
+#   - min=2, max=4のような差が大きい場合に強く制約
 # v3.2 (2026-01-28):
 # - 生成パターン数をデフォルト100に戻す（処理時間の最適化）
 #   - NUM_PATTERNS: 10000 → 100
@@ -123,7 +135,7 @@ LOCAL_REFRESH_EVERY = 200     # 問題医師（gap/重複）を再抽出する�
 
 # スコア重み（必要なら調整）
 # 優先順位: TARGET_CAP > gap > DUP を死守
-W_FAIR_TOTAL = 10          # 全合計（active内 max-min-1）
+W_FAIR_TOTAL = 30          # 全合計（active内 max-min）- 公平性強化
 W_GAP = 100                # gap(4日未満) - 優先度2位
 W_HOSP_DUP = 1             # 同一病院複数回（大学病院：許容）
 W_EXTERNAL_HOSP_DUP = 70   # 外病院重複（厳格：優先度3位）
@@ -236,7 +248,7 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直くん v3.2 (優先順位厳格化+平日休日バランス)")
+print("   当直くん v3.3 (大学3回禁止+公平性強化)")
 print("="*60)
 print("\nsheet1〜sheet4（またはSheet4）が入った当直Excelファイルを選択してください")
 
@@ -1114,7 +1126,12 @@ def evaluate_schedule_with_raw(
     max_c = max(active_counts) if active_counts else 0
     min_c = min(active_counts) if active_counts else 0
     diff_total = max_c - min_c
-    fairness_penalty = max(0, diff_total - 1)
+    # 差が2以上の場合、不満が高いので強いペナルティ
+    # 例: min=2, max=4の場合、4回の医師から2回の医師に渡すべき
+    if diff_total >= 2:
+        fairness_penalty = diff_total * 2  # 2倍のペナルティ
+    else:
+        fairness_penalty = max(0, diff_total - 1)
 
     # gap(4日未満) と 同一病院重複
     dates_by_doc = defaultdict(list)
@@ -1187,14 +1204,24 @@ def evaluate_schedule_with_raw(
 
     # 大学病院2回の場合、平日1回+休日1回のバランス違反
     bg_weekday_weekend_imbalance = 0
+    bg_over_2_violations = 0  # 大学3回以上の違反（不満が高い）
+    bg_weekday_over_violations = 0  # 大学の平日偏り（平日2回以上は不満）
     for doc in active_doctors:
         bg_total = assigned_bg.get(doc, 0)
+        weekday_count = bg_cat[doc].get("平日", 0)
+
+        # 大学3回以上は不可
+        if bg_total >= 3:
+            bg_over_2_violations += (bg_total - 2)
+
+        # 大学2回の場合、平日1回+休日1回が理想
         if bg_total == 2:
-            # 平日回数をカウント
-            weekday_count = bg_cat[doc].get("平日", 0)
-            # 平日が0回または2回の場合は違反（平日1回、休日1回が理想）
             if weekday_count == 0 or weekday_count == 2:
                 bg_weekday_weekend_imbalance += 1
+
+        # 大学の平日が2回以上は不満
+        if weekday_count >= 2:
+            bg_weekday_over_violations += (weekday_count - 1)
 
     penalty = 0
     penalty += fairness_penalty * W_FAIR_TOTAL
@@ -1206,6 +1233,8 @@ def evaluate_schedule_with_raw(
     penalty += code_1_2_violations * 150  # 1.2の医師が大学系0回の場合、大きなペナルティ
     penalty += bg_ht_imbalance_violations * 100  # 大学系と外病院の差が3以上の場合、大きなペナルティ
     penalty += bg_weekday_weekend_imbalance * 50  # 大学病院2回の平日/休日バランス違反
+    penalty += bg_over_2_violations * 150  # 大学3回以上の違反（不満が高い）
+    penalty += bg_weekday_over_violations * 80  # 大学の平日偏り（平日2回以上は不満）
 
     penalty += max(0, bg_spread - 1) * W_BG_SPREAD
     penalty += max(0, ht_spread - 1) * W_HT_SPREAD
@@ -1228,6 +1257,8 @@ def evaluate_schedule_with_raw(
         "code_1_2_violations": int(code_1_2_violations),
         "bg_ht_imbalance_violations": int(bg_ht_imbalance_violations),
         "bg_weekday_weekend_imbalance": int(bg_weekday_weekend_imbalance),
+        "bg_over_2_violations": int(bg_over_2_violations),
+        "bg_weekday_over_violations": int(bg_weekday_over_violations),
         "bg_spread_cum": float(bg_spread),
         "ht_spread_cum": float(ht_spread),
         "weekday_spread_cum": float(wd_spread),
