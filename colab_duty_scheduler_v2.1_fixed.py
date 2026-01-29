@@ -1,4 +1,4 @@
-# @title 当直くん v3.4 (TARGET_CAP厳格化+多軸スコアリング+公平性強制)
+# @title 当直くん v3.5 (大学最低1回を準ハード制約に+gap=3日)
 # 修正内容:
 # v3.4 (2026-01-29):
 # - TARGET_CAP違反の厳格化
@@ -30,7 +30,7 @@
 #   - min=2, max=4のような差が大きい場合に強く制約
 # - 修正パイプラインを拡充
 #   - 最適化後に全ての制約違反を強制的に修正
-#   - 順序: ハード制約 → TARGET_CAP（優先1） → gap（優先2） → 外病院DUP（優先3） → 1.2 → BG/HT → 大学3+ → 大学平日偏り → 公平性
+#   - 順序: ハード制約 → TARGET_CAP（優先1） → 大学最低1回（準ハード、優先2） → gap（優先3） → 外病院DUP（優先4） → BG/HT → 大学3+ → 大学平日偏り → 公平性
 # v3.2 (2026-01-28):
 # - 生成パターン数をデフォルト100に戻す（処理時間の最適化）
 #   - NUM_PATTERNS: 10000 → 100
@@ -267,7 +267,7 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直くん v3.4 (TARGET_CAP厳格化+多軸スコアリング+公平性強制)")
+print("   当直くん v3.5 (大学最低1回を準ハード制約に+gap=3日)")
 print("="*60)
 print("\nsheet1〜sheet4（またはSheet4）が入った当直Excelファイルを選択してください")
 
@@ -643,6 +643,12 @@ CODE_1_2_DOCTORS = {doc for doc in doctor_names if has_code_1_2(doc)}
 if CODE_1_2_DOCTORS:
     print(f"   可否コード1.2医師（大学系最低1回必須）: {len(CODE_1_2_DOCTORS)}人")
     print(f"      対象: {', '.join(sorted(CODE_1_2_DOCTORS)[:10])}")
+
+# 大学系最低1回必須の医師（準ハード制約：コード3以外の全医師）
+# コード3は外病院専門なので除外
+UNIVERSITY_MINIMUM_REQUIRED_DOCTORS = {doc for doc in active_doctors if doc not in RATIO_EXEMPT_DOCTORS}
+if UNIVERSITY_MINIMUM_REQUIRED_DOCTORS:
+    print(f"   大学系最低1回必須医師（準ハード制約）: {len(UNIVERSITY_MINIMUM_REQUIRED_DOCTORS)}人（コード3除外）")
 
 # =========================
 # 大学(B〜G)の昼夜判定 & 7分類
@@ -2152,9 +2158,9 @@ def fix_target_cap_violations(pattern_df, max_attempts=100, verbose=True):
 
     return df, (remaining_over == 0 and remaining_under == 0), total_fixed
 
-def fix_code_1_2_violations(pattern_df, max_attempts=100, verbose=True):
+def fix_university_minimum_requirement(pattern_df, max_attempts=100, verbose=True):
     """
-    可否コード1.2の医師が大学系0回の違反を修正する
+    大学系最低1回必須違反を修正する（準ハード制約：コード3以外の全医師）
 
     Args:
         pattern_df: スケジュールDataFrame
@@ -2164,7 +2170,7 @@ def fix_code_1_2_violations(pattern_df, max_attempts=100, verbose=True):
     Returns:
         (修正後のDataFrame, 成功フラグ, 修正数)
     """
-    if not CODE_1_2_DOCTORS:
+    if not UNIVERSITY_MINIMUM_REQUIRED_DOCTORS:
         return pattern_df, True, 0
 
     df = pattern_df.copy()
@@ -2174,19 +2180,19 @@ def fix_code_1_2_violations(pattern_df, max_attempts=100, verbose=True):
         # 現在の割当回数を再計算
         counts, bg_counts, *_ = recompute_stats(df)
 
-        # 大学系0回の1.2医師を特定
+        # 大学系0回の医師を特定（コード3除外）
         zero_bg_docs = []
-        for doc in CODE_1_2_DOCTORS:
+        for doc in UNIVERSITY_MINIMUM_REQUIRED_DOCTORS:
             if bg_counts.get(doc, 0) == 0:
                 zero_bg_docs.append(doc)
 
         if not zero_bg_docs:
             if verbose and total_fixed > 0:
-                print(f"   ✅ 可否コード1.2医師の大学系0回違反を{total_fixed}件修正しました")
+                print(f"   ✅ 大学系最低1回必須違反を{total_fixed}件修正しました")
             return df, True, total_fixed
 
         if attempt == 0 and verbose:
-            print(f"   ⚠️ 可否コード1.2医師の大学系0回違反を{len(zero_bg_docs)}件検出 → 自動修正を開始...")
+            print(f"   ⚠️ 大学系最低1回必須違反を{len(zero_bg_docs)}件検出 → 自動修正を開始...")
 
         # 修正試行
         fixed_in_this_iteration = 0
@@ -2255,15 +2261,20 @@ def fix_code_1_2_violations(pattern_df, max_attempts=100, verbose=True):
 
     # 最終確認
     counts, bg_counts, *_ = recompute_stats(df)
-    remaining_violations = sum(1 for doc in CODE_1_2_DOCTORS if bg_counts.get(doc, 0) == 0)
+    remaining_violations = sum(1 for doc in UNIVERSITY_MINIMUM_REQUIRED_DOCTORS if bg_counts.get(doc, 0) == 0)
 
     if verbose:
         if remaining_violations == 0:
-            print(f"   ✅ 全ての可否コード1.2医師の大学系0回違反を修正しました（修正数: {total_fixed}）")
+            print(f"   ✅ 全ての大学系最低1回必須違反を修正しました（修正数: {total_fixed}）")
         else:
-            print(f"   ⚠️ {remaining_violations}件の可否コード1.2医師の大学系0回違反が残っています（修正数: {total_fixed}）")
+            print(f"   ⚠️ {remaining_violations}件の大学系最低1回必須違反が残っています（修正数: {total_fixed}）")
 
     return df, remaining_violations == 0, total_fixed
+
+# 後方互換性のため、旧関数名を残す
+def fix_code_1_2_violations(pattern_df, max_attempts=100, verbose=True):
+    """後方互換性のための関数（fix_university_minimum_requirementにリダイレクト）"""
+    return fix_university_minimum_requirement(pattern_df, max_attempts, verbose)
 
 def fix_bg_ht_imbalance_violations(pattern_df, max_attempts=100, verbose=True):
     """
@@ -3206,7 +3217,7 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         raw2 = cand["raw_score"]
         met2 = cand["metrics"]
 
-    # ハード制約違反の自動修正
+    # 1. ハード制約違反の自動修正
     fixed_df, fix_success, fix_count, fail_count = fix_hard_constraint_violations(
         improved_df, max_attempts=50, verbose=True
     )
@@ -3216,24 +3227,24 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         fixed_df, max_attempts=100, verbose=True
     )
 
-    # 3. gap違反（3日未満の間隔）を修正（優先度2位）
-    gap_fixed_df, gap_success, gap_fix_count = fix_gap_violations(
-        cap_fixed_df, max_attempts=200, verbose=True
+    # 3. 大学系最低1回必須違反を修正（準ハード制約、優先度2位）
+    univ_min_fixed_df, univ_min_success, univ_min_fix_count = fix_university_minimum_requirement(
+        cap_fixed_df, max_attempts=100, verbose=True
     )
 
-    # 4. 外病院重複を修正（優先度3位）
+    # 4. gap違反（3日未満の間隔）を修正（優先度3位）
+    gap_fixed_df, gap_success, gap_fix_count = fix_gap_violations(
+        univ_min_fixed_df, max_attempts=200, verbose=True
+    )
+
+    # 5. 外病院重複を修正（優先度4位）
     ext_dup_fixed_df, ext_dup_success, ext_dup_fix_count = fix_external_hospital_dup_violations(
         gap_fixed_df, max_attempts=150, verbose=True
     )
 
-    # 5. 可否コード1.2の医師が大学系0回の違反を修正
-    code_1_2_fixed_df, code_1_2_success, code_1_2_fix_count = fix_code_1_2_violations(
-        ext_dup_fixed_df, max_attempts=100, verbose=True
-    )
-
     # 6. 大学系と外病院の差が3以上の違反を修正
     bg_ht_fixed_df, bg_ht_success, bg_ht_fix_count = fix_bg_ht_imbalance_violations(
-        code_1_2_fixed_df, max_attempts=100, verbose=True
+        ext_dup_fixed_df, max_attempts=100, verbose=True
     )
 
     # 7. 大学3回以上違反を修正
@@ -3252,7 +3263,7 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
     )
 
     # 修正後に再評価
-    if fix_count > 0 or cap_fix_count > 0 or code_1_2_fix_count > 0 or bg_ht_fix_count > 0 or gap_fix_count > 0 or ext_dup_fix_count > 0 or univ_over_2_fix_count > 0 or univ_weekday_fix_count > 0 or fairness_fix_count > 0:
+    if fix_count > 0 or cap_fix_count > 0 or univ_min_fix_count > 0 or bg_ht_fix_count > 0 or gap_fix_count > 0 or ext_dup_fix_count > 0 or univ_over_2_fix_count > 0 or univ_weekday_fix_count > 0 or fairness_fix_count > 0:
         counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(fairness_fixed_df)
         sc2, raw2, met2 = evaluate_schedule_with_raw(
             fairness_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
@@ -3272,7 +3283,7 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         "violations_fixed": fix_count,
         "violations_failed": fail_count,
         "cap_violations_fixed": cap_fix_count,
-        "code_1_2_violations_fixed": code_1_2_fix_count,
+        "univ_min_violations_fixed": univ_min_fix_count,
         "bg_ht_imbalance_fixed": bg_ht_fix_count,
         "gap_violations_fixed": gap_fix_count,
         "external_dup_violations_fixed": ext_dup_fix_count,
