@@ -1,4 +1,4 @@
-# @title 当直くん v3.3 (大学3回禁止+公平性強化対応)
+# @title 当直くん v3.4 (TARGET_CAP厳格化+多軸スコアリング)
 # 修正内容:
 # v3.3 (2026-01-28):
 # - 大学病院3回以上を禁止（不満が高い）
@@ -252,7 +252,7 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直くん v3.3 (大学3回禁止+公平性強化)")
+print("   当直くん v3.4 (TARGET_CAP厳格化+多軸スコアリング)")
 print("="*60)
 print("\nsheet1〜sheet4（またはSheet4）が入った当直Excelファイルを選択してください")
 
@@ -3066,9 +3066,106 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         "univ_weekday_violations_fixed": univ_weekday_fix_count,
     })
 
-refined_sorted = sorted(refined, key=lambda e: e["raw_after"], reverse=True)
-TOP_OUTPUT_PATTERNS = 3
-top_patterns = refined_sorted[:TOP_OUTPUT_PATTERNS]
+# =========================
+# ハード制約違反のないパターンのみ選択（TARGET_CAP、gap、未割当）
+# =========================
+print("\n=== ハード制約チェック ===")
+valid_patterns = []
+for e in refined:
+    met = e["metrics_after"]
+    cap_viol = met.get('cap_violations', 0)
+    gap_viol = met.get('gap_violations', 0)
+    unassigned = met.get('unassigned_slots', 0)
+
+    if cap_viol > 0 or gap_viol > 0 or unassigned > 0:
+        print(f"   ❌ seed={e['seed']}: TARGET_CAP違反={cap_viol}, gap違反={gap_viol}, 未割当={unassigned} → 除外")
+    else:
+        valid_patterns.append(e)
+
+if not valid_patterns:
+    print("   ⚠️ 警告: ハード制約を満たすパターンがありません。全パターンから選択します。")
+    valid_patterns = refined
+
+print(f"   ✅ {len(valid_patterns)}/{len(refined)} パターンがハード制約を満たしています")
+
+# =========================
+# 多軸スコアリング: 異なる評価軸で最適パターンを選択
+# =========================
+print("\n=== 多軸スコアリング ===")
+
+# 評価軸1: 公平性重視（TARGET_CAP、公平性ペナルティを重視）
+fairness_patterns = sorted(
+    valid_patterns,
+    key=lambda e: (
+        -e["metrics_after"].get('cap_violations', 0) * 1000,  # TARGET_CAP違反を最優先で回避
+        -e["metrics_after"].get('max_minus_min_total_active', 0) * 100,  # 公平性
+        -e["metrics_after"].get('bg_ht_imbalance_violations', 0) * 50,
+        e["raw_after"]
+    ),
+    reverse=True
+)
+
+# 評価軸2: gap違反回避重視（連続当直の間隔を重視）
+gap_patterns = sorted(
+    valid_patterns,
+    key=lambda e: (
+        -e["metrics_after"].get('gap_violations', 0) * 1000,
+        -e["metrics_after"].get('external_hosp_dup_violations', 0) * 100,
+        -e["metrics_after"].get('hospital_dup_violations', 0) * 50,
+        e["raw_after"]
+    ),
+    reverse=True
+)
+
+# 評価軸3: バランス重視（大学/外病院、平日/休日のバランスを重視）
+balance_patterns = sorted(
+    valid_patterns,
+    key=lambda e: (
+        -e["metrics_after"].get('bg_ht_imbalance_violations', 0) * 1000,
+        -e["metrics_after"].get('bg_weekday_weekend_imbalance', 0) * 100,
+        -e["metrics_after"].get('bg_over_2_violations', 0) * 100,
+        -e["metrics_after"].get('bg_weekday_over_violations', 0) * 100,
+        e["raw_after"]
+    ),
+    reverse=True
+)
+
+# 各軸から最良パターンを選択
+top_patterns = []
+selected_seeds = set()
+
+# 軸1: 公平性重視
+if fairness_patterns and fairness_patterns[0]["seed"] not in selected_seeds:
+    fairness_patterns[0]["axis_label"] = "公平性重視"
+    top_patterns.append(fairness_patterns[0])
+    selected_seeds.add(fairness_patterns[0]["seed"])
+
+# 軸2: gap違反回避重視
+if gap_patterns and gap_patterns[0]["seed"] not in selected_seeds:
+    gap_patterns[0]["axis_label"] = "連続当直回避重視"
+    top_patterns.append(gap_patterns[0])
+    selected_seeds.add(gap_patterns[0]["seed"])
+
+# 軸3: バランス重視
+if balance_patterns and balance_patterns[0]["seed"] not in selected_seeds:
+    balance_patterns[0]["axis_label"] = "バランス重視"
+    top_patterns.append(balance_patterns[0])
+    selected_seeds.add(balance_patterns[0]["seed"])
+
+# まだ3パターン未満の場合、総合スコアから補填
+if len(top_patterns) < 3:
+    overall_sorted = sorted(valid_patterns, key=lambda e: e["raw_after"], reverse=True)
+    for pattern in overall_sorted:
+        if pattern["seed"] not in selected_seeds:
+            pattern["axis_label"] = "総合スコア"
+            top_patterns.append(pattern)
+            selected_seeds.add(pattern["seed"])
+            if len(top_patterns) >= 3:
+                break
+
+# ソート済みリストも作成（後方互換性のため）
+refined_sorted = sorted(valid_patterns, key=lambda e: e["raw_after"], reverse=True)
+TOP_OUTPUT_PATTERNS = len(top_patterns)
 
 scores_df = pd.DataFrame(score_rows).sort_values(["raw_score", "seed"], ascending=[False, True]).reset_index(drop=True)
 
@@ -3085,19 +3182,18 @@ refined_df = pd.DataFrame([
 ]).sort_values(["raw_after", "seed"], ascending=[False, True]).reset_index(drop=True)
 
 print("\n✅ 局所探索完了")
-print("\n=== TOPパターンのスコア ===")
+print("\n=== TOPパターンのスコア（多軸評価） ===")
 for rank, pattern in enumerate(top_patterns, 1):
+    axis_label = pattern.get('axis_label', '総合スコア')
     print(
-        f"   {rank}位: raw_score={pattern['raw_after']:.1f}, "
+        f"   {rank}位 [{axis_label}]: raw_score={pattern['raw_after']:.1f}, "
         + f"gap違反={pattern['metrics_after']['gap_violations']}, "
         + f"未割当={pattern['metrics_after']['unassigned_slots']}, "
         + f"cap違反={pattern['metrics_after'].get('cap_violations', 0)}, "
         + f"1.2違反={pattern['metrics_after'].get('code_1_2_violations', 0)}, "
         + f"BG/HT差3以上={pattern['metrics_after'].get('bg_ht_imbalance_violations', 0)}, "
-        + f"制約修正={pattern.get('violations_fixed', 0)}件, "
-        + f"CAP修正={pattern.get('cap_violations_fixed', 0)}件, "
-        + f"1.2修正={pattern.get('code_1_2_violations_fixed', 0)}件, "
-        + f"BG/HT修正={pattern.get('bg_ht_imbalance_fixed', 0)}件"
+        + f"公平性(max-min)={pattern['metrics_after'].get('max_minus_min_total_active', 0)}, "
+        + f"制約修正={pattern.get('violations_fixed', 0)}件"
     )
 
 # =========================
@@ -3127,8 +3223,17 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
 
     # TOPパターン出力
     for rank, entry in enumerate(top_patterns, start=1):
+        axis_label = entry.get('axis_label', '総合スコア')
         sheet_label = f"pattern_{rank:02d}"
+
+        # パターンシートのコメント行に軸ラベルを追加
+        pattern_df_with_label = entry["pattern_df"].copy()
         entry["pattern_df"].to_excel(writer, sheet_name=sheet_label, index=False)
+
+        # シート名に軸ラベルを追加（Excelの制限により簡略化）
+        ws = writer.sheets[sheet_label]
+        axis_short = {"公平性重視": "公平性", "連続当直回避重視": "gap回避", "バランス重視": "バランス", "総合スコア": "総合"}.get(axis_label, axis_label)
+        ws.cell(row=1, column=len(entry["pattern_df"].columns) + 2, value=f"【{axis_short}】")
 
         # summary（今月/累計）
         counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(entry["pattern_df"])
@@ -3158,16 +3263,18 @@ print("="*60)
 print(f"\n📥 出力ファイル: {output_path}")
 print("\n【ファイル内容】")
 print("  - sheet1〜4: 元データ")
-print("  - pattern_01〜03: TOP3スケジュール候補")
+print("  - pattern_01〜03: 多軸評価によるTOP3スケジュール候補")
+print("    * 公平性重視: 医師間の割当回数の公平性を最優先")
+print("    * gap回避重視: 連続当直の間隔を最優先")
+print("    * バランス重視: 大学/外病院、平日/休日のバランスを最優先")
 print("  - pattern_XX_今月/累計: 各パターンのサマリーシート")
 print("  - pattern_XX_diag: 各パターンの診断シート（ハード制約違反、gap違反、重複等）")
 print("\n【推奨】")
-print("  ✅ v2.7では全てのハード制約違反が自動修正されています")
+print("  ✅ 多軸評価により異なる特性を持つパターンを提供")
+print("  ✅ TARGET_CAP、gap、未割当の違反がないパターンのみ選択")
 print("  🔍 各pattern_XX_diagの「ハード制約違反」シートで修正結果を確認")
-print("    ※通常は違反0件になっているはずです")
-print("    ※修正できなかった違反がある場合は警告が表示されています")
-print("  1. 3つのパターンを比較し、最適なものを選択")
-print("  2. 選択したパターンの診断シートで gap違反・重複・未割当を確認")
+print("  1. 3つの評価軸（公平性/gap回避/バランス）から最適なパターンを選択")
+print("  2. 選択したパターンの診断シートで違反・重複を確認")
 print("  3. サマリーシートで医師ごとの偏りを確認")
 print("\n【主な自動修正対象】")
 print("  ✅ 可否コード0違反（絶対不可の日に割当）")
