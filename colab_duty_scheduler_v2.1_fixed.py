@@ -30,7 +30,7 @@
 #   - min=2, max=4のような差が大きい場合に強く制約
 # - 修正パイプラインを拡充
 #   - 最適化後に全ての制約違反を強制的に修正
-#   - 順序: ハード制約 → TARGET_CAP → 1.2 → BG/HT → gap → 外病院DUP → 大学3+ → 大学平日偏り → 公平性
+#   - 順序: ハード制約 → TARGET_CAP（優先1） → gap（優先2） → 外病院DUP（優先3） → 1.2 → BG/HT → 大学3+ → 大学平日偏り → 公平性
 # v3.2 (2026-01-28):
 # - 生成パターン数をデフォルト100に戻す（処理時間の最適化）
 #   - NUM_PATTERNS: 10000 → 100
@@ -2012,9 +2012,7 @@ def fix_target_cap_violations(pattern_df, max_attempts=100, verbose=True):
             return df, True, total_fixed
 
         if attempt == 0 and verbose:
-            over_cap_names = [f"{doc}({counts[doc]}/{TARGET_CAP[doc]})" for doc, _ in over_cap_docs]
-            print(f"   ⚠️ TARGET_CAP超過を検出 → 自動修正を開始...")
-            print(f"      超過: {', '.join(over_cap_names[:5])}")
+            print(f"   ⚠️ TARGET_CAP超過を{len(over_cap_docs)}件検出 → 自動修正を開始...")
 
         # 修正試行
         fixed_in_this_iteration = 0
@@ -2126,8 +2124,7 @@ def fix_code_1_2_violations(pattern_df, max_attempts=100, verbose=True):
             return df, True, total_fixed
 
         if attempt == 0 and verbose:
-            print(f"   ⚠️ 可否コード1.2医師の大学系0回違反を検出 → 自動修正を開始...")
-            print(f"      対象: {', '.join(zero_bg_docs[:5])}")
+            print(f"   ⚠️ 可否コード1.2医師の大学系0回違反を{len(zero_bg_docs)}件検出 → 自動修正を開始...")
 
         # 修正試行
         fixed_in_this_iteration = 0
@@ -2240,9 +2237,7 @@ def fix_bg_ht_imbalance_violations(pattern_df, max_attempts=100, verbose=True):
             return df, True, total_fixed
 
         if attempt == 0 and verbose:
-            imbalance_names = [f"{doc}(BG={bg}/HT={ht})" for doc, bg, ht, diff in imbalance_docs[:5]]
-            print(f"   ⚠️ 大学系と外病院の差3以上の違反を検出 → 自動修正を開始...")
-            print(f"      対象: {', '.join(imbalance_names)}")
+            print(f"   ⚠️ 大学系と外病院の差3以上の違反を{len(imbalance_docs)}件検出 → 自動修正を開始...")
 
         # 修正試行
         fixed_in_this_iteration = 0
@@ -2369,10 +2364,7 @@ def fix_gap_violations(pattern_df, max_attempts=200, verbose=True):
             return df, True, total_fixed
 
         if attempt == 0 and verbose:
-            violation_names = [f"{doc}({d1.strftime('%m/%d')}-{d2.strftime('%m/%d')}={gap}日)"
-                             for doc, d1, d2, gap in gap_violation_list[:5]]
             print(f"   ⚠️ gap違反を{len(gap_violation_list)}件検出 → 自動修正を開始...")
-            print(f"      例: {', '.join(violation_names)}")
 
         # 修正試行（1イテレーションで複数の違反を修正）
         fixed_in_this_iteration = 0
@@ -2531,9 +2523,7 @@ def fix_external_hospital_dup_violations(pattern_df, max_attempts=150, verbose=T
             return df, True, total_fixed
 
         if attempt == 0 and verbose:
-            dup_names = [f"{doc}({hosp}={count}回)" for doc, hosp, count in external_dup_list[:5]]
             print(f"   ⚠️ 外病院重複を{len(external_dup_list)}件検出 → 自動修正を開始...")
-            print(f"      例: {', '.join(dup_names)}")
 
         # 修正試行
         fixed_in_this_iteration = 0
@@ -2661,9 +2651,7 @@ def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True)
             return df, True, total_fixed
 
         if attempt == 0 and verbose:
-            over_names = [f"{doc}({bg_count}回)" for doc, bg_count in over_2_list[:5]]
             print(f"   ⚠️ 大学3回以上違反を{len(over_2_list)}件検出 → 自動修正を開始...")
-            print(f"      対象: {', '.join(over_names)}")
 
         # 修正試行
         fixed_in_this_iteration = 0
@@ -2789,9 +2777,7 @@ def fix_university_weekday_balance_violations(pattern_df, max_attempts=150, verb
             return df, True, total_fixed
 
         if attempt == 0 and verbose:
-            over_names = [f"{doc}(平日{wd}回/大学{total}回)" for doc, wd, total in weekday_over_list[:5]]
             print(f"   ⚠️ 大学平日偏り違反を{len(weekday_over_list)}件検出 → 自動修正を開始...")
-            print(f"      対象: {', '.join(over_names)}")
 
         # 修正試行
         fixed_in_this_iteration = 0
@@ -2926,8 +2912,6 @@ def fix_fairness_imbalance(pattern_df, max_attempts=200, verbose=True):
             max_docs = [doc for doc, c in active_counts if c == max_count]
             min_docs = [doc for doc, c in active_counts if c == min_count]
             print(f"   ⚠️ 公平性違反を検出（max={max_count}, min={min_count}, diff={diff}） → 自動修正を開始...")
-            print(f"      最多: {', '.join(max_docs[:3])}... ({len(max_docs)}人)")
-            print(f"      最少: {', '.join(min_docs[:3])}... ({len(min_docs)}人)")
 
         fixed_in_this_iteration = 0
 
@@ -2974,7 +2958,8 @@ def fix_fairness_imbalance(pattern_df, max_attempts=200, verbose=True):
 
                     # gap制約チェック（移動後にgap違反が発生しないか）
                     # min_docに割り当てた場合のgap違反チェック
-                    min_doc_dates = sorted([d for r, h, d in doc_assignments.get(min_doc, []) if (r, h) != (ridx, hosp)])
+                    # doc_assignments は (date, hosp) のタプルのリスト
+                    min_doc_dates = sorted([d for d, h in doc_assignments.get(min_doc, []) if h != hosp or d != date])
                     new_dates = sorted(min_doc_dates + [date])
 
                     gap_ok = True
@@ -2988,7 +2973,7 @@ def fix_fairness_imbalance(pattern_df, max_attempts=200, verbose=True):
                         continue
 
                     # max_docから削除した場合のgap違反チェック
-                    max_doc_dates = sorted([d for r, h, d in doc_assignments.get(max_doc, []) if (r, h) != (ridx, hosp)])
+                    max_doc_dates = sorted([d for d, h in doc_assignments.get(max_doc, []) if h != hosp or d != date])
                     if len(max_doc_dates) >= 2:
                         for j in range(len(max_doc_dates) - 1):
                             gap = (max_doc_dates[j + 1] - max_doc_dates[j]).days
@@ -2999,15 +2984,15 @@ def fix_fairness_imbalance(pattern_df, max_attempts=200, verbose=True):
                     fixed_in_this_iteration += 1
                     total_fixed += 1
 
-                    if verbose and attempt < 5:
+                    if verbose and attempt < 3:
                         print(f"      {date.strftime('%m/%d')} {hosp}: {max_doc}({max_count}回) → {min_doc}({min_count}回)")
 
                     # doc_assignmentsを更新（次の反復のため）
                     if max_doc in doc_assignments:
-                        doc_assignments[max_doc] = [(r, h, d) for r, h, d in doc_assignments[max_doc] if (r, h) != (ridx, hosp)]
+                        doc_assignments[max_doc] = [(d, h) for d, h in doc_assignments[max_doc] if h != hosp or d != date]
                     if min_doc not in doc_assignments:
                         doc_assignments[min_doc] = []
-                    doc_assignments[min_doc].append((ridx, hosp, date))
+                    doc_assignments[min_doc].append((date, hosp))
 
                     break  # min_docs loop
 
@@ -3077,8 +3062,8 @@ score_rows = []
 candidates = []  # TOP_KEEPだけ保持
 
 for i in range(1, NUM_PATTERNS + 1):
-    if i % 100 == 0 or i == 1:
-        print(f"   進捗: {i}/{NUM_PATTERNS} パターン生成中...")
+    if i == 1:
+        print(f"   パターン生成を開始...")
 
     (
         pattern_df,
@@ -3144,7 +3129,7 @@ print(f"   TOP{min(TOP_KEEP, len(candidates))}候補を局所探索で最適化�
 # ローカル探索で候補を改善
 refined = []
 for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
-    print(f"   候補{idx}/{REFINE_TOP}を最適化中...")
+    print(f"   候補{idx}/{REFINE_TOP}を処理中...")
     if LOCAL_SEARCH_ENABLED:
         improved_df, sc2, raw2, met2 = local_search_swap(
             cand["pattern_df"],
@@ -3160,49 +3145,41 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         met2 = cand["metrics"]
 
     # ハード制約違反の自動修正
-    print(f"   候補{idx}/{REFINE_TOP}のハード制約違反チェック中...")
     fixed_df, fix_success, fix_count, fail_count = fix_hard_constraint_violations(
         improved_df, max_attempts=50, verbose=True
     )
 
-    # TARGET_CAP違反の自動修正
-    print(f"   候補{idx}/{REFINE_TOP}のTARGET_CAPチェック中...")
+    # 2. TARGET_CAP違反の自動修正（優先度1位）
     cap_fixed_df, cap_success, cap_fix_count = fix_target_cap_violations(
         fixed_df, max_attempts=100, verbose=True
     )
 
-    # 可否コード1.2の医師が大学系0回の違反を修正
-    print(f"   候補{idx}/{REFINE_TOP}の可否コード1.2チェック中...")
-    code_1_2_fixed_df, code_1_2_success, code_1_2_fix_count = fix_code_1_2_violations(
-        cap_fixed_df, max_attempts=100, verbose=True
-    )
-
-    # 大学系と外病院の差が3以上の違反を修正
-    print(f"   候補{idx}/{REFINE_TOP}の大学系/外病院バランスチェック中...")
-    bg_ht_fixed_df, bg_ht_success, bg_ht_fix_count = fix_bg_ht_imbalance_violations(
-        code_1_2_fixed_df, max_attempts=100, verbose=True
-    )
-
-    # gap違反（4日未満の間隔）を修正
-    print(f"   候補{idx}/{REFINE_TOP}のgap違反チェック中...")
+    # 3. gap違反（4日未満の間隔）を修正（優先度2位）
     gap_fixed_df, gap_success, gap_fix_count = fix_gap_violations(
-        bg_ht_fixed_df, max_attempts=200, verbose=True
+        cap_fixed_df, max_attempts=200, verbose=True
     )
 
-    # 外病院重複を修正（優先度3位）
-    print(f"   候補{idx}/{REFINE_TOP}の外病院重複チェック中...")
+    # 4. 外病院重複を修正（優先度3位）
     ext_dup_fixed_df, ext_dup_success, ext_dup_fix_count = fix_external_hospital_dup_violations(
         gap_fixed_df, max_attempts=150, verbose=True
     )
 
-    # 大学3回以上違反を修正
-    print(f"   候補{idx}/{REFINE_TOP}の大学3回以上チェック中...")
-    univ_over_2_fixed_df, univ_over_2_success, univ_over_2_fix_count = fix_university_over_2_violations(
-        ext_dup_fixed_df, max_attempts=150, verbose=True
+    # 5. 可否コード1.2の医師が大学系0回の違反を修正
+    code_1_2_fixed_df, code_1_2_success, code_1_2_fix_count = fix_code_1_2_violations(
+        ext_dup_fixed_df, max_attempts=100, verbose=True
     )
 
-    # 大学平日偏り違反を修正
-    print(f"   候補{idx}/{REFINE_TOP}の大学平日偏りチェック中...")
+    # 6. 大学系と外病院の差が3以上の違反を修正
+    bg_ht_fixed_df, bg_ht_success, bg_ht_fix_count = fix_bg_ht_imbalance_violations(
+        code_1_2_fixed_df, max_attempts=100, verbose=True
+    )
+
+    # 7. 大学3回以上違反を修正
+    univ_over_2_fixed_df, univ_over_2_success, univ_over_2_fix_count = fix_university_over_2_violations(
+        bg_ht_fixed_df, max_attempts=150, verbose=True
+    )
+
+    # 8. 大学平日偏り違反を修正
     univ_weekday_fixed_df, univ_weekday_success, univ_weekday_fix_count = fix_university_weekday_balance_violations(
         univ_over_2_fixed_df, max_attempts=150, verbose=True
     )
