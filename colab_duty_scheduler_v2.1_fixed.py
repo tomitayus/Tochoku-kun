@@ -1,5 +1,12 @@
-# @title 当直くん v4.0 (C-H列カテ当番制約)
+# @title 当直くん v4.1 (枠決定順序最適化)
 # 修正内容:
+# v4.1 (2026-01-30):
+# - 枠決定順序を最適化
+#   - 大学休日(C-H列) → 大学平日(B,I-K列) → 外病院(L-Y列) の順に割り当て
+#   - C-H列はカテ当番制約があるため先に埋めることで制約を満たしやすくする
+#   - slot_priority関数を追加して優先度順にソート
+# - ハード制約チェックにC-H列カテ当番違反を追加
+#   - ch_kate_violations > 0 のパターンを除外
 # v4.0 (2026-01-30):
 # - C-H列（休日大学系）のカテ当番制約を追加
 #   - C-H列はカテ当番のある医師（その日にアルファベットあり）または
@@ -165,7 +172,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "4.0"
+VERSION = "4.1"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -1022,9 +1029,26 @@ def build_schedule_pattern(seed=0):
                 assigned_ly[doc] += 1
 
     # 自動割当
+    # 枠決定順序: 大学休日(C-H) → 大学平日(B,I-K) → 外病院(L-Y)
+    # C-H列はカテ当番制約があるため先に埋める
+    def slot_priority(slot_tuple):
+        ridx, hosp = slot_tuple
+        hidx = shift_df.columns.get_loc(hosp)
+        # C-H列（休日大学系）: 優先度0（最初）
+        if C_COL_INDEX <= hidx <= H_COL_INDEX:
+            return (0, hidx)
+        # B列、I-K列（平日大学系）: 優先度1
+        elif hidx == B_COL_INDEX or (I_COL_INDEX <= hidx <= K_COL_INDEX):
+            return (1, hidx)
+        # L-Y列（外病院）: 優先度2（最後）
+        else:
+            return (2, hidx)
+
     for date in all_dates:
         free_slots = slots_by_date[date]["free"].copy()
-        random.shuffle(free_slots)
+        # 優先度順にソート後、同一優先度内でシャッフル
+        random.shuffle(free_slots)  # まずシャッフルしてランダム性を確保
+        free_slots.sort(key=slot_priority)  # 安定ソートで優先度順に
 
         for ridx, hosp in free_slots:
             chosen = choose_doctor_for_slot(
@@ -3743,8 +3767,9 @@ for e in refined:
     code_2_viol = met.get('code_2_extra_violations', 0)
     bg_over_2_viol = met.get('bg_over_2_violations', 0)
     ht_0_viol = met.get('ht_0_violations', 0)
+    ch_kate_viol = met.get('ch_kate_violations', 0)
 
-    if cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0 or bg_over_2_viol > 0 or ht_0_viol > 0:
+    if cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0 or bg_over_2_viol > 0 or ht_0_viol > 0 or ch_kate_viol > 0:
         excluded_count += 1
     else:
         valid_patterns.append(e)
