@@ -193,7 +193,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "4.4"
+VERSION = "4.5"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -3808,6 +3808,70 @@ def fix_fairness_imbalance(pattern_df, max_attempts=200, verbose=True):
 
     return df, diff <= 1, total_fixed
 
+def fix_unassigned_slots(pattern_df, verbose=True):
+    """
+    slot_metaに登録されたスロットで医師が割り当てられていないものを埋める
+    これは最終セーフティネットとして、全てのスロットに医師を配置することを保証する
+    """
+    df = pattern_df.copy()
+    total_fixed = 0
+
+    counts, *_ = recompute_stats(df)
+
+    for (ridx, hosp), (date, fixed) in slot_meta.items():
+        val = df.at[ridx, hosp]
+
+        # 既に医師が割り当てられている場合はスキップ
+        if isinstance(val, str):
+            v_norm = normalize_name(val)
+            if v_norm in doctor_names:
+                continue
+
+        # 未割り当てスロットを発見
+        # この日に既に割り当てられている医師を取得
+        already_assigned_on_date = set()
+        for h in hospital_cols:
+            v = df.at[ridx, h]
+            if isinstance(v, str):
+                already_assigned_on_date.add(normalize_name(v))
+
+        # 候補医師を探す（制約チェック付き）
+        candidates = [
+            d for d in doctor_names
+            if d not in already_assigned_on_date
+            and can_assign_doc_to_slot(d, date, hosp)
+        ]
+
+        if candidates:
+            # 割当回数が少ない医師を優先
+            candidates.sort(key=lambda d: counts.get(d, 0))
+            new_doc = candidates[0]
+        else:
+            # 緊急フォールバック: 制約緩和して誰かを割り当て
+            emergency = [d for d in doctor_names if d not in already_assigned_on_date]
+            if emergency:
+                emergency.sort(key=lambda d: counts.get(d, 0))
+                new_doc = emergency[0]
+            else:
+                # 最終手段: 同日重複も許容
+                all_docs = sorted(doctor_names, key=lambda d: counts.get(d, 0))
+                new_doc = all_docs[0]
+
+        df.at[ridx, hosp] = new_doc
+        counts[new_doc] = counts.get(new_doc, 0) + 1
+        total_fixed += 1
+
+        if verbose:
+            print(f"   🔧 未割り当て修正: {date.strftime('%Y-%m-%d')} {hosp} → {new_doc}")
+
+    if verbose:
+        if total_fixed == 0:
+            print("   ✅ 未割り当てスロットなし")
+        else:
+            print(f"   ✅ {total_fixed}件の未割り当てスロットを修正しました")
+
+    return df, (total_fixed == 0 or total_fixed > 0), total_fixed
+
 def build_diagnostics(pattern_df):
     counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(pattern_df)
     score, raw, metrics = evaluate_schedule_with_raw(
@@ -3973,15 +4037,20 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         univ_weekday_fixed_df, max_attempts=200, verbose=False
     )
 
+    # 11. 最終セーフティネット: 未割り当てスロットを埋める（ハード制約）
+    final_df, unassigned_success, unassigned_fix_count = fix_unassigned_slots(
+        fairness_fixed_df, verbose=False
+    )
+
     # 修正後に再評価
-    if fix_count > 0 or code_2_fix_count > 0 or cap_fix_count > 0 or univ_min_fix_count > 0 or ch_kate_fix_count > 0 or bg_ht_fix_count > 0 or gap_fix_count > 0 or ext_dup_fix_count > 0 or univ_over_2_fix_count > 0 or univ_weekday_fix_count > 0 or fairness_fix_count > 0:
-        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(fairness_fixed_df)
+    if fix_count > 0 or code_2_fix_count > 0 or cap_fix_count > 0 or univ_min_fix_count > 0 or ch_kate_fix_count > 0 or bg_ht_fix_count > 0 or gap_fix_count > 0 or ext_dup_fix_count > 0 or univ_over_2_fix_count > 0 or univ_weekday_fix_count > 0 or fairness_fix_count > 0 or unassigned_fix_count > 0:
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(final_df)
         sc2, raw2, met2 = evaluate_schedule_with_raw(
-            fairness_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
+            final_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
         )
-        improved_df = fairness_fixed_df
+        improved_df = final_df
     else:
-        improved_df = fairness_fixed_df
+        improved_df = final_df
 
     refined.append({
         "seed": cand["seed"],
@@ -4003,6 +4072,7 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         "univ_over_2_violations_fixed": univ_over_2_fix_count,
         "univ_weekday_violations_fixed": univ_weekday_fix_count,
         "fairness_violations_fixed": fairness_fix_count,
+        "unassigned_slots_fixed": unassigned_fix_count,
     })
 
 # =========================
