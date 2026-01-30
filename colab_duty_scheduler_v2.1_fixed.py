@@ -281,7 +281,7 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直くん v3.5 (大学最低1回を準ハード制約に+gap=3日)")
+print("   当直くん v3.7 (CODE_2医師n+1違反チェック追加)")
 print("="*60)
 print("\nsheet1〜sheet4（またはSheet4）が入った当直Excelファイルを選択してください")
 
@@ -3372,7 +3372,6 @@ print(f"   TOP{min(TOP_KEEP, len(candidates))}候補を局所探索で最適化�
 # ローカル探索で候補を改善
 refined = []
 for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
-    print(f"   候補{idx}/{REFINE_TOP}を処理中...")
     if LOCAL_SEARCH_ENABLED:
         improved_df, sc2, raw2, met2 = local_search_swap(
             cand["pattern_df"],
@@ -3389,52 +3388,52 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
 
     # 1. ハード制約違反の自動修正
     fixed_df, fix_success, fix_count, fail_count = fix_hard_constraint_violations(
-        improved_df, max_attempts=50, verbose=True
+        improved_df, max_attempts=50, verbose=False
     )
 
     # 2. 可否コード2医師のn+1回違反を修正（ハード制約）
     code_2_fixed_df, code_2_success, code_2_fix_count = fix_code_2_extra_violations(
-        fixed_df, max_attempts=100, verbose=True
+        fixed_df, max_attempts=100, verbose=False
     )
 
     # 3. TARGET_CAP違反の自動修正（優先度1位）
     cap_fixed_df, cap_success, cap_fix_count = fix_target_cap_violations(
-        code_2_fixed_df, max_attempts=100, verbose=True
+        code_2_fixed_df, max_attempts=100, verbose=False
     )
 
     # 4. 大学系最低1回必須違反を修正（準ハード制約、優先度2位）
     univ_min_fixed_df, univ_min_success, univ_min_fix_count = fix_university_minimum_requirement(
-        cap_fixed_df, max_attempts=100, verbose=True
+        cap_fixed_df, max_attempts=100, verbose=False
     )
 
     # 5. gap違反（3日未満の間隔）を修正（優先度3位）
     gap_fixed_df, gap_success, gap_fix_count = fix_gap_violations(
-        univ_min_fixed_df, max_attempts=200, verbose=True
+        univ_min_fixed_df, max_attempts=200, verbose=False
     )
 
     # 6. 外病院重複を修正（優先度4位）
     ext_dup_fixed_df, ext_dup_success, ext_dup_fix_count = fix_external_hospital_dup_violations(
-        gap_fixed_df, max_attempts=150, verbose=True
+        gap_fixed_df, max_attempts=150, verbose=False
     )
 
     # 7. 大学系と外病院の差が3以上の違反を修正
     bg_ht_fixed_df, bg_ht_success, bg_ht_fix_count = fix_bg_ht_imbalance_violations(
-        ext_dup_fixed_df, max_attempts=100, verbose=True
+        ext_dup_fixed_df, max_attempts=100, verbose=False
     )
 
     # 8. 大学3回以上違反を修正
     univ_over_2_fixed_df, univ_over_2_success, univ_over_2_fix_count = fix_university_over_2_violations(
-        bg_ht_fixed_df, max_attempts=150, verbose=True
+        bg_ht_fixed_df, max_attempts=150, verbose=False
     )
 
     # 9. 大学平日偏り違反を修正
     univ_weekday_fixed_df, univ_weekday_success, univ_weekday_fix_count = fix_university_weekday_balance_violations(
-        univ_over_2_fixed_df, max_attempts=150, verbose=True
+        univ_over_2_fixed_df, max_attempts=150, verbose=False
     )
 
     # 10. 公平性違反の修正（最大と最小の差を縮める）
     fairness_fixed_df, fairness_success, fairness_fix_count = fix_fairness_imbalance(
-        univ_weekday_fixed_df, max_attempts=200, verbose=True
+        univ_weekday_fixed_df, max_attempts=200, verbose=False
     )
 
     # 修正後に再評価
@@ -3473,6 +3472,7 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
 # =========================
 print("\n=== ハード制約チェック ===")
 valid_patterns = []
+excluded_count = 0
 for e in refined:
     met = e["metrics_after"]
     cap_viol = met.get('cap_violations', 0)
@@ -3481,9 +3481,12 @@ for e in refined:
     code_2_viol = met.get('code_2_extra_violations', 0)
 
     if cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0:
-        print(f"   ❌ seed={e['seed']}: TARGET_CAP違反={cap_viol}, gap違反={gap_viol}, 未割当={unassigned}, CODE_2 n+1違反={code_2_viol} → 除外")
+        excluded_count += 1
     else:
         valid_patterns.append(e)
+
+if excluded_count > 0:
+    print(f"   {excluded_count}パターンが違反により除外されました")
 
 if not valid_patterns:
     print("   ⚠️ 警告: ハード制約を満たすパターンがありません。全パターンから選択します。")
