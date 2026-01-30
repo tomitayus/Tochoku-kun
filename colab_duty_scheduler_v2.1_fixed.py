@@ -1,5 +1,13 @@
-# @title 当直くん v3.7 (CODE_2医師n+1違反の修正機能追加)
+# @title 当直くん v3.8 (外病院最低1回ハード制約追加)
 # 修正内容:
+# v3.8 (2026-01-30):
+# - 外病院最低1回をハード制約として追加（大学3回以上を防止）
+#   - fix_university_over_2_violationsを拡張して外病院0回も検出・修正
+#   - ht_0_violationsメトリクスを追加（ペナルティ300）
+#   - ハード制約チェックにbg_over_2_violations、ht_0_violationsを追加
+# - 最適化パイプライン順序を修正
+#   - BG/HT不均衡(#6) → 外病院重複(#7) の順序に変更
+# - 処理番号の表示を追加 [X/15]
 # v3.7 (2026-01-30):
 # - build_hard_constraint_violationsのreturn文欠落バグを修正
 # - CODE_2医師のn+1回違反を最適化後にチェック・修正する機能を追加
@@ -281,7 +289,7 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # 入力ファイルのアップロード
 # =========================
 print("="*60)
-print("   当直くん v3.7 (CODE_2医師n+1違反チェック追加)")
+print("   当直くん v3.8 (外病院最低1回ハード制約追加)")
 print("="*60)
 print("\nsheet1〜sheet4（またはSheet4）が入った当直Excelファイルを選択してください")
 
@@ -1273,14 +1281,22 @@ def evaluate_schedule_with_raw(
     # 大学病院2回の場合、平日1回+休日1回のバランス違反
     bg_weekday_weekend_imbalance = 0
     bg_over_2_violations = 0  # 大学3回以上の違反（不満が高い）
+    ht_0_violations = 0  # 外病院0回の違反（ハード制約：大学3回以上を防ぐ）
     bg_weekday_over_violations = 0  # 大学の平日偏り（平日2回以上は不満）
     for doc in active_doctors:
+        if doc in RATIO_EXEMPT_DOCTORS:  # コード3は外病院専門なので除外
+            continue
         bg_total = assigned_bg.get(doc, 0)
+        ht_total = assigned_ht.get(doc, 0)
         weekday_count = bg_cat[doc].get("平日", 0)
 
         # 大学3回以上は不可
         if bg_total >= 3:
             bg_over_2_violations += (bg_total - 2)
+
+        # 外病院0回かつ大学1回以上はハード制約違反
+        if ht_total == 0 and bg_total >= 1:
+            ht_0_violations += 1
 
         # 大学2回の場合、平日1回+休日1回が理想
         if bg_total == 2:
@@ -1302,7 +1318,8 @@ def evaluate_schedule_with_raw(
     penalty += code_1_2_violations * 150  # 1.2の医師が大学系0回の場合、大きなペナルティ
     penalty += bg_ht_imbalance_violations * 100  # 大学系と外病院の差が3以上の場合、大きなペナルティ
     penalty += bg_weekday_weekend_imbalance * 50  # 大学病院2回の平日/休日バランス違反
-    penalty += bg_over_2_violations * 150  # 大学3回以上の違反（不満が高い）
+    penalty += bg_over_2_violations * 300  # 大学3回以上の違反（ハード制約）
+    penalty += ht_0_violations * 300  # 外病院0回の違反（ハード制約）
     penalty += bg_weekday_over_violations * 80  # 大学の平日偏り（平日2回以上は不満）
 
     penalty += max(0, bg_spread - 1) * W_BG_SPREAD
@@ -1328,6 +1345,7 @@ def evaluate_schedule_with_raw(
         "bg_ht_imbalance_violations": int(bg_ht_imbalance_violations),
         "bg_weekday_weekend_imbalance": int(bg_weekday_weekend_imbalance),
         "bg_over_2_violations": int(bg_over_2_violations),
+        "ht_0_violations": int(ht_0_violations),
         "bg_weekday_over_violations": int(bg_weekday_over_violations),
         "bg_spread_cum": float(bg_spread),
         "ht_spread_cum": float(ht_spread),
@@ -2864,6 +2882,7 @@ def fix_external_hospital_dup_violations(pattern_df, max_attempts=150, verbose=T
 def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True):
     """
     大学病院（B～K列）が3回以上の医師の違反を修正する
+    また、外病院0回の医師がいる場合も大学→外病院への移動を試みる（ハード制約）
 
     Args:
         pattern_df: スケジュールDataFrame
@@ -2884,23 +2903,45 @@ def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True)
         # 大学3回以上の医師を検出
         over_2_list = []
         for doc in active_doctors:
+            if doc in RATIO_EXEMPT_DOCTORS:  # コード3は外病院専門なので除外
+                continue
             bg_count = bg_counts.get(doc, 0)
             if bg_count >= 3:
-                over_2_list.append((doc, bg_count))
+                over_2_list.append((doc, bg_count, "大学3回以上"))
+
+        # 外病院0回の医師を検出（大学を外病院に移動する必要あり）
+        for doc in active_doctors:
+            if doc in RATIO_EXEMPT_DOCTORS:  # コード3は外病院専門なので対象外
+                continue
+            ht_count = ht_counts.get(doc, 0)
+            bg_count = bg_counts.get(doc, 0)
+            # 外病院0回かつ大学1回以上なら、大学→外病院への移動が必要
+            if ht_count == 0 and bg_count >= 1:
+                # 既にover_2_listに含まれていないかチェック
+                if not any(d == doc for d, _, _ in over_2_list):
+                    over_2_list.append((doc, bg_count, "外病院0回"))
 
         if not over_2_list:
             if verbose and total_fixed > 0:
-                print(f"   ✅ 大学3回以上違反を{total_fixed}件修正しました")
+                print(f"   ✅ 大学3回以上/外病院0回違反を{total_fixed}件修正しました")
             return df, True, total_fixed
 
         if attempt == 0 and verbose:
-            print(f"   ⚠️ 大学3回以上違反を{len(over_2_list)}件検出 → 自動修正を開始...")
+            over_3_count = sum(1 for _, _, reason in over_2_list if reason == "大学3回以上")
+            ext_0_count = sum(1 for _, _, reason in over_2_list if reason == "外病院0回")
+            if over_3_count > 0:
+                print(f"   ⚠️ 大学3回以上違反を{over_3_count}件検出")
+            if ext_0_count > 0:
+                print(f"   ⚠️ 外病院0回違反を{ext_0_count}件検出")
 
         # 修正試行
         fixed_in_this_iteration = 0
 
-        for doc, bg_count in over_2_list:
-            if bg_count < 3:
+        for doc, bg_count, reason in over_2_list:
+            # 大学3回以上の場合は2回に減らす、外病院0回の場合は1回移動
+            if reason == "大学3回以上" and bg_count < 3:
+                continue
+            if reason == "外病院0回" and bg_count < 1:
                 continue
 
             # この医師の大学病院への割当を探す
@@ -2921,8 +2962,12 @@ def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True)
                     if isinstance(val, str) and normalize_name(val) == doc:
                         bg_positions.append((ridx, hosp, date))
 
-            # 3回以上のうち、削減する（2回まで減らす）
-            excess = bg_count - 2
+            # 移動数を決定
+            if reason == "大学3回以上":
+                excess = bg_count - 2  # 2回まで減らす
+            else:  # 外病院0回
+                excess = 1  # 1回だけ移動
+
             import random
             random.shuffle(bg_positions)
 
@@ -2976,14 +3021,20 @@ def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True)
             break
 
     # 最終確認
-    counts, bg_counts, *_ = recompute_stats(df)
-    remaining_violations = sum(1 for doc in active_doctors if bg_counts.get(doc, 0) >= 3)
+    counts, bg_counts, ht_counts, *_ = recompute_stats(df)
+    remaining_over_2 = sum(1 for doc in active_doctors if doc not in RATIO_EXEMPT_DOCTORS and bg_counts.get(doc, 0) >= 3)
+    remaining_ext_0 = sum(1 for doc in active_doctors if doc not in RATIO_EXEMPT_DOCTORS and ht_counts.get(doc, 0) == 0 and bg_counts.get(doc, 0) >= 1)
+    remaining_violations = remaining_over_2 + remaining_ext_0
 
     if verbose:
         if remaining_violations == 0:
-            print(f"   ✅ 全ての大学3回以上違反を修正しました（修正数: {total_fixed}）")
+            if total_fixed > 0:
+                print(f"   ✅ 全ての大学3回以上/外病院0回違反を修正しました（修正数: {total_fixed}）")
         else:
-            print(f"   ⚠️ {remaining_violations}件の大学3回以上違反が残っています（修正数: {total_fixed}）")
+            if remaining_over_2 > 0:
+                print(f"   ⚠️ {remaining_over_2}件の大学3回以上違反が残っています")
+            if remaining_ext_0 > 0:
+                print(f"   ⚠️ {remaining_ext_0}件の外病院0回違反が残っています")
 
     return df, remaining_violations == 0, total_fixed
 
@@ -3372,6 +3423,7 @@ print(f"   TOP{min(TOP_KEEP, len(candidates))}候補を局所探索で最適化�
 # ローカル探索で候補を改善
 refined = []
 for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
+    print(f"   [{idx}/{REFINE_TOP}] 最適化中...")
     if LOCAL_SEARCH_ENABLED:
         improved_df, sc2, raw2, met2 = local_search_swap(
             cand["pattern_df"],
@@ -3411,19 +3463,19 @@ for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
         univ_min_fixed_df, max_attempts=200, verbose=False
     )
 
-    # 6. 外病院重複を修正（優先度4位）
-    ext_dup_fixed_df, ext_dup_success, ext_dup_fix_count = fix_external_hospital_dup_violations(
-        gap_fixed_df, max_attempts=150, verbose=False
-    )
-
-    # 7. 大学系と外病院の差が3以上の違反を修正
+    # 6. 大学系と外病院の差が3以上の違反を修正
     bg_ht_fixed_df, bg_ht_success, bg_ht_fix_count = fix_bg_ht_imbalance_violations(
-        ext_dup_fixed_df, max_attempts=100, verbose=False
+        gap_fixed_df, max_attempts=100, verbose=False
     )
 
-    # 8. 大学3回以上違反を修正
-    univ_over_2_fixed_df, univ_over_2_success, univ_over_2_fix_count = fix_university_over_2_violations(
+    # 7. 外病院重複を修正
+    ext_dup_fixed_df, ext_dup_success, ext_dup_fix_count = fix_external_hospital_dup_violations(
         bg_ht_fixed_df, max_attempts=150, verbose=False
+    )
+
+    # 8. 大学3回以上違反を修正（外病院最低1回も強制）
+    univ_over_2_fixed_df, univ_over_2_success, univ_over_2_fix_count = fix_university_over_2_violations(
+        ext_dup_fixed_df, max_attempts=150, verbose=False
     )
 
     # 9. 大学平日偏り違反を修正
@@ -3479,8 +3531,10 @@ for e in refined:
     gap_viol = met.get('gap_violations', 0)
     unassigned = met.get('unassigned_slots', 0)
     code_2_viol = met.get('code_2_extra_violations', 0)
+    bg_over_2_viol = met.get('bg_over_2_violations', 0)
+    ht_0_viol = met.get('ht_0_violations', 0)
 
-    if cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0:
+    if cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0 or bg_over_2_viol > 0 or ht_0_viol > 0:
         excluded_count += 1
     else:
         valid_patterns.append(e)
