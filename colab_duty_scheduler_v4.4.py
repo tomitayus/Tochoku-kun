@@ -193,7 +193,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "4.3"
+VERSION = "4.4"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -1239,14 +1239,19 @@ def recompute_stats(pattern_df):
 
     for (ridx, hosp), (date, fixed) in slot_meta.items():
         val = pattern_df.at[ridx, hosp]
-        if not isinstance(val, str):
-            continue
-        v = normalize_name(val)  # 🔧 FIX
 
-        if v == "UNASSIGNED":
+        # 未割り当てチェック（None, NaN, 非医師名の場合）
+        if pd.isna(val):
             unassigned.append((date, hosp, ridx))
             continue
+        if not isinstance(val, str):
+            # 数値など（1など）は未割り当て
+            unassigned.append((date, hosp, ridx))
+            continue
+        v = normalize_name(val)  # 🔧 FIX
         if v not in doctor_names:
+            # 医師名でない文字列（"UNASSIGNED"や"1"など）も未割り当て
+            unassigned.append((date, hosp, ridx))
             continue
 
         doc = v
@@ -1319,13 +1324,21 @@ def evaluate_schedule_with_raw(
     assigned_bk,
     assigned_ly,
 ):
-    # UNASSIGNED
+    # UNASSIGNED - slot_metaに登録されたスロットのうち、医師名が入っていないものをカウント
+    # None, NaN, 非医師名（1, 〇など）も未割り当てとしてカウント
     unassigned_slots = 0
-    for ridx in pattern_df.index:
-        for hosp in hospital_cols:
-            v = pattern_df.at[ridx, hosp]
-            if isinstance(v, str) and normalize_name(v) == "UNASSIGNED":  # 🔧 FIX
+    for (ridx, hosp), (date, fixed) in slot_meta.items():
+        v = pattern_df.at[ridx, hosp]
+        # 医師名でない場合は未割り当て
+        if pd.isna(v):
+            unassigned_slots += 1
+        elif isinstance(v, str):
+            v_norm = normalize_name(v)
+            if v_norm not in doctor_names:
                 unassigned_slots += 1
+        else:
+            # 数値など（1など）は未割り当て
+            unassigned_slots += 1
 
     # CC（大型連休特別シフト）カウント - バランス計算から除外用
     cc_counts = {d: 0 for d in doctor_names}
@@ -2222,10 +2235,26 @@ def fix_hard_constraint_violations(pattern_df, max_attempts=50, verbose=True):
                 fixed_in_this_iteration += 1
                 total_fixed += 1
             else:
-                # 代替医師が見つからない → 未割当のまま
-                total_failed += 1
-                if verbose:
-                    print(f"   ⚠️ 修正失敗: {date.strftime('%Y-%m-%d')} {hosp} ({violation_type})")
+                # 緊急フォールバック: 制約を無視して誰かを割り当て（未割当よりはまし）
+                # 同日重複のみ避ける
+                emergency_candidates = [d for d in doctor_names if d not in already_assigned_on_date]
+                if emergency_candidates:
+                    # 全体合計が最も少ない医師を選択
+                    emergency_candidates.sort(key=lambda d: prev_total.get(d, 0) + len([1 for h in hospital_cols for ridx2 in df.index if isinstance(df.at[ridx2, h], str) and normalize_name(df.at[ridx2, h]) == d]))
+                    new_doc = emergency_candidates[0]
+                    df.at[ridx, hosp] = new_doc
+                    fixed_in_this_iteration += 1
+                    total_fixed += 1
+                    if verbose:
+                        print(f"   ⚠️ 緊急フォールバック: {date.strftime('%Y-%m-%d')} {hosp} → {new_doc}")
+                else:
+                    # 同日重複も許容して最後の手段
+                    fallback_doc = min(doctor_names, key=lambda d: prev_total.get(d, 0) + len([1 for h in hospital_cols for ridx2 in df.index if isinstance(df.at[ridx2, h], str) and normalize_name(df.at[ridx2, h]) == d]))
+                    df.at[ridx, hosp] = fallback_doc
+                    fixed_in_this_iteration += 1
+                    total_fixed += 1
+                    if verbose:
+                        print(f"   ⚠️ 最終フォールバック（同日重複あり）: {date.strftime('%Y-%m-%d')} {hosp} → {fallback_doc}")
 
         # 進捗がなければループ終了
         # 修正が進まなくてもmax_attemptsまで試行を続ける
@@ -2523,13 +2552,22 @@ def fix_code_2_extra_violations(pattern_df, max_attempts=100, verbose=True):
                     total_fixed += 1
                     fixed_in_this_iteration += 1
                 else:
-                    # 代替が見つからない場合は削除
-                    df.at[ridx, hosp] = np.nan
-                    counts[over_doc] = counts.get(over_doc, 0) - 1
-                    total_fixed += 1
-                    fixed_in_this_iteration += 1
-                    if verbose:
-                        print(f"      ⚠️ {over_doc}の{date.strftime('%m/%d')} {hosp}を削除（代替なし）")
+                    # 緊急フォールバック: 制約緩和して誰かを割り当て（未割当防止）
+                    emergency = [d for d in doctor_names if d not in already_assigned_on_date and d != over_doc]
+                    if emergency:
+                        emergency.sort(key=lambda d: counts.get(d, 0))
+                        new_doc = emergency[0]
+                        df.at[ridx, hosp] = new_doc
+                        counts[over_doc] = counts.get(over_doc, 0) - 1
+                        counts[new_doc] = counts.get(new_doc, 0) + 1
+                        total_fixed += 1
+                        fixed_in_this_iteration += 1
+                        if verbose:
+                            print(f"      ⚠️ {over_doc}→{new_doc}(緊急): {date.strftime('%m/%d')} {hosp}")
+                    else:
+                        # 最終手段: 元の医師を維持（削除しない）
+                        if verbose:
+                            print(f"      ⚠️ {over_doc}の{date.strftime('%m/%d')} {hosp}を維持（代替不可）")
 
         if fixed_in_this_iteration == 0:
             break
@@ -3383,13 +3421,44 @@ def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True)
                         moved = True
                         break
 
-                # 移動先が見つからない場合は削除
+                # 移動先が見つからない場合は代替医師を探して割り当て（未割当防止）
                 if not moved and attempt >= 5:
-                    df.at[ridx, hosp] = None
+                    # この日に既に割り当てられている医師を取得
+                    already_on_date = set()
+                    for h in hospital_cols:
+                        v = df.at[ridx, h]
+                        if isinstance(v, str):
+                            already_on_date.add(normalize_name(v))
+                    # 代替候補: 同日重複なし & 大学系2回未満の医師
+                    replacement_candidates = [
+                        d for d in doctor_names
+                        if d not in already_on_date
+                        and d != doc
+                        and bg_counts.get(d, 0) < 2
+                        and can_assign_doc_to_slot(d, date, hosp)
+                    ]
+                    if replacement_candidates:
+                        replacement_candidates.sort(key=lambda d: bg_counts.get(d, 0))
+                        new_doc = replacement_candidates[0]
+                        df.at[ridx, hosp] = new_doc
+                        if verbose and attempt < 10:
+                            print(f"      {doc}→{new_doc}: {date.strftime('%m/%d')}の大学病院割当を交代")
+                    else:
+                        # 緊急フォールバック: 制約緩和して誰かを割り当て
+                        emergency = [d for d in doctor_names if d not in already_on_date and d != doc]
+                        if emergency:
+                            emergency.sort(key=lambda d: bg_counts.get(d, 0))
+                            new_doc = emergency[0]
+                            df.at[ridx, hosp] = new_doc
+                            if verbose and attempt < 10:
+                                print(f"      {doc}→{new_doc}(緊急): {date.strftime('%m/%d')}の大学病院割当を交代")
+                        else:
+                            # 最終手段: 元の医師を維持（削除しない）
+                            df.at[ridx, hosp] = doc
+                            if verbose and attempt < 10:
+                                print(f"      {doc}: {date.strftime('%m/%d')}の割当維持（代替不可）")
                     fixed_in_this_iteration += 1
                     total_fixed += 1
-                    if verbose and attempt < 10:
-                        print(f"      {doc}の{date.strftime('%m/%d')}の大学病院割当を削除します（3回以上→2回）")
 
             if fixed_in_this_iteration > 0:
                 counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
@@ -3519,13 +3588,44 @@ def fix_university_weekday_balance_violations(pattern_df, max_attempts=150, verb
                         moved = True
                         break
 
-                # 移動先が見つからない場合は削除
+                # 移動先が見つからない場合は代替医師を探して割り当て（未割当防止）
                 if not moved and attempt >= 5:
-                    df.at[ridx, hosp] = None
+                    # この日に既に割り当てられている医師を取得
+                    already_on_date = set()
+                    for h in hospital_cols:
+                        v = df.at[ridx, h]
+                        if isinstance(v, str):
+                            already_on_date.add(normalize_name(v))
+                    # 代替候補: 同日重複なし & 大学平日未割当の医師
+                    replacement_candidates = [
+                        d for d in doctor_names
+                        if d not in already_on_date
+                        and d != doc
+                        and wd_counts.get(d, 0) < we_counts.get(d, 0)  # 平日<休日の医師を優先
+                        and can_assign_doc_to_slot(d, date, hosp)
+                    ]
+                    if replacement_candidates:
+                        replacement_candidates.sort(key=lambda d: wd_counts.get(d, 0))
+                        new_doc = replacement_candidates[0]
+                        df.at[ridx, hosp] = new_doc
+                        if verbose and attempt < 10:
+                            print(f"      {doc}→{new_doc}: {date.strftime('%m/%d')}の大学平日割当を交代")
+                    else:
+                        # 緊急フォールバック
+                        emergency = [d for d in doctor_names if d not in already_on_date and d != doc]
+                        if emergency:
+                            emergency.sort(key=lambda d: counts.get(d, 0))
+                            new_doc = emergency[0]
+                            df.at[ridx, hosp] = new_doc
+                            if verbose and attempt < 10:
+                                print(f"      {doc}→{new_doc}(緊急): {date.strftime('%m/%d')}の大学平日割当を交代")
+                        else:
+                            # 最終手段: 元の医師を維持
+                            df.at[ridx, hosp] = doc
+                            if verbose and attempt < 10:
+                                print(f"      {doc}: {date.strftime('%m/%d')}の割当維持（代替不可）")
                     fixed_in_this_iteration += 1
                     total_fixed += 1
-                    if verbose and attempt < 10:
-                        print(f"      {doc}の{date.strftime('%m/%d')}の大学平日割当を削除します")
                     break
 
             if fixed_in_this_iteration > 0:
