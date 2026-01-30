@@ -1,5 +1,14 @@
-# @title 当直くん v3.8 (外病院最低1回ハード制約追加)
+# @title 当直くん v3.9 (print出力最適化)
 # 修正内容:
+# v3.9 (2026-01-30):
+# - print出力の最適化
+#   - tqdmによる進捗バー表示（パターン生成、局所探索）
+#   - セクション区切りの統一（=== ===形式）
+#   - 階層構造表示（├─/└─）
+#   - TOPパターン評価をテーブル形式で表示
+#   - 冗長な出力を削減
+# - 出力ファイル名にバージョンを反映（filename_v3.9.xlsx）
+# - VERSION定数を追加
 # v3.8 (2026-01-30):
 # - 外病院最低1回をハード制約として追加（大学3回以上を防止）
 #   - fix_university_over_2_violationsを拡張して外病院0回も検出・修正
@@ -145,6 +154,18 @@ import random
 import importlib.util
 import os
 
+# バージョン定数
+VERSION = "3.9"
+
+# tqdmのインポート（進捗バー用）
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    def tqdm(iterable, **kwargs):
+        return iterable
+
 COLAB_AVAILABLE = (
     importlib.util.find_spec("google") is not None
     and importlib.util.find_spec("google.colab") is not None
@@ -288,10 +309,10 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # 入力ファイルのアップロード
 # =========================
+print("\n" + "="*60)
+print(f"  📂 当直くん v{VERSION}")
 print("="*60)
-print("   当直くん v3.8 (外病院最低1回ハード制約追加)")
-print("="*60)
-print("\nsheet1〜sheet4（またはSheet4）が入った当直Excelファイルを選択してください")
+print("\nsheet1〜sheet4が入った当直Excelファイルを選択してください")
 
 if COLAB_AVAILABLE:
     uploaded = files.upload()
@@ -413,10 +434,7 @@ B_K_END_INDEX = K_COL_INDEX
 L_Y_START_INDEX = L_COL_INDEX  # 外病院
 L_Y_END_INDEX = min(Y_COL_INDEX, n_cols - 1)
 
-print(f"✅ Excelファイル読み込み完了")
-print(f"   医師数: {len(doctor_names)}人")
-print(f"   病院列数: {len(hospital_cols)}列")
-print(f"   対象日数: {len(shift_df)}日")
+print(f"\n✅ Excel読込完了: 医師{len(doctor_names)}人 | 病院{len(hospital_cols)}列 | {len(shift_df)}日間")
 
 # =========================
 # sheet2 可否コード
@@ -611,35 +629,13 @@ for d in doctor_names:
 floor_shifts = BASE_TARGET
 
 print(f"\n✅ 割当設計完了")
-print(f"   全枠数: {total_slots}")
-print(f"   active医師: {len(active_doctors)}人")
-print(f"   inactive医師: {len(inactive_doctors)}人")
-print(f"   基本割当数: {BASE_TARGET}回")
-print(f"   余り枠: {EXTRA_SLOTS}枠（右側/下位の医師に+1回）")
-if EXTRA_ALLOWED:
-    extra_docs_display = sorted(EXTRA_ALLOWED, key=lambda d: doctor_col_index[d])
-    print(f"   +1回対象: {', '.join(extra_docs_display)}")
+print(f"   ├─ 全枠数: {total_slots} | active医師: {len(active_doctors)}人")
+print(f"   ├─ 基本割当: {BASE_TARGET}回 (+1回対象: {len(EXTRA_ALLOWED)}人)")
 
 # 可否コード2の医師がEXTRA枠から除外されていることを表示
 code_2_in_active = [d for d in active_sorted_by_index if d in CODE_2_DOCTORS]
 if code_2_in_active:
-    print(f"   可否コード2医師（EXTRA枠対象外）: {', '.join(code_2_in_active)}")
-
-if EXTRA_ALLOWED:
-    # デバッグ：上位医師が含まれていないことを確認
-    upper_doctors = [d for d in active_doctors if doctor_col_index[d] < 10]  # 最初の10人
-    upper_in_extra = [d for d in upper_doctors if d in EXTRA_ALLOWED]
-    if upper_in_extra:
-        print(f"   ⚠️ 警告: 上位医師が+1回対象に含まれています: {', '.join(upper_in_extra)}")
-
-    # 各医師のTARGET_CAPを表示（最初の5人と最後の5人）
-    cap_display = []
-    for d in active_sorted_by_index[:5]:
-        cap_display.append(f"{d}={TARGET_CAP[d]}")
-    cap_display.append("...")
-    for d in active_sorted_by_index[-5:]:
-        cap_display.append(f"{d}={TARGET_CAP[d]}")
-    print(f"   TARGET_CAP: {' / '.join(cap_display)}")
+    print(f"   └─ CODE_2医師（EXTRA対象外）: {len(code_2_in_active)}人")
 
 # =========================
 # B-K / L-Y 比率バランス（sheet3で「3」記載の医師は除外）
@@ -667,9 +663,7 @@ if RATIO_EXEMPT_DOCTORS:
     print(f"   比率バランス除外（sheet3に3あり）: {sorted(RATIO_EXEMPT_DOCTORS)}")
 
 SCHEDULE_CODE_HOLDERS = {doc for doc in doctor_names if has_any_schedule_code(doc)}
-if SCHEDULE_CODE_HOLDERS:
-    print(f"   カテ表コード保有医師: {len(SCHEDULE_CODE_HOLDERS)}人")
-    print(f"   カテ表コード非保有医師: {len([d for d in doctor_names if d not in SCHEDULE_CODE_HOLDERS])}人")
+print(f"   └─ カテ表保有: {len(SCHEDULE_CODE_HOLDERS)}人")
 
 # 可否コード1.2の医師（大学系最低1回必須）
 def has_code_1_2(doc):
@@ -683,15 +677,10 @@ def has_code_1_2(doc):
     return False
 
 CODE_1_2_DOCTORS = {doc for doc in doctor_names if has_code_1_2(doc)}
-if CODE_1_2_DOCTORS:
-    print(f"   可否コード1.2医師（大学系最低1回必須）: {len(CODE_1_2_DOCTORS)}人")
-    print(f"      対象: {', '.join(sorted(CODE_1_2_DOCTORS)[:10])}")
 
 # 大学系最低1回必須の医師（準ハード制約：コード3以外の全医師）
 # コード3は外病院専門なので除外
 UNIVERSITY_MINIMUM_REQUIRED_DOCTORS = {doc for doc in active_doctors if doc not in RATIO_EXEMPT_DOCTORS}
-if UNIVERSITY_MINIMUM_REQUIRED_DOCTORS:
-    print(f"   大学系最低1回必須医師（準ハード制約）: {len(UNIVERSITY_MINIMUM_REQUIRED_DOCTORS)}人（コード3除外）")
 
 # =========================
 # 大学(B〜G)の昼夜判定 & 7分類
@@ -3347,17 +3336,14 @@ def build_diagnostics(pattern_df):
 # =========================
 # パターン探索（greedy → top候補に局所探索 → top3）
 # =========================
-print("\n🚀 スケジュール生成を開始します...")
-print(f"   パターン数: {NUM_PATTERNS}")
-print(f"   局所探索: {'有効' if LOCAL_SEARCH_ENABLED else '無効'}")
-print(f"   ※処理時間: 約5-10分（パターン数に依存）\n")
+print("\n" + "="*60)
+print("  🚀 スケジュール生成")
+print("="*60)
 
 score_rows = []
 candidates = []  # TOP_KEEPだけ保持
 
-for i in range(1, NUM_PATTERNS + 1):
-    if i == 1:
-        print(f"   パターン生成を開始...")
+for i in tqdm(range(1, NUM_PATTERNS + 1), desc="   パターン生成", ncols=60, disable=not TQDM_AVAILABLE):
 
     (
         pattern_df,
@@ -3397,10 +3383,8 @@ for i in range(1, NUM_PATTERNS + 1):
 # gap違反0個の候補をスコア順にソート
 candidates = sorted(candidates, key=lambda e: e["raw_score"], reverse=True)[:TOP_KEEP]
 
-print(f"\n✅ {NUM_PATTERNS}パターンの生成完了")
-print(f"   gap違反0個の候補: {len(candidates)}個")
 if len(candidates) == 0:
-    print("   ⚠️ 警告: gap違反0個の候補が見つかりませんでした。制約を緩和します...")
+    print("\n⚠️  gap違反0個の候補なし → 制約緩和して続行")
     # gap違反の制約を緩和して再選択
     candidates = []
     for row in score_rows:
@@ -3418,12 +3402,10 @@ if len(candidates) == 0:
             pattern_df, *_ = build_schedule_pattern(seed=cand["seed"])
             cand["pattern_df"] = pattern_df
 
-print(f"   TOP{min(TOP_KEEP, len(candidates))}候補を局所探索で最適化中...")
-
 # ローカル探索で候補を改善
 refined = []
-for idx, cand in enumerate(candidates[:REFINE_TOP], 1):
-    print(f"   [{idx}/{REFINE_TOP}] 最適化中...")
+refine_list = candidates[:REFINE_TOP]
+for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=60, disable=not TQDM_AVAILABLE), 1):
     if LOCAL_SEARCH_ENABLED:
         improved_df, sc2, raw2, met2 = local_search_swap(
             cand["pattern_df"],
@@ -3539,19 +3521,11 @@ for e in refined:
     else:
         valid_patterns.append(e)
 
-if excluded_count > 0:
-    print(f"   {excluded_count}パターンが違反により除外されました")
-
 if not valid_patterns:
-    print("   ⚠️ 警告: ハード制約を満たすパターンがありません。全パターンから選択します。")
+    print("\n⚠️  ハード制約を満たすパターンなし → 全パターンから選択")
     valid_patterns = refined
-
-print(f"   ✅ {len(valid_patterns)}/{len(refined)} パターンがハード制約を満たしています")
-
-# =========================
-# 多軸スコアリング: 異なる評価軸で最適パターンを選択
-# =========================
-print("\n=== 多軸スコアリング ===")
+else:
+    print(f"\n✅ {len(valid_patterns)}/{len(refined)} パターンがハード制約OK")
 
 # 評価軸1: 公平性重視（TARGET_CAP、公平性ペナルティを重視）
 fairness_patterns = sorted(
@@ -3641,29 +3615,32 @@ refined_df = pd.DataFrame([
     for e in refined_sorted
 ]).sort_values(["raw_after", "seed"], ascending=[False, True]).reset_index(drop=True)
 
-print("\n✅ 局所探索完了")
-print("\n=== TOPパターンのスコア（多軸評価） ===")
+# =========================
+# TOPパターン評価（テーブル表示）
+# =========================
+print("\n" + "="*60)
+print("  📊 TOPパターン評価")
+print("="*60)
+
+# テーブルヘッダー
+print(f"\n{'順位':<6}{'評価軸':<14}{'gap違反':>8}{'cap違反':>8}{'公平性':>6}{'修正数':>8}")
+print("-"*56)
+
 for rank, pattern in enumerate(top_patterns, 1):
     axis_label = pattern.get('axis_label', '総合スコア')
-    print(
-        f"   {rank}位 [{axis_label}]: raw_score={pattern['raw_after']:.1f}, "
-        + f"gap違反={pattern['metrics_after']['gap_violations']}, "
-        + f"未割当={pattern['metrics_after']['unassigned_slots']}, "
-        + f"cap違反={pattern['metrics_after'].get('cap_violations', 0)}, "
-        + f"1.2違反={pattern['metrics_after'].get('code_1_2_violations', 0)}, "
-        + f"BG/HT差3以上={pattern['metrics_after'].get('bg_ht_imbalance_violations', 0)}, "
-        + f"公平性(max-min)={pattern['metrics_after'].get('max_minus_min_total_active', 0)}, "
-        + f"制約修正={pattern.get('violations_fixed', 0)}件"
-    )
+    axis_short = {"公平性重視": "公平性", "連続当直回避重視": "gap回避", "バランス重視": "バランス", "総合スコア": "総合"}.get(axis_label, axis_label[:6])
+    gap_v = pattern['metrics_after']['gap_violations']
+    cap_v = pattern['metrics_after'].get('cap_violations', 0)
+    fairness = pattern['metrics_after'].get('max_minus_min_total_active', 0)
+    fixes = pattern.get('violations_fixed', 0)
+    print(f"{rank}位{'':<4}{axis_short:<14}{gap_v:>8}{cap_v:>8}{fairness:>6}{fixes:>8}")
 
 # =========================
 # 出力（pattern + summary + diagnostics）
 # =========================
 base_name = uploaded_filename.rsplit(".", 1)[0]
-output_filename = f"{base_name}_auto_schedules_v2.8.xlsx"
+output_filename = f"{base_name}_v{VERSION}.xlsx"
 output_path = output_filename
-
-print(f"\n📝 結果をExcelファイルに出力中...")
 
 def write_diagnostics_sheet(writer, sheet_name, diagnostics):
     startrow = 0
@@ -3718,31 +3695,18 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         )
 
 print("\n" + "="*60)
-print("   🎉 完了！")
+print("  🎉 完了")
 print("="*60)
-print(f"\n📥 出力ファイル: {output_path}")
-print("\n【ファイル内容】")
-print("  - sheet1〜4: 元データ")
-print("  - pattern_01〜03: 多軸評価によるTOP3スケジュール候補")
-print("    * 公平性重視: 医師間の割当回数の公平性を最優先")
-print("    * gap回避重視: 連続当直の間隔を最優先")
-print("    * バランス重視: 大学/外病院、平日/休日のバランスを最優先")
-print("  - pattern_XX_今月/累計: 各パターンのサマリーシート")
-print("  - pattern_XX_diag: 各パターンの診断シート（ハード制約違反、gap違反、重複等）")
-print("\n【推奨】")
-print("  ✅ 多軸評価により異なる特性を持つパターンを提供")
-print("  ✅ TARGET_CAP、gap、未割当の違反がないパターンのみ選択")
-print("  🔍 各pattern_XX_diagの「ハード制約違反」シートで修正結果を確認")
-print("  1. 3つの評価軸（公平性/gap回避/バランス）から最適なパターンを選択")
-print("  2. 選択したパターンの診断シートで違反・重複を確認")
-print("  3. サマリーシートで医師ごとの偏りを確認")
-print("\n【主な自動修正対象】")
-print("  ✅ 可否コード0違反（絶対不可の日に割当）")
-print("  ✅ カテ表+外病院違反（カテ表コードがある日にL〜Y列に割当）← 五十嵐医師の問題を修正")
-print("  ✅ 可否コード2違反（B〜Q列以外に割当）")
-print("  ✅ 可否コード3違反（L〜Y列以外に割当）")
-print("  ✅ B-K列カテ表コード欠如（カテ表コード保有医師がコードなし日にB〜K列に割当）")
-print("  ✅ 水曜日L〜Y列禁止違反")
+print(f"\n📥 出力: {output_path}")
+print("\n【内容】")
+print("  ├─ sheet1〜4: 元データ")
+print("  ├─ pattern_01〜03: TOP3スケジュール候補")
+print("  ├─ pattern_XX_今月/累計: サマリー")
+print("  └─ pattern_XX_diag: 診断シート")
+print("\n【確認手順】")
+print("  1. 3つの評価軸から最適パターンを選択")
+print("  2. 診断シートで違反・重複を確認")
+print("  3. サマリーで医師ごとの偏りを確認")
 print("="*60)
 
 if COLAB_AVAILABLE:
