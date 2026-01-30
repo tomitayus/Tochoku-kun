@@ -193,7 +193,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "4.5"
+VERSION = "4.6"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -955,6 +955,13 @@ def choose_doctor_for_slot(
         under_floor = [d for d in candidates if assigned_count[d] < floor_shifts]
         if under_floor:
             candidates = under_floor
+
+    # ★ C-H列（土日大学）はカテ当番医師を最優先（カテなし医師は最後の手段）
+    # カテ当番医師がいる場合、カテなし医師より優先して配置
+    if is_ch_slot(idx) and candidates:
+        kate_docs_on_day = [d for d in candidates if get_sched_code(date, d)]
+        if kate_docs_on_day:
+            candidates = kate_docs_on_day
 
     # gap
     gaps = {}
