@@ -1,5 +1,15 @@
-# @title 当直くん v3.9 (print出力最適化)
+# @title 当直くん v4.0 (C-H列カテ当番制約)
 # 修正内容:
+# v4.0 (2026-01-30):
+# - C-H列（休日大学系）のカテ当番制約を追加
+#   - C-H列はカテ当番のある医師（その日にアルファベットあり）または
+#     カテ当番が一回もない医師（sheet3に1つもアルファベットなし）のみ割り当て可能
+#   - NO_KATE_DOCTORSセットを追加（カテ当番なし医師の集合）
+#   - is_ch_slot()、is_eligible_for_ch_slot()関数を追加
+#   - collect_candidatesにrelax_ch_kateパラメータを追加
+#   - fix_ch_kate_violations()関数を追加（違反修正用）
+#   - ch_kate_violationsメトリクスを追加（ペナルティ120）
+#   - 最適化パイプライン#4.5に追加（大学最低1回の後、gap違反の前）
 # v3.9 (2026-01-30):
 # - print出力の最適化
 #   - tqdmによる進捗バー表示（パターン生成、局所探索）
@@ -155,7 +165,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "3.9"
+VERSION = "4.0"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -665,6 +675,27 @@ if RATIO_EXEMPT_DOCTORS:
 SCHEDULE_CODE_HOLDERS = {doc for doc in doctor_names if has_any_schedule_code(doc)}
 print(f"   └─ カテ表保有: {len(SCHEDULE_CODE_HOLDERS)}人")
 
+# カテ当番なし医師（sheet3に1つもアルファベットがない医師）
+# C-H列（休日大学系）に自由に割り当て可能
+NO_KATE_DOCTORS = {doc for doc in doctor_names if not has_any_schedule_code(doc)}
+print(f"   └─ カテ当番なし: {len(NO_KATE_DOCTORS)}人")
+
+def is_ch_slot(col_idx):
+    """C-H列（休日大学系、インデックス2-7）かどうか"""
+    return C_COL_INDEX <= col_idx <= H_COL_INDEX
+
+def is_eligible_for_ch_slot(doc, date):
+    """C-H列（休日大学系）に割り当て可能かどうか
+    条件：その日にカテ当番あり OR カテ当番が一回もない医師
+    """
+    # カテ当番が一回もない医師はOK
+    if doc in NO_KATE_DOCTORS:
+        return True
+    # カテ当番保有医師は、その日にカテ表コードがあればOK
+    if get_sched_code(date, doc):
+        return True
+    return False
+
 # 可否コード1.2の医師（大学系最低1回必須）
 def has_code_1_2(doc):
     """医師がsheet2で少なくとも1つの1.2コードを持っているか"""
@@ -761,6 +792,7 @@ def choose_doctor_for_slot(
         relax_schedule=False,
         relax_wed=False,
         relax_bh_limit=False,
+        relax_ch_kate=False,
     ):
         candidates = []
         for doc in doctor_names:
@@ -793,6 +825,11 @@ def choose_doctor_for_slot(
                 if doc in SCHEDULE_CODE_HOLDERS and not get_sched_code(date, doc) and doc not in EXTRA_ALLOWED:
                     continue
 
+            # ★ 準ハード制約: C〜H列（休日大学系）はカテ当番ありの日 OR カテ当番なし医師のみ
+            if not relax_ch_kate and is_ch_slot(idx):
+                if not is_eligible_for_ch_slot(doc, date):
+                    continue
+
             # ★ ハード制約4: B〜H列は2回まで（relax_bh_limitで緩和可能）
             if not relax_bh_limit and is_BH and assigned_bh[doc] >= 2:
                 continue
@@ -822,6 +859,7 @@ def choose_doctor_for_slot(
             relax_schedule=True,
             relax_wed=True,
             relax_bh_limit=True,
+            relax_ch_kate=True,
         )
 
     if not candidates:
@@ -1296,6 +1334,24 @@ def evaluate_schedule_with_raw(
         if weekday_count >= 2:
             bg_weekday_over_violations += (weekday_count - 1)
 
+    # C-H列（休日大学系）カテ当番違反
+    # カテ当番保有医師がその日にカテ当番なしでC-H列に割り当てられている場合
+    ch_kate_violations = 0
+    for ridx in pattern_df.index:
+        date = pattern_df.at[ridx, date_col_shift]
+        if pd.isna(date):
+            continue
+        date = pd.to_datetime(date).normalize().tz_localize(None)
+        for hosp in hospital_cols:
+            idx = shift_df.columns.get_loc(hosp)
+            if not is_ch_slot(idx):
+                continue
+            val = pattern_df.at[ridx, hosp]
+            val_norm = normalize_name(val) if isinstance(val, str) else ""
+            if val_norm in doctor_names:
+                if not is_eligible_for_ch_slot(val_norm, date):
+                    ch_kate_violations += 1
+
     penalty = 0
     penalty += fairness_penalty * W_FAIR_TOTAL
     penalty += gap_violations * W_GAP
@@ -1310,6 +1366,7 @@ def evaluate_schedule_with_raw(
     penalty += bg_over_2_violations * 300  # 大学3回以上の違反（ハード制約）
     penalty += ht_0_violations * 300  # 外病院0回の違反（ハード制約）
     penalty += bg_weekday_over_violations * 80  # 大学の平日偏り（平日2回以上は不満）
+    penalty += ch_kate_violations * 120  # C-H列カテ当番違反（優先度高）
 
     penalty += max(0, bg_spread - 1) * W_BG_SPREAD
     penalty += max(0, ht_spread - 1) * W_HT_SPREAD
@@ -1336,6 +1393,7 @@ def evaluate_schedule_with_raw(
         "bg_over_2_violations": int(bg_over_2_violations),
         "ht_0_violations": int(ht_0_violations),
         "bg_weekday_over_violations": int(bg_weekday_over_violations),
+        "ch_kate_violations": int(ch_kate_violations),
         "bg_spread_cum": float(bg_spread),
         "ht_spread_cum": float(ht_spread),
         "weekday_spread_cum": float(wd_spread),
@@ -2453,6 +2511,170 @@ def fix_code_1_2_violations(pattern_df, max_attempts=100, verbose=True):
     """後方互換性のための関数（fix_university_minimum_requirementにリダイレクト）"""
     return fix_university_minimum_requirement(pattern_df, max_attempts, verbose)
 
+def fix_ch_kate_violations(pattern_df, max_attempts=100, verbose=True):
+    """
+    C-H列（休日大学系）のカテ当番違反を修正する
+
+    条件：C-H列はカテ当番ありの日 OR カテ当番なし医師のみ
+    カテ当番保有医師がその日にカテ当番なしでC-H列に割り当てられている場合、
+    適格な医師と交換する
+
+    Args:
+        pattern_df: スケジュールDataFrame
+        max_attempts: 最大試行回数
+        verbose: ログ出力するか
+
+    Returns:
+        (修正後のDataFrame, 成功フラグ, 修正数)
+    """
+    df = pattern_df.copy()
+    total_fixed = 0
+
+    for attempt in range(max_attempts):
+        # C-H列の違反を検出
+        violations = []
+        for ridx in df.index:
+            date = df.at[ridx, date_col_shift]
+            if pd.isna(date):
+                continue
+            date = pd.to_datetime(date).normalize().tz_localize(None)
+            for hosp in hospital_cols:
+                idx = shift_df.columns.get_loc(hosp)
+                if not is_ch_slot(idx):
+                    continue
+                val = df.at[ridx, hosp]
+                if not isinstance(val, str):
+                    continue
+                doc = normalize_name(val)
+                if doc not in doctor_names:
+                    continue
+                if not is_eligible_for_ch_slot(doc, date):
+                    violations.append({
+                        "ridx": ridx,
+                        "hosp": hosp,
+                        "date": date,
+                        "doc": doc,
+                        "idx": idx
+                    })
+
+        if not violations:
+            break
+
+        # 最初の違反を修正
+        viol = violations[0]
+        ridx, hosp, date, bad_doc, col_idx = viol["ridx"], viol["hosp"], viol["date"], viol["doc"], viol["idx"]
+
+        # 1. C-H列に適格な医師を探す
+        # 適格条件: is_eligible_for_ch_slot(doc, date) = True
+        # 候補：現在違反がないスロットにいる適格医師
+        swap_done = False
+
+        # 同じ日の他のスロット（C-H以外）で適格な医師を探して交換
+        for other_hosp in hospital_cols:
+            if swap_done:
+                break
+            other_idx = shift_df.columns.get_loc(other_hosp)
+            # C-H列以外のスロットを探す（L-Y列など）
+            if is_ch_slot(other_idx):
+                continue
+            other_val = df.at[ridx, other_hosp]
+            if not isinstance(other_val, str):
+                continue
+            other_doc = normalize_name(other_val)
+            if other_doc not in doctor_names:
+                continue
+            # other_docがC-H列に適格かチェック
+            if not is_eligible_for_ch_slot(other_doc, date):
+                continue
+            # bad_docがother_hospに割り当て可能かチェック
+            if not can_assign_doc_to_slot(bad_doc, date, other_hosp):
+                continue
+            # 交換
+            df.at[ridx, hosp] = other_doc
+            df.at[ridx, other_hosp] = bad_doc
+            total_fixed += 1
+            swap_done = True
+            if verbose:
+                print(f"   [C-Hカテ当番修正] {date.strftime('%Y-%m-%d')} {hosp}列: {bad_doc} ⇔ {other_doc}")
+
+        if swap_done:
+            continue
+
+        # 2. 別の日の適格医師と交換を試みる
+        for other_ridx in df.index:
+            if swap_done:
+                break
+            other_date = df.at[other_ridx, date_col_shift]
+            if pd.isna(other_date):
+                continue
+            other_date = pd.to_datetime(other_date).normalize().tz_localize(None)
+            if other_date == date:
+                continue
+
+            for other_hosp in hospital_cols:
+                if swap_done:
+                    break
+                other_idx = shift_df.columns.get_loc(other_hosp)
+                # C-H列以外のスロット
+                if is_ch_slot(other_idx):
+                    continue
+                other_val = df.at[other_ridx, other_hosp]
+                if not isinstance(other_val, str):
+                    continue
+                other_doc = normalize_name(other_val)
+                if other_doc not in doctor_names:
+                    continue
+                # other_docがC-H列に適格かチェック
+                if not is_eligible_for_ch_slot(other_doc, date):
+                    continue
+                # bad_docがother_hospに割り当て可能かチェック
+                if not can_assign_doc_to_slot(bad_doc, other_date, other_hosp):
+                    continue
+                # other_docがdate, hospに割り当て可能かチェック
+                if not can_assign_doc_to_slot(other_doc, date, hosp):
+                    continue
+                # 交換
+                df.at[ridx, hosp] = other_doc
+                df.at[other_ridx, other_hosp] = bad_doc
+                total_fixed += 1
+                swap_done = True
+                if verbose:
+                    print(f"   [C-Hカテ当番修正] {date.strftime('%Y-%m-%d')} {hosp}列: {bad_doc} → {other_doc}")
+
+        if not swap_done:
+            # 交換できなかった場合、次の違反を試す
+            if verbose and attempt == 0:
+                print(f"   ⚠️ C-H列カテ当番違反を修正できません: {date.strftime('%Y-%m-%d')} {hosp}列 {bad_doc}")
+            break
+
+    # 残り違反を再計算
+    remaining_violations = 0
+    for ridx in df.index:
+        date = df.at[ridx, date_col_shift]
+        if pd.isna(date):
+            continue
+        date = pd.to_datetime(date).normalize().tz_localize(None)
+        for hosp in hospital_cols:
+            idx = shift_df.columns.get_loc(hosp)
+            if not is_ch_slot(idx):
+                continue
+            val = df.at[ridx, hosp]
+            if not isinstance(val, str):
+                continue
+            doc = normalize_name(val)
+            if doc not in doctor_names:
+                continue
+            if not is_eligible_for_ch_slot(doc, date):
+                remaining_violations += 1
+
+    if verbose:
+        if remaining_violations == 0:
+            print(f"   ✅ 全てのC-H列カテ当番違反を修正しました（修正数: {total_fixed}）")
+        else:
+            print(f"   ⚠️ {remaining_violations}件のC-H列カテ当番違反が残っています（修正数: {total_fixed}）")
+
+    return df, remaining_violations == 0, total_fixed
+
 def fix_bg_ht_imbalance_violations(pattern_df, max_attempts=100, verbose=True):
     """
     大学系と外病院の差が3以上の違反を修正する
@@ -3440,9 +3662,14 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         cap_fixed_df, max_attempts=100, verbose=False
     )
 
+    # 4.5. C-H列（休日大学系）カテ当番違反を修正
+    ch_kate_fixed_df, ch_kate_success, ch_kate_fix_count = fix_ch_kate_violations(
+        univ_min_fixed_df, max_attempts=100, verbose=False
+    )
+
     # 5. gap違反（3日未満の間隔）を修正（優先度3位）
     gap_fixed_df, gap_success, gap_fix_count = fix_gap_violations(
-        univ_min_fixed_df, max_attempts=200, verbose=False
+        ch_kate_fixed_df, max_attempts=200, verbose=False
     )
 
     # 6. 大学系と外病院の差が3以上の違反を修正
@@ -3471,7 +3698,7 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
     )
 
     # 修正後に再評価
-    if fix_count > 0 or code_2_fix_count > 0 or cap_fix_count > 0 or univ_min_fix_count > 0 or bg_ht_fix_count > 0 or gap_fix_count > 0 or ext_dup_fix_count > 0 or univ_over_2_fix_count > 0 or univ_weekday_fix_count > 0 or fairness_fix_count > 0:
+    if fix_count > 0 or code_2_fix_count > 0 or cap_fix_count > 0 or univ_min_fix_count > 0 or ch_kate_fix_count > 0 or bg_ht_fix_count > 0 or gap_fix_count > 0 or ext_dup_fix_count > 0 or univ_over_2_fix_count > 0 or univ_weekday_fix_count > 0 or fairness_fix_count > 0:
         counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(fairness_fixed_df)
         sc2, raw2, met2 = evaluate_schedule_with_raw(
             fairness_fixed_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
@@ -3493,6 +3720,7 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         "code_2_violations_fixed": code_2_fix_count,
         "cap_violations_fixed": cap_fix_count,
         "univ_min_violations_fixed": univ_min_fix_count,
+        "ch_kate_violations_fixed": ch_kate_fix_count,
         "bg_ht_imbalance_fixed": bg_ht_fix_count,
         "gap_violations_fixed": gap_fix_count,
         "external_dup_violations_fixed": ext_dup_fix_count,
