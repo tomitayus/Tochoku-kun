@@ -1,5 +1,12 @@
-# @title 当直くん v3.5 (大学最低1回を準ハード制約に+gap=3日)
+# @title 当直くん v3.6 (可否コード2のEXTRA枠除外)
 # 修正内容:
+# v3.6 (2026-01-30):
+# - 可否コード2の医師をEXTRA枠（n+1回）対象から除外（ハード制約）
+#   - has_code_2_anywhere関数を追加（sheet2でいずれかの日に2を持つ医師を判定）
+#   - CODE_2_DOCTORSリストを作成
+#   - EXTRA_ALLOWEDの計算時にCODE_2_DOCTORSを除外
+#   - 可否コード2の医師は大学系のみ可能なため、外病院枠増加は不適切
+#   - 出力に「可否コード2医師（EXTRA枠対象外）」を表示
 # v3.4 (2026-01-29):
 # - TARGET_CAP違反の厳格化
 #   - パターン選択時に cap_violations > 0 のパターンを除外
@@ -554,13 +561,28 @@ active_doctors = [d for d in doctor_names if d not in inactive_doctors]
 if len(active_doctors) == 0:
     raise ValueError("❌ 当月に割り当て可能な医師がいません")
 
+# 可否コード2の医師（大学系のみ可能、EXTRA枠対象外）
+def has_code_2_anywhere(doc):
+    """医師がsheet2でいずれかの日に可否コード2を持っているか"""
+    if doc not in availability_df.columns:
+        return False
+    for date in all_shift_dates:
+        code = get_avail_code(date, doc)
+        if code == 2:
+            return True
+    return False
+
+CODE_2_DOCTORS = {doc for doc in doctor_names if has_code_2_anywhere(doc)}
+
 BASE_TARGET = total_slots // len(active_doctors)
 EXTRA_SLOTS = total_slots - BASE_TARGET * len(active_doctors)
 
-# 余り枠は右側（下位）の医師に割り当てる
+# 余り枠は右側（下位）の医師に割り当てる（可否コード2の医師は除外：ハード制約）
 # 例：小林(0), 及川(1), ..., 大河内(30), 猪股(31) の場合、右側の医師を選択
 active_sorted_by_index = sorted(active_doctors, key=lambda d: doctor_col_index[d])  # 昇順ソート
-EXTRA_ALLOWED = set(active_sorted_by_index[-EXTRA_SLOTS:] if EXTRA_SLOTS > 0 else [])  # 最後のEXTRA_SLOTS人（右側/下位）
+# 可否コード2の医師はEXTRA枠対象から除外（大学系のみ可のため、外病院枠増加は不適切）
+extra_eligible = [d for d in active_sorted_by_index if d not in CODE_2_DOCTORS]
+EXTRA_ALLOWED = set(extra_eligible[-EXTRA_SLOTS:] if EXTRA_SLOTS > 0 else [])  # 最後のEXTRA_SLOTS人（右側/下位）
 
 TARGET_CAP = {d: 0 for d in doctor_names}
 for d in active_doctors:
@@ -583,6 +605,12 @@ if EXTRA_ALLOWED:
     extra_docs_display = sorted(EXTRA_ALLOWED, key=lambda d: doctor_col_index[d])
     print(f"   +1回対象: {', '.join(extra_docs_display)}")
 
+# 可否コード2の医師がEXTRA枠から除外されていることを表示
+code_2_in_active = [d for d in active_sorted_by_index if d in CODE_2_DOCTORS]
+if code_2_in_active:
+    print(f"   可否コード2医師（EXTRA枠対象外）: {', '.join(code_2_in_active)}")
+
+if EXTRA_ALLOWED:
     # デバッグ：上位医師が含まれていないことを確認
     upper_doctors = [d for d in active_doctors if doctor_col_index[d] < 10]  # 最初の10人
     upper_in_extra = [d for d in upper_doctors if d in EXTRA_ALLOWED]
