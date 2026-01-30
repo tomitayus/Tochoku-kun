@@ -1649,7 +1649,7 @@ def local_search_swap(pattern_df, max_iters=2000, patience=800, refresh_every=20
     rng = random.Random(seed)
     df = pattern_df.copy()
 
-    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
     cur_score, cur_raw, cur_metrics = evaluate_schedule_with_raw(
         df,
         counts,
@@ -1742,7 +1742,7 @@ def local_search_swap(pattern_df, max_iters=2000, patience=800, refresh_every=20
             date_doc_count[d2][doc1] += 1
 
         # 再評価（全再計算）
-        counts2, bg2, ht2, wd2, we2, bk2, ly2, bg_cat2, assigned_hosp_count2, doc_assignments2, unassigned2 = recompute_stats(df)
+        counts2, bg2, ht2, wd2, we2, bk2, ly2, bg_cat2, assigned_hosp_count2, doc_assignments2, unassigned2, *_ = recompute_stats(df)
         new_score, new_raw, new_metrics = evaluate_schedule_with_raw(
             df,
             counts2,
@@ -2968,7 +2968,7 @@ def fix_gap_violations(pattern_df, max_attempts=200, verbose=True):
 
     for attempt in range(max_attempts):
         # 現在の割当状態を再計算
-        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
 
         # gap違反を検出
         gap_violation_list = []
@@ -3079,7 +3079,7 @@ def fix_gap_violations(pattern_df, max_attempts=200, verbose=True):
 
             # この違反を修正したら、doc_assignmentsを更新
             if fixed_in_this_iteration > 0:
-                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
 
         # 進捗チェック
         if fixed_in_this_iteration == 0:
@@ -3092,7 +3092,7 @@ def fix_gap_violations(pattern_df, max_attempts=200, verbose=True):
             break
 
     # 最終確認
-    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
     remaining_violations = 0
     for doc, date_hosp_list in doc_assignments.items():
         dates = sorted([d for d, h in date_hosp_list])
@@ -3225,7 +3225,7 @@ def fix_external_hospital_dup_violations(pattern_df, max_attempts=150, verbose=T
                     break  # この重複の他のpositionは次回
 
             if fixed_in_this_iteration > 0:
-                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
 
         # 進捗チェック
         if fixed_in_this_iteration == 0:
@@ -3238,7 +3238,7 @@ def fix_external_hospital_dup_violations(pattern_df, max_attempts=150, verbose=T
             break
 
     # 最終確認
-    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
     remaining_violations = 0
     for doc, hosp_dict in assigned_hosp_count.items():
         for hosp, count in hosp_dict.items():
@@ -3386,7 +3386,7 @@ def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True)
                         print(f"      {doc}の{date.strftime('%m/%d')}の大学病院割当を削除します（3回以上→2回）")
 
             if fixed_in_this_iteration > 0:
-                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
 
         # 進捗チェック
         if fixed_in_this_iteration == 0:
@@ -3523,7 +3523,7 @@ def fix_university_weekday_balance_violations(pattern_df, max_attempts=150, verb
                     break
 
             if fixed_in_this_iteration > 0:
-                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(df)
+                counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
 
         # 進捗チェック
         if fixed_in_this_iteration == 0:
@@ -3703,7 +3703,7 @@ def fix_fairness_imbalance(pattern_df, max_attempts=200, verbose=True):
     return df, diff <= 1, total_fixed
 
 def build_diagnostics(pattern_df):
-    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned = recompute_stats(pattern_df)
+    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(pattern_df)
     score, raw, metrics = evaluate_schedule_with_raw(
         pattern_df,
         counts,
