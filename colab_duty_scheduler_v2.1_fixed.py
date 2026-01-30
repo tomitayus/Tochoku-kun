@@ -1833,6 +1833,110 @@ def build_hard_constraint_violations(pattern_df):
                     "詳細": f"{doc}は水曜日のL〜Y列禁止",
                 })
 
+def fix_hard_constraint_violations(pattern_df, max_attempts=50, verbose=True):
+    """
+    ハード制約違反を自動修正する
+
+    Args:
+        pattern_df: スケジュールDataFrame
+        max_attempts: 最大試行回数
+        verbose: ログ出力するか
+
+    Returns:
+        (修正後のDataFrame, 成功フラグ, 修正数, 修正失敗数)
+    """
+    df = pattern_df.copy()
+    total_fixed = 0
+    total_failed = 0
+
+    for attempt in range(max_attempts):
+        violations_df = build_hard_constraint_violations(df)
+
+        if len(violations_df) == 0:
+            if verbose and total_fixed > 0:
+                print(f"   ✅ ハード制約違反を{total_fixed}件修正しました")
+            return df, True, total_fixed, total_failed
+
+        if attempt == 0 and verbose:
+            print(f"   ⚠️ ハード制約違反を{len(violations_df)}件検出 → 自動修正を開始...")
+
+        # 各違反を修正試行
+        fixed_in_this_iteration = 0
+
+        for _, violation in violations_df.iterrows():
+            date = violation['日付']
+            doc = violation['医師名']
+            hosp = violation['病院']
+            violation_type = violation['違反種別']
+
+            # 該当行を探す
+            ridx = None
+            for idx in df.index:
+                if pd.to_datetime(df.at[idx, date_col_shift]).normalize().tz_localize(None) == date:
+                    ridx = idx
+                    break
+
+            if ridx is None:
+                continue
+
+            # 違反している割当を解除
+            current_val = df.at[ridx, hosp]
+            if not isinstance(current_val, str) or normalize_name(current_val) != doc:
+                continue
+
+            df.at[ridx, hosp] = None
+
+            # 代替医師を探す
+            col_idx = shift_df.columns.get_loc(hosp)
+            dow = pd.to_datetime(date).weekday()
+
+            # この日に既に割り当てられている医師を除外
+            already_assigned_on_date = set()
+            for h in hospital_cols:
+                v = df.at[ridx, h]
+                if isinstance(v, str):
+                    already_assigned_on_date.add(normalize_name(v))
+
+            # 候補医師を探す（ハード制約のみチェック）
+            candidates = []
+            for candidate_doc in doctor_names:
+                # 同日重複チェック
+                if candidate_doc in already_assigned_on_date:
+                    continue
+
+                # ハード制約チェック
+                if can_assign_doc_to_slot(candidate_doc, date, hosp):
+                    candidates.append(candidate_doc)
+
+            if candidates:
+                # 優先順位：全体合計が少ない医師を優先
+                candidates.sort(key=lambda d: prev_total.get(d, 0) + len([1 for h in hospital_cols for ridx2 in df.index if isinstance(df.at[ridx2, h], str) and normalize_name(df.at[ridx2, h]) == d]))
+                new_doc = candidates[0]
+                df.at[ridx, hosp] = new_doc
+                fixed_in_this_iteration += 1
+                total_fixed += 1
+            else:
+                # 代替医師が見つからない → 未割当のまま
+                total_failed += 1
+                if verbose:
+                    print(f"   ⚠️ 修正失敗: {date.strftime('%Y-%m-%d')} {hosp} ({violation_type})")
+
+        # 進捗がなければループ終了
+        if fixed_in_this_iteration == 0:
+            break
+
+    # 最終チェック
+    final_violations = build_hard_constraint_violations(df)
+    success = len(final_violations) == 0
+
+    if verbose:
+        if success:
+            print(f"   ✅ 全てのハード制約違反を修正しました（修正数: {total_fixed}）")
+        else:
+            print(f"   ⚠️ {len(final_violations)}件のハード制約違反が残っています（修正数: {total_fixed}, 失敗: {total_failed}）")
+
+    return df, success, total_fixed, total_failed
+
     # B〜H列の2回超過違反をチェック
     bh_counts = defaultdict(list)
     for ridx in pattern_df.index:
