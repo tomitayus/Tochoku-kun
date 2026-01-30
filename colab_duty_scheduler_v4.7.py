@@ -193,7 +193,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "4.6"
+VERSION = "4.7"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -236,9 +236,9 @@ LOCAL_REFRESH_EVERY = 200     # 問題医師（gap/重複）を再抽出する�
 # スコア重み（必要なら調整）
 # 優先順位: TARGET_CAP > gap > DUP を死守
 W_FAIR_TOTAL = 30          # 全合計（active内 max-min）- 公平性強化
-W_GAP = 100                # gap(4日未満) - 優先度2位
-W_HOSP_DUP = 1             # 同一病院複数回（大学病院：許容）
-W_EXTERNAL_HOSP_DUP = 70   # 外病院重複（厳格：優先度3位）
+W_GAP = 100                # gap(3日未満) - 優先度2位
+W_HOSP_DUP = 0             # 同一病院複数回（大学病院：デフォルトなのでペナルティなし）
+W_EXTERNAL_HOSP_DUP = 150  # 外病院重複（ほぼ禁忌：非常に高いペナルティ）
 W_UNASSIGNED = 100         # 未割当
 W_CAP = 200                # cap超え（厳格化：優先度1位）
 W_BG_SPREAD = 3            # 大学合計（累計）ばらつき
@@ -867,43 +867,47 @@ def choose_doctor_for_slot(
     weekday = dow < 5
 
     def collect_candidates(
-        allow_same_day=False,
-        relax_availability=False,
         relax_schedule=False,
-        relax_wed=False,
         relax_bh_limit=False,
         relax_ch_kate=False,
+        relax_gap=False,  # 間隔2日も許容
     ):
         candidates = []
         for doc in doctor_names:
-            if not allow_same_day and date in assigned_dates[doc]:
+            # ★ 絶対禁忌1: 同日重複禁止（緩和不可）
+            if date in assigned_dates[doc]:
                 continue
 
             code = get_avail_code(date, doc)
 
-            # ★ ハード制約1: コード0は絶対に緩和しない
+            # ★ 絶対禁忌2: コード0は全列禁止（緩和不可）
             if code == 0:
                 continue
 
-            # コード2/3のチェック（relax_availability=Trueで緩和可能）
-            if not relax_availability:
-                # 2 -> B〜Q列以外ダメ
-                if code == 2 and not (B_COL_INDEX <= idx <= Q_COL_INDEX):
-                    continue
-                # 3 -> L〜Y列以外ダメ
-                if code == 3 and not (L_COL_INDEX <= idx <= L_Y_END_INDEX):
-                    continue
+            # ★ 絶対禁忌3: コード2はR-Y列禁止（緩和不可）
+            if code == 2 and not (B_COL_INDEX <= idx <= Q_COL_INDEX):
+                continue
 
-            # ★ ハード制約2: その日にカテ表コードあり→L〜Y列不可（絶対に緩和しない）
+            # ★ 絶対禁忌4: コード3は大学系(B-K)禁止（緩和不可）
+            if code == 3 and not (L_COL_INDEX <= idx <= L_Y_END_INDEX):
+                continue
+
+            # ★ 絶対禁忌5: その日にカテ表コードあり→L〜Y列不可（緩和不可）
             if L_COL_INDEX <= idx <= L_Y_END_INDEX:
                 if get_sched_code(date, doc):
                     continue
 
-            # ★ ハード制約3: B〜K列はカテ表コード保有医師のみカテ表コードが必要（EXTRA医師は例外）
-            if B_COL_INDEX <= idx <= B_K_END_INDEX:
-                # カテ表コード保有医師は、その日にカテ表コードが必要（EXTRA医師は除く）
-                if doc in SCHEDULE_CODE_HOLDERS and not get_sched_code(date, doc) and doc not in EXTRA_ALLOWED:
+            # ★ 絶対禁忌6: 水曜日L〜Y列禁止医師（緩和不可）
+            if dow == 2 and is_LY_range:
+                if doc in WED_FORBIDDEN_DOCTORS:
                     continue
+
+            # ★ 準ハード制約: B〜K列はカテ表コード保有医師のみカテ表コードが必要
+            # ただしsheet3「1」の医師（SHEET3_CODE_1_DOCTORS）は例外として許容
+            if B_COL_INDEX <= idx <= B_K_END_INDEX:
+                if doc in SCHEDULE_CODE_HOLDERS and not get_sched_code(date, doc):
+                    if doc not in EXTRA_ALLOWED and doc not in SHEET3_CODE_1_DOCTORS:
+                        continue
 
             # ★ 準ハード制約: C〜H列（休日大学系）はカテ当番ありの日 OR カテ当番なし医師のみ
             if not relax_ch_kate and is_ch_slot(idx):
@@ -915,14 +919,19 @@ def choose_doctor_for_slot(
                 if not is_eligible_for_weekday_university_slot(doc, date):
                     continue
 
-            # ★ ハード制約4: B〜H列は2回まで（relax_bh_limitで緩和可能）
+            # ★ 準ハード制約: B〜H列は2回まで（relax_bh_limitで緩和可能）
             if not relax_bh_limit and is_BH and assigned_bh[doc] >= 2:
                 continue
 
-            # 水曜日L〜Y列禁止医師
-            if not relax_wed and dow == 2 and is_LY_range:
-                if doc in WED_FORBIDDEN_DOCTORS:
-                    continue
+            # ★ 準ハード制約: 間隔チェック（通常3日以上、緩和時2日も許容）
+            if assigned_dates[doc]:
+                min_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_dates[doc])
+                if relax_gap:
+                    if min_gap < 2:  # 緩和時は2日未満がNG
+                        continue
+                else:
+                    if min_gap < 3:  # 通常は3日未満がNG
+                        continue
 
             if assigned_count[doc] >= TARGET_CAP.get(doc, 0):
                 continue
@@ -932,20 +941,11 @@ def choose_doctor_for_slot(
 
     candidates = collect_candidates()
     if not candidates:
-        candidates = collect_candidates(allow_same_day=True)
+        candidates = collect_candidates(relax_bh_limit=True)
     if not candidates:
-        candidates = collect_candidates(allow_same_day=True, relax_availability=True)
+        candidates = collect_candidates(relax_bh_limit=True, relax_ch_kate=True)
     if not candidates:
-        candidates = collect_candidates(allow_same_day=True, relax_availability=True, relax_bh_limit=True)
-    if not candidates:
-        candidates = collect_candidates(
-            allow_same_day=True,
-            relax_availability=True,
-            relax_schedule=True,
-            relax_wed=True,
-            relax_bh_limit=True,
-            relax_ch_kate=True,
-        )
+        candidates = collect_candidates(relax_bh_limit=True, relax_ch_kate=True, relax_gap=True)
 
     if not candidates:
         return None
@@ -1421,7 +1421,7 @@ def evaluate_schedule_with_raw(
     for doc, dlist in dates_by_doc.items():
         dlist = sorted(dlist)
         for i in range(1, len(dlist)):
-            if (dlist[i] - dlist[i - 1]).days < 4:
+            if (dlist[i] - dlist[i - 1]).days < 3:
                 gap_violations += 1
 
     hosp_dup_violations = 0
@@ -1626,7 +1626,7 @@ def collect_violation_docs_from_assignments(doc_assignments, assigned_hosp_count
     for doc, assigns in doc_assignments.items():
         dlist = sorted([d for d, _ in assigns])
         for i in range(1, len(dlist)):
-            if (dlist[i] - dlist[i - 1]).days < 4:
+            if (dlist[i] - dlist[i - 1]).days < 3:
                 bad.add(doc)
                 break
     # hospital dup
@@ -3148,7 +3148,7 @@ def fix_gap_violations(pattern_df, max_attempts=200, verbose=True):
     for doc, date_hosp_list in doc_assignments.items():
         dates = sorted([d for d, h in date_hosp_list])
         for i in range(1, len(dates)):
-            if (dates[i] - dates[i-1]).days < 4:
+            if (dates[i] - dates[i-1]).days < 3:
                 remaining_violations += 1
 
     if verbose:
