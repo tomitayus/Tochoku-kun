@@ -1,5 +1,11 @@
-# @title 当直くん v4.2 (平日大学緩和+CC特別扱い)
+# @title 当直くん v4.3 (C-Hカテ当番をソフト制約化)
 # 修正内容:
+# v4.3 (2026-01-30):
+# - C-H列カテ当番制約をソフト制約に変更（ハード制約から除外）
+#   - 適格医師不足時のパターン除外を防止
+#   - ペナルティ(120)とfix関数は維持
+#   - 修正不可でもパターン選択可能に
+# - recompute_stats呼び出しのunpacking修正（*_追加）
 # v4.2 (2026-01-30):
 # - 平日大学系(B,I-K列)の制約を緩和
 #   - sheet3で「1」を持つ医師はカテ当番が合わなくても許容
@@ -187,7 +193,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "4.2"
+VERSION = "4.3"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -3913,9 +3919,9 @@ for e in refined:
     code_2_viol = met.get('code_2_extra_violations', 0)
     bg_over_2_viol = met.get('bg_over_2_violations', 0)
     ht_0_viol = met.get('ht_0_violations', 0)
-    ch_kate_viol = met.get('ch_kate_violations', 0)
+    # ch_kate_violationsはソフト制約（ペナルティのみ、ハード制約から除外）
 
-    if cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0 or bg_over_2_viol > 0 or ht_0_viol > 0 or ch_kate_viol > 0:
+    if cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0 or bg_over_2_viol > 0 or ht_0_viol > 0:
         excluded_count += 1
     else:
         valid_patterns.append(e)
