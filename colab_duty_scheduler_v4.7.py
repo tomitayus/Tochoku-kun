@@ -248,6 +248,45 @@ W_WE_SPREAD = 3            # 休日合計（累計）ばらつき
 W_BK_LY_BALANCE = 2        # B-K/L-Y の比率バランス（なるべく1:1）
 
 # =========================
+# 制約ID定義（v5.2仕様書準拠）
+# =========================
+# 絶対禁忌（ABS: 配置不可）
+CONSTRAINT_ABS_001 = "ABS-001"  # 可否コード0禁止
+CONSTRAINT_ABS_002 = "ABS-002"  # コード2の列制約
+CONSTRAINT_ABS_003 = "ABS-003"  # コード3の列制約
+CONSTRAINT_ABS_004 = "ABS-004"  # カテ当番日の外病院禁止
+CONSTRAINT_ABS_005 = "ABS-005"  # 同日重複禁止
+CONSTRAINT_ABS_006 = "ABS-006"  # 水曜日L〜Y禁止医師
+
+# ハード制約（HARD: パターン除外）
+CONSTRAINT_HARD_001 = "HARD-001"  # TARGET_CAP超過
+CONSTRAINT_HARD_002 = "HARD-002"  # gap違反
+CONSTRAINT_HARD_003 = "HARD-003"  # 未割当枠
+CONSTRAINT_HARD_004 = "HARD-004"  # CODE_2のn+1違反
+
+# 準ハード制約（SEMI: 緩和可）
+CONSTRAINT_SEMI_001 = "SEMI-001"  # 平日大学系カテ要件
+CONSTRAINT_SEMI_002 = "SEMI-002"  # 休日大学系カテ当番
+CONSTRAINT_SEMI_003 = "SEMI-003"  # gap制約
+CONSTRAINT_SEMI_004 = "SEMI-004"  # 大学最低1回
+
+# ソフト制約（SOFT: ペナルティ）
+CONSTRAINT_SOFT_001 = "SOFT-001"  # 外病院0回 (W=300)
+CONSTRAINT_SOFT_002 = "SOFT-002"  # 大学3回以上 (W=150)
+CONSTRAINT_SOFT_003 = "SOFT-003"  # 外病院同一病院重複 (W=150)
+CONSTRAINT_SOFT_004 = "SOFT-004"  # CODE_1.2大学0回 (W=150)
+CONSTRAINT_SOFT_005 = "SOFT-005"  # gap違反 (W=100)
+CONSTRAINT_SOFT_006 = "SOFT-006"  # BG/HT差3以上 (W=100)
+CONSTRAINT_SOFT_007 = "SOFT-007"  # 大学平日2回以上 (W=80)
+CONSTRAINT_SOFT_008 = "SOFT-008"  # 公平性 (W=30)
+CONSTRAINT_SOFT_009 = "SOFT-009"  # 大学ばらつき (W=3)
+CONSTRAINT_SOFT_010 = "SOFT-010"  # 外病院ばらつき (W=3)
+CONSTRAINT_SOFT_011 = "SOFT-011"  # 休日ばらつき (W=3)
+CONSTRAINT_SOFT_012 = "SOFT-012"  # 平日ばらつき (W=2)
+CONSTRAINT_SOFT_013 = "SOFT-013"  # B-K/L-Y比率バランス (W=2)
+CONSTRAINT_SOFT_014 = "SOFT-014"  # 大学同一病院重複 (W=0)
+
+# =========================
 # ユーティリティ
 # =========================
 def strip_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -621,8 +660,13 @@ all_shift_dates = sorted(pd.to_datetime(shift_df[date_col_shift].dropna()).dt.no
 
 # =========================
 # cap設計：n回ベース＋余りは右側（下側）からn+1回
+# inactive医師の扱い（v5.2仕様書§5準拠）:
+#   - 解析処理から完全除外（候補に含めない）
+#   - TARGET_CAP計算から除外（active医師のみで計算）
+#   - 出力Excelには0回として記載（氏名は表示）
 # =========================
 def is_always_unavailable(doc):
+    """inactive医師の判定: sheet2で全日=0かつ事前割当なし"""
     if preassigned_count.get(doc, 0) > 0:
         return False
     return all(get_avail_code(d, doc) == 0 for d in all_shift_dates)
@@ -631,6 +675,8 @@ inactive_doctors = [d for d in doctor_names if is_always_unavailable(d)]
 active_doctors = [d for d in doctor_names if d not in inactive_doctors]
 if len(active_doctors) == 0:
     raise ValueError("❌ 当月に割り当て可能な医師がいません")
+if inactive_doctors:
+    print(f"⚠️ inactive医師（解析除外、出力のみ）: {len(inactive_doctors)}人")
 
 # 可否コード2の医師（大学系のみ可能、EXTRA枠対象外）
 def has_code_2_anywhere(doc):
@@ -2039,9 +2085,10 @@ def build_hard_constraint_violations(pattern_df):
             code = get_avail_code(date, doc)
             sched_code = get_sched_code(date, doc)
 
-            # 違反1: 可否コード0
+            # 違反1: 可否コード0 (ABS-001)
             if code == 0:
                 rows.append({
+                    "制約ID": CONSTRAINT_ABS_001,
                     "違反種別": "可否コード0違反",
                     "日付": date,
                     "医師名": doc,
@@ -2049,12 +2096,13 @@ def build_hard_constraint_violations(pattern_df):
                     "列番号": idx,
                     "可否コード": code,
                     "カテ表": sched_code if sched_code else "",
-                    "詳細": "コード0（不可）の日に割当",
+                    "詳細": f"[{CONSTRAINT_ABS_001}] コード0（不可）の日に割当",
                 })
 
-            # 違反2: 可否コード2違反（Q列より後に割当）
+            # 違反2: 可否コード2違反（Q列より後に割当）(ABS-002)
             if code == 2 and not (B_COL_INDEX <= idx <= Q_COL_INDEX):
                 rows.append({
+                    "制約ID": CONSTRAINT_ABS_002,
                     "違反種別": "可否コード2違反",
                     "日付": date,
                     "医師名": doc,
@@ -2062,12 +2110,13 @@ def build_hard_constraint_violations(pattern_df):
                     "列番号": idx,
                     "可否コード": code,
                     "カテ表": sched_code if sched_code else "",
-                    "詳細": f"コード2はB〜Q列のみ可。列{idx}に割当",
+                    "詳細": f"[{CONSTRAINT_ABS_002}] コード2はB〜Q列のみ可。列{idx}に割当",
                 })
 
-            # 違反3: 可否コード3違反（L〜Y列以外に割当）
+            # 違反3: 可否コード3違反（L〜Y列以外に割当）(ABS-003)
             if code == 3 and not (L_COL_INDEX <= idx <= L_Y_END_INDEX):
                 rows.append({
+                    "制約ID": CONSTRAINT_ABS_003,
                     "違反種別": "可否コード3違反",
                     "日付": date,
                     "医師名": doc,
@@ -2075,12 +2124,13 @@ def build_hard_constraint_violations(pattern_df):
                     "列番号": idx,
                     "可否コード": code,
                     "カテ表": sched_code if sched_code else "",
-                    "詳細": f"コード3はL〜Y列のみ可。列{idx}に割当",
+                    "詳細": f"[{CONSTRAINT_ABS_003}] コード3はL〜Y列のみ可。列{idx}に割当",
                 })
 
-            # 違反4: カテ表コードあり＋L〜Y列違反
+            # 違反4: カテ表コードあり＋L〜Y列違反 (ABS-004)
             if L_COL_INDEX <= idx <= L_Y_END_INDEX and sched_code:
                 rows.append({
+                    "制約ID": CONSTRAINT_ABS_004,
                     "違反種別": "カテ表+外病院違反",
                     "日付": date,
                     "医師名": doc,
@@ -2088,12 +2138,15 @@ def build_hard_constraint_violations(pattern_df):
                     "列番号": idx,
                     "可否コード": code,
                     "カテ表": sched_code,
-                    "詳細": f"カテ表（{sched_code}）がある日は外病院（L〜Y列）に割当不可。列{idx}に割当",
+                    "詳細": f"[{CONSTRAINT_ABS_004}] カテ表（{sched_code}）がある日は外病院（L〜Y列）に割当不可。列{idx}に割当",
                 })
 
-            # 違反5: B〜K列でカテ表コードなし（カテ表コード保有医師のみ、EXTRA医師は例外）
+            # 違反5: B〜K列でカテ表コードなし（カテ表コード保有医師のみ、EXTRA医師は例外）(SEMI-001/002)
             if B_COL_INDEX <= idx <= B_K_END_INDEX and doc in SCHEDULE_CODE_HOLDERS and not sched_code and doc not in EXTRA_ALLOWED:
+                # C-H列は休日大学系(SEMI-002)、それ以外は平日大学系(SEMI-001)
+                constraint_id = CONSTRAINT_SEMI_002 if C_COL_INDEX <= idx <= H_COL_INDEX else CONSTRAINT_SEMI_001
                 rows.append({
+                    "制約ID": constraint_id,
                     "違反種別": "B-K列カテ表コード欠如",
                     "日付": date,
                     "医師名": doc,
@@ -2101,12 +2154,13 @@ def build_hard_constraint_violations(pattern_df):
                     "列番号": idx,
                     "可否コード": code,
                     "カテ表": "",
-                    "詳細": f"B〜K列（大学系）の割当にカテ表コードが必要（カテ表コード保有医師、EXTRA医師は例外）。列{idx}に割当",
+                    "詳細": f"[{constraint_id}] B〜K列（大学系）の割当にカテ表コードが必要（カテ表コード保有医師、EXTRA医師は例外）。列{idx}に割当",
                 })
 
-            # 違反6: 水曜日L〜Y列禁止医師
+            # 違反6: 水曜日L〜Y列禁止医師 (ABS-006)
             if dow == 2 and L_COL_INDEX <= idx <= L_Y_END_INDEX and doc in WED_FORBIDDEN_DOCTORS:
                 rows.append({
+                    "制約ID": CONSTRAINT_ABS_006,
                     "違反種別": "水曜日L〜Y列禁止違反",
                     "日付": date,
                     "医師名": doc,
@@ -2114,7 +2168,7 @@ def build_hard_constraint_violations(pattern_df):
                     "列番号": idx,
                     "可否コード": code,
                     "カテ表": sched_code if sched_code else "",
-                    "詳細": f"{doc}は水曜日のL〜Y列禁止",
+                    "詳細": f"[{CONSTRAINT_ABS_006}] {doc}は水曜日のL〜Y列禁止",
                 })
 
     # B〜H列の2回超過違反をチェック
@@ -2137,13 +2191,14 @@ def build_hard_constraint_violations(pattern_df):
             if B_H_START_INDEX <= idx <= B_H_END_INDEX:
                 bh_counts[doc].append((date, hosp, idx))
 
-    # 違反7: B〜H列が2回超過
+    # 違反7: B〜H列が2回超過 (SOFT-002: 大学3回以上)
     for doc, assignments in bh_counts.items():
         if len(assignments) > 2:
             for date, hosp, idx in assignments[2:]:  # 3回目以降
                 code = get_avail_code(date, doc)
                 sched_code = get_sched_code(date, doc)
                 rows.append({
+                    "制約ID": CONSTRAINT_SOFT_002,
                     "違反種別": "B-H列2回超過違反",
                     "日付": date,
                     "医師名": doc,
@@ -2151,13 +2206,13 @@ def build_hard_constraint_violations(pattern_df):
                     "列番号": idx,
                     "可否コード": code,
                     "カテ表": sched_code if sched_code else "",
-                    "詳細": f"B〜H列は2回まで。{len(assignments)}回目の割当",
+                    "詳細": f"[{CONSTRAINT_SOFT_002}] B〜H列は2回まで。{len(assignments)}回目の割当",
                 })
 
-    cols = ["違反種別", "日付", "医師名", "病院", "列番号", "可否コード", "カテ表", "詳細"]
+    cols = ["制約ID", "違反種別", "日付", "医師名", "病院", "列番号", "可否コード", "カテ表", "詳細"]
     if not rows:
         return pd.DataFrame(columns=cols)
-    return pd.DataFrame(rows)[cols].sort_values(["違反種別", "日付", "医師名"]).reset_index(drop=True)
+    return pd.DataFrame(rows)[cols].sort_values(["制約ID", "日付", "医師名"]).reset_index(drop=True)
 
 def fix_hard_constraint_violations(pattern_df, max_attempts=50, verbose=True):
     """
