@@ -1,5 +1,18 @@
-# @title 当直くん v4.3 (C-Hカテ当番をソフト制約化)
+# @title 当直くん v4.8 (制約ID体系・ABS-001修正)
 # 修正内容:
+# v4.8 (2026-01-31):
+# - 制約ID体系を導入（ABS-001〜006, HARD-001〜004, SEMI-001〜004, SOFT-001〜014）
+#   - 28個の制約ID定数を追加
+#   - build_hard_constraint_violations()でID付き違反ログ出力
+#   - 違反DataFrameに「制約ID」列を追加
+# - ABS-001（コード0禁止）修正
+#   - fix_hard_constraint_violations()の緊急フォールバックでコード0チェック追加
+#   - 最終手段でもコード0医師を除外
+#   - 全員コード0の場合は未割当のまま（違反割当より優先）
+# - inactive医師処理にドキュメント参照を追加
+#   - CONSTRAINT_RULES.md §5準拠コメント
+# v4.7 (2026-01-31):
+# - CONSTRAINT_RULES.md v5.2仕様に基づく整備
 # v4.3 (2026-01-30):
 # - C-H列カテ当番制約をソフト制約に変更（ハード制約から除外）
 #   - 適格医師不足時のパターン除外を防止
@@ -193,7 +206,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "4.7"
+VERSION = "4.8"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -2297,9 +2310,13 @@ def fix_hard_constraint_violations(pattern_df, max_attempts=50, verbose=True):
                 fixed_in_this_iteration += 1
                 total_fixed += 1
             else:
-                # 緊急フォールバック: 制約を無視して誰かを割り当て（未割当よりはまし）
+                # 緊急フォールバック: 同日重複を避け、ABS-001（コード0）も必ず回避
                 # 同日重複のみ避ける
-                emergency_candidates = [d for d in doctor_names if d not in already_assigned_on_date]
+                emergency_candidates = [
+                    d for d in doctor_names
+                    if d not in already_assigned_on_date
+                    and get_avail_code(date, d) != 0  # ABS-001: コード0は絶対禁止
+                ]
                 if emergency_candidates:
                     # 全体合計が最も少ない医師を選択
                     emergency_candidates.sort(key=lambda d: prev_total.get(d, 0) + len([1 for h in hospital_cols for ridx2 in df.index if isinstance(df.at[ridx2, h], str) and normalize_name(df.at[ridx2, h]) == d]))
@@ -2310,13 +2327,21 @@ def fix_hard_constraint_violations(pattern_df, max_attempts=50, verbose=True):
                     if verbose:
                         print(f"   ⚠️ 緊急フォールバック: {date.strftime('%Y-%m-%d')} {hosp} → {new_doc}")
                 else:
-                    # 同日重複も許容して最後の手段
-                    fallback_doc = min(doctor_names, key=lambda d: prev_total.get(d, 0) + len([1 for h in hospital_cols for ridx2 in df.index if isinstance(df.at[ridx2, h], str) and normalize_name(df.at[ridx2, h]) == d]))
-                    df.at[ridx, hosp] = fallback_doc
-                    fixed_in_this_iteration += 1
-                    total_fixed += 1
-                    if verbose:
-                        print(f"   ⚠️ 最終フォールバック（同日重複あり）: {date.strftime('%Y-%m-%d')} {hosp} → {fallback_doc}")
+                    # 最終手段: コード0以外で同日重複も許容（未割当よりはまし）
+                    final_candidates = [d for d in doctor_names if get_avail_code(date, d) != 0]
+                    if final_candidates:
+                        final_candidates.sort(key=lambda d: prev_total.get(d, 0) + len([1 for h in hospital_cols for ridx2 in df.index if isinstance(df.at[ridx2, h], str) and normalize_name(df.at[ridx2, h]) == d]))
+                        new_doc = final_candidates[0]
+                        df.at[ridx, hosp] = new_doc
+                        fixed_in_this_iteration += 1
+                        total_fixed += 1
+                        if verbose:
+                            print(f"   ⚠️ 最終フォールバック（同日重複あり）: {date.strftime('%Y-%m-%d')} {hosp} → {new_doc}")
+                    else:
+                        # 全員コード0の場合は未割当のままにする
+                        total_failed += 1
+                        if verbose:
+                            print(f"   ❌ 修正不可（全員コード0）: {date.strftime('%Y-%m-%d')} {hosp}")
 
         # 進捗がなければループ終了
         # 修正が進まなくてもmax_attemptsまで試行を続ける
