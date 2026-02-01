@@ -1,6 +1,6 @@
-# @title 当直くん v4.8 (制約ID体系・ABS-001修正)
+# @title 当直くん v5.3 (制約ID体系・ABS-001修正)
 # 修正内容:
-# v4.8 (2026-01-31):
+# v5.3 (2026-01-31):
 # - 制約ID体系を導入（ABS-001〜006, HARD-001〜004, SEMI-001〜004, SOFT-001〜014）
 #   - 28個の制約ID定数を追加
 #   - build_hard_constraint_violations()でID付き違反ログ出力
@@ -206,7 +206,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "4.8"
+VERSION = "5.3"
 
 # tqdmのインポート（進捗バー用）
 try:
