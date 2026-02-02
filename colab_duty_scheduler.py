@@ -1,5 +1,12 @@
-# @title 当直くん v5.7 (最適化後の絶対禁忌チェック強化)
+# @title 当直くん v5.7.1 (最適化無効化バージョン - 絶対禁忌厳守)
 # 修正内容:
+# v5.7.1 (2026-02-02):
+# - 最適化処理を無効化（バグ発生源の排除）
+#   - LOCAL_SEARCH_ENABLED = False（局所探索スキップ）
+#   - OPTIMIZATION_ENABLED = False（fix関数群スキップ）
+# - 初期パターン生成の絶対禁忌チェックのみで品質担保
+# - validate_absolute_constraints()で最終検証
+# - 最適化が不要な理由: 初期生成時に絶対禁忌を厳守すればfix不要
 # v5.7 (2026-02-02):
 # - 局所探索（local_search_swap）で外病院重複チェックを追加
 #   - gap_violations > 0 に加えて external_hosp_dup_violations > 0 も拒否
@@ -232,7 +239,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "5.7"
+VERSION = "5.7.1"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -265,7 +272,8 @@ NUM_PATTERNS = int(os.getenv("NUM_PATTERNS", "100"))  # デフォルト100パタ
 SLOT_MARKERS = {1, 1.0, "1", "〇", "○", "◯", "◎"}
 
 # --- ローカル探索（入替）設定 ---
-LOCAL_SEARCH_ENABLED = True
+LOCAL_SEARCH_ENABLED = False   # v5.7.1: 最適化無効化
+OPTIMIZATION_ENABLED = False   # v5.7.1: fix関数群を無効化（絶対禁忌のみ厳守）
 TOP_KEEP = 20                 # greedyで残す候補数（100パターンから上位20候補を保持）
 REFINE_TOP = 15               # ローカル探索をかける候補数（上位15候補を最適化）
 LOCAL_MAX_ITERS = 3000        # 1候補あたりの入替試行回数
@@ -4146,6 +4154,96 @@ def fix_unassigned_slots(pattern_df, verbose=True):
 
     return df, (total_fixed == 0 or total_fixed > 0), total_fixed
 
+def validate_absolute_constraints(pattern_df, verbose=True):
+    """
+    絶対禁忌の最終検証（v5.7.1）
+
+    チェック項目:
+    1. コード0割当禁止 (ABS-001)
+    2. 同日当直禁止 (ABS-006)
+    3. gap1禁止（連日シフト禁止、gap >= 2必須）
+    4. 同一外病院重複禁止
+    5. 未割当枠なし
+
+    Returns:
+        (violations_list, is_valid)
+    """
+    violations = []
+
+    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(pattern_df)
+
+    # 1. コード0割当チェック
+    for (ridx, hosp), (date, fixed) in slot_meta.items():
+        val = pattern_df.at[ridx, hosp]
+        if isinstance(val, str):
+            doc = normalize_name(val)
+            if doc in doctor_names:
+                code = get_avail_code(date, doc)
+                if code == 0:
+                    violations.append({
+                        "type": "ABS-001",
+                        "desc": f"コード0割当: {doc} → {date.strftime('%Y-%m-%d')} {hosp}"
+                    })
+
+    # 2. 同日当直チェック
+    for date, doc_count in build_date_doc_count(pattern_df).items():
+        for doc, count in doc_count.items():
+            if count > 1:
+                violations.append({
+                    "type": "ABS-006",
+                    "desc": f"同日重複: {doc} → {date.strftime('%Y-%m-%d')} ({count}回)"
+                })
+
+    # 3. gap1チェック（連日シフト）
+    for doc, assigns in doc_assignments.items():
+        dates = sorted([d for d, _ in assigns])
+        for i in range(1, len(dates)):
+            gap = (dates[i] - dates[i-1]).days
+            if gap < 2:
+                violations.append({
+                    "type": "gap1",
+                    "desc": f"連日シフト: {doc} → {dates[i-1].strftime('%Y-%m-%d')} と {dates[i].strftime('%Y-%m-%d')} (gap={gap}日)"
+                })
+
+    # 4. 同一外病院重複チェック
+    for doc, hosp_dict in assigned_hosp_count.items():
+        for hosp, count in hosp_dict.items():
+            hidx = shift_df.columns.get_loc(hosp)
+            is_external = L_COL_INDEX <= hidx <= L_Y_END_INDEX
+            if is_external and count > 1:
+                violations.append({
+                    "type": "外病院重複",
+                    "desc": f"同一外病院重複: {doc} → {hosp} ({count}回)"
+                })
+
+    # 5. 未割当枠チェック
+    for (ridx, hosp), (date, fixed) in slot_meta.items():
+        val = pattern_df.at[ridx, hosp]
+        if not isinstance(val, str):
+            violations.append({
+                "type": "未割当",
+                "desc": f"未割当: {date.strftime('%Y-%m-%d')} {hosp}"
+            })
+        elif normalize_name(val) not in doctor_names:
+            violations.append({
+                "type": "未割当",
+                "desc": f"不明医師: {date.strftime('%Y-%m-%d')} {hosp} → {val}"
+            })
+
+    is_valid = len(violations) == 0
+
+    if verbose:
+        if is_valid:
+            print("   ✅ 絶対禁忌チェック: 全てクリア")
+        else:
+            print(f"   ❌ 絶対禁忌違反: {len(violations)}件")
+            for v in violations[:10]:  # 最大10件表示
+                print(f"      - [{v['type']}] {v['desc']}")
+            if len(violations) > 10:
+                print(f"      ... 他 {len(violations) - 10}件")
+
+    return violations, is_valid
+
 def build_diagnostics(pattern_df):
     counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(pattern_df)
     score, raw, metrics = evaluate_schedule_with_raw(
@@ -4256,75 +4354,88 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         raw2 = cand["raw_score"]
         met2 = cand["metrics"]
 
-    # 1. ハード制約違反の自動修正
-    fixed_df, fix_success, fix_count, fail_count = fix_hard_constraint_violations(
-        improved_df, max_attempts=50, verbose=False
-    )
-
-    # 2. 可否コード2医師のn+1回違反を修正（ハード制約）
-    code_2_fixed_df, code_2_success, code_2_fix_count = fix_code_2_extra_violations(
-        fixed_df, max_attempts=100, verbose=False
-    )
-
-    # 3. TARGET_CAP違反の自動修正（優先度1位）
-    cap_fixed_df, cap_success, cap_fix_count = fix_target_cap_violations(
-        code_2_fixed_df, max_attempts=100, verbose=False
-    )
-
-    # 4. 大学系最低1回必須違反を修正（準ハード制約、優先度2位）
-    univ_min_fixed_df, univ_min_success, univ_min_fix_count = fix_university_minimum_requirement(
-        cap_fixed_df, max_attempts=100, verbose=False
-    )
-
-    # 4.5. C-H列（休日大学系）カテ当番違反を修正
-    ch_kate_fixed_df, ch_kate_success, ch_kate_fix_count = fix_ch_kate_violations(
-        univ_min_fixed_df, max_attempts=100, verbose=False
-    )
-
-    # 5. gap違反（3日未満の間隔）を修正（優先度3位）
-    gap_fixed_df, gap_success, gap_fix_count = fix_gap_violations(
-        ch_kate_fixed_df, max_attempts=200, verbose=False
-    )
-
-    # 6. 大学系と外病院の差が3以上の違反を修正
-    bg_ht_fixed_df, bg_ht_success, bg_ht_fix_count = fix_bg_ht_imbalance_violations(
-        gap_fixed_df, max_attempts=100, verbose=False
-    )
-
-    # 7. 外病院重複を修正
-    ext_dup_fixed_df, ext_dup_success, ext_dup_fix_count = fix_external_hospital_dup_violations(
-        bg_ht_fixed_df, max_attempts=150, verbose=False
-    )
-
-    # 8. 大学3回以上違反を修正（外病院最低1回も強制）
-    univ_over_2_fixed_df, univ_over_2_success, univ_over_2_fix_count = fix_university_over_2_violations(
-        ext_dup_fixed_df, max_attempts=150, verbose=False
-    )
-
-    # 9. 大学平日偏り違反を修正
-    univ_weekday_fixed_df, univ_weekday_success, univ_weekday_fix_count = fix_university_weekday_balance_violations(
-        univ_over_2_fixed_df, max_attempts=150, verbose=False
-    )
-
-    # 10. 公平性違反の修正（最大と最小の差を縮める）
-    fairness_fixed_df, fairness_success, fairness_fix_count = fix_fairness_imbalance(
-        univ_weekday_fixed_df, max_attempts=200, verbose=False
-    )
-
-    # 11. 最終セーフティネット: 未割り当てスロットを埋める（ハード制約）
-    final_df, unassigned_success, unassigned_fix_count = fix_unassigned_slots(
-        fairness_fixed_df, verbose=False
-    )
-
-    # 修正後に再評価
-    if fix_count > 0 or code_2_fix_count > 0 or cap_fix_count > 0 or univ_min_fix_count > 0 or ch_kate_fix_count > 0 or bg_ht_fix_count > 0 or gap_fix_count > 0 or ext_dup_fix_count > 0 or univ_over_2_fix_count > 0 or univ_weekday_fix_count > 0 or fairness_fix_count > 0 or unassigned_fix_count > 0:
-        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(final_df)
-        sc2, raw2, met2 = evaluate_schedule_with_raw(
-            final_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
+    # v5.7.1: 最適化処理のON/OFFスイッチ
+    if OPTIMIZATION_ENABLED:
+        # 1. ハード制約違反の自動修正
+        fixed_df, fix_success, fix_count, fail_count = fix_hard_constraint_violations(
+            improved_df, max_attempts=50, verbose=False
         )
-        improved_df = final_df
+
+        # 2. 可否コード2医師のn+1回違反を修正（ハード制約）
+        code_2_fixed_df, code_2_success, code_2_fix_count = fix_code_2_extra_violations(
+            fixed_df, max_attempts=100, verbose=False
+        )
+
+        # 3. TARGET_CAP違反の自動修正（優先度1位）
+        cap_fixed_df, cap_success, cap_fix_count = fix_target_cap_violations(
+            code_2_fixed_df, max_attempts=100, verbose=False
+        )
+
+        # 4. 大学系最低1回必須違反を修正（準ハード制約、優先度2位）
+        univ_min_fixed_df, univ_min_success, univ_min_fix_count = fix_university_minimum_requirement(
+            cap_fixed_df, max_attempts=100, verbose=False
+        )
+
+        # 4.5. C-H列（休日大学系）カテ当番違反を修正
+        ch_kate_fixed_df, ch_kate_success, ch_kate_fix_count = fix_ch_kate_violations(
+            univ_min_fixed_df, max_attempts=100, verbose=False
+        )
+
+        # 5. gap違反（3日未満の間隔）を修正（優先度3位）
+        gap_fixed_df, gap_success, gap_fix_count = fix_gap_violations(
+            ch_kate_fixed_df, max_attempts=200, verbose=False
+        )
+
+        # 6. 大学系と外病院の差が3以上の違反を修正
+        bg_ht_fixed_df, bg_ht_success, bg_ht_fix_count = fix_bg_ht_imbalance_violations(
+            gap_fixed_df, max_attempts=100, verbose=False
+        )
+
+        # 7. 外病院重複を修正
+        ext_dup_fixed_df, ext_dup_success, ext_dup_fix_count = fix_external_hospital_dup_violations(
+            bg_ht_fixed_df, max_attempts=150, verbose=False
+        )
+
+        # 8. 大学3回以上違反を修正（外病院最低1回も強制）
+        univ_over_2_fixed_df, univ_over_2_success, univ_over_2_fix_count = fix_university_over_2_violations(
+            ext_dup_fixed_df, max_attempts=150, verbose=False
+        )
+
+        # 9. 大学平日偏り違反を修正
+        univ_weekday_fixed_df, univ_weekday_success, univ_weekday_fix_count = fix_university_weekday_balance_violations(
+            univ_over_2_fixed_df, max_attempts=150, verbose=False
+        )
+
+        # 10. 公平性違反の修正（最大と最小の差を縮める）
+        fairness_fixed_df, fairness_success, fairness_fix_count = fix_fairness_imbalance(
+            univ_weekday_fixed_df, max_attempts=200, verbose=False
+        )
+
+        # 11. 最終セーフティネット: 未割り当てスロットを埋める（ハード制約）
+        final_df, unassigned_success, unassigned_fix_count = fix_unassigned_slots(
+            fairness_fixed_df, verbose=False
+        )
+
+        # 修正後に再評価
+        if fix_count > 0 or code_2_fix_count > 0 or cap_fix_count > 0 or univ_min_fix_count > 0 or ch_kate_fix_count > 0 or bg_ht_fix_count > 0 or gap_fix_count > 0 or ext_dup_fix_count > 0 or univ_over_2_fix_count > 0 or univ_weekday_fix_count > 0 or fairness_fix_count > 0 or unassigned_fix_count > 0:
+            counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(final_df)
+            sc2, raw2, met2 = evaluate_schedule_with_raw(
+                final_df, counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts
+            )
+            improved_df = final_df
+        else:
+            improved_df = final_df
     else:
-        improved_df = final_df
+        # v5.7.1: 最適化無効 - 初期パターンをそのまま使用
+        final_df = improved_df
+        fix_count = fail_count = 0
+        code_2_fix_count = cap_fix_count = univ_min_fix_count = 0
+        ch_kate_fix_count = gap_fix_count = bg_ht_fix_count = 0
+        ext_dup_fix_count = univ_over_2_fix_count = univ_weekday_fix_count = 0
+        fairness_fix_count = unassigned_fix_count = 0
+
+    # v5.7.1: 絶対禁忌の最終検証
+    violations, is_valid = validate_absolute_constraints(final_df, verbose=False)
 
     refined.append({
         "seed": cand["seed"],
@@ -4333,7 +4444,7 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         "score_after": sc2,
         "raw_after": raw2,
         "metrics_after": met2,
-        "pattern_df": improved_df,
+        "pattern_df": final_df,  # v5.7.1: 最終パターンを使用
         "violations_fixed": fix_count,
         "violations_failed": fail_count,
         "code_2_violations_fixed": code_2_fix_count,
@@ -4347,7 +4458,29 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         "univ_weekday_violations_fixed": univ_weekday_fix_count,
         "fairness_violations_fixed": fairness_fix_count,
         "unassigned_slots_fixed": unassigned_fix_count,
+        "absolute_constraints_valid": is_valid,  # v5.7.1: 絶対禁忌チェック結果
+        "absolute_violations": violations,  # v5.7.1: 違反詳細
     })
+
+# =========================
+# v5.7.1: 絶対禁忌チェック結果の表示
+# =========================
+print("\n=== 絶対禁忌チェック (v5.7.1) ===")
+abs_valid_count = sum(1 for e in refined if e.get("absolute_constraints_valid", False))
+abs_invalid_count = len(refined) - abs_valid_count
+print(f"   絶対禁忌クリア: {abs_valid_count}/{len(refined)} パターン")
+if abs_invalid_count > 0:
+    print(f"   ❌ 絶対禁忌違反あり: {abs_invalid_count} パターン")
+    # 違反の内訳を表示
+    for e in refined:
+        if not e.get("absolute_constraints_valid", False):
+            viols = e.get("absolute_violations", [])
+            if viols:
+                print(f"      seed={e['seed']}: {len(viols)}件の違反")
+                for v in viols[:3]:
+                    print(f"         - [{v['type']}] {v['desc']}")
+                if len(viols) > 3:
+                    print(f"         ... 他 {len(viols) - 3}件")
 
 # =========================
 # ハード制約違反のないパターンのみ選択（TARGET_CAP、gap、未割当）
@@ -4363,9 +4496,13 @@ for e in refined:
     code_2_viol = met.get('code_2_extra_violations', 0)
     bg_over_2_viol = met.get('bg_over_2_violations', 0)
     ht_0_viol = met.get('ht_0_violations', 0)
+    abs_valid = e.get("absolute_constraints_valid", False)  # v5.7.1: 絶対禁忌チェック
     # ch_kate_violationsはソフト制約（ペナルティのみ、ハード制約から除外）
 
-    if cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0 or bg_over_2_viol > 0 or ht_0_viol > 0:
+    # v5.7.1: 絶対禁忌違反があれば除外
+    if not abs_valid:
+        excluded_count += 1
+    elif cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0 or bg_over_2_viol > 0 or ht_0_viol > 0:
         excluded_count += 1
     else:
         valid_patterns.append(e)
@@ -4374,7 +4511,7 @@ if not valid_patterns:
     print("\n⚠️  ハード制約を満たすパターンなし → 全パターンから選択")
     valid_patterns = refined
 else:
-    print(f"\n✅ {len(valid_patterns)}/{len(refined)} パターンがハード制約OK")
+    print(f"\n✅ {len(valid_patterns)}/{len(refined)} パターンがハード制約OK（絶対禁忌クリア含む）")
 
 # 評価軸1: 公平性重視（TARGET_CAP、公平性ペナルティを重視）
 fairness_patterns = sorted(
