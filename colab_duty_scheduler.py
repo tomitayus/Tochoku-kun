@@ -1,5 +1,12 @@
-# @title 当直くん v5.4 (初期パターン生成のABS-001修正)
+# @title 当直くん v5.5 (全fix関数のABS-001完全対応)
 # 修正内容:
+# v5.5 (2026-02-02):
+# - 全てのfix関数の緊急フォールバックにABS-001チェックを追加
+#   - fix_ch_kate_violations: スワップ時のコード0チェック追加
+#   - fix_target_cap_violations: 緊急フォールバックにコード0チェック追加
+#   - fix_bg_over_2_violations: 緊急フォールバックにコード0チェック追加
+#   - fix_weekday_bg_over_2_violations: 緊急フォールバックにコード0チェック追加
+#   - fix_unassigned_slots: 全フォールバックにコード0チェック追加
 # v5.4 (2026-02-02):
 # - 初期パターン生成のフォールバックでABS-001チェックを追加
 #   - collect_candidatesで候補がいない場合のフォールバックでコード0を除外
@@ -210,7 +217,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "5.4"
+VERSION = "5.5"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -2659,7 +2666,13 @@ def fix_code_2_extra_violations(pattern_df, max_attempts=100, verbose=True):
                     fixed_in_this_iteration += 1
                 else:
                     # 緊急フォールバック: 制約緩和して誰かを割り当て（未割当防止）
-                    emergency = [d for d in doctor_names if d not in already_assigned_on_date and d != over_doc]
+                    # ABS-001: コード0は絶対禁止
+                    emergency = [
+                        d for d in doctor_names
+                        if d not in already_assigned_on_date
+                        and d != over_doc
+                        and get_avail_code(date, d) != 0
+                    ]
                     if emergency:
                         emergency.sort(key=lambda d: counts.get(d, 0))
                         new_doc = emergency[0]
@@ -2883,6 +2896,9 @@ def fix_ch_kate_violations(pattern_df, max_attempts=100, verbose=True):
                 continue
             # other_docがC-H列に適格かチェック
             if not is_eligible_for_ch_slot(other_doc, date):
+                continue
+            # other_docがhosp（C-H列）に割り当て可能かチェック（ABS-001含む）
+            if not can_assign_doc_to_slot(other_doc, date, hosp):
                 continue
             # bad_docがother_hospに割り当て可能かチェック
             if not can_assign_doc_to_slot(bad_doc, date, other_hosp):
@@ -3550,8 +3566,13 @@ def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True)
                         if verbose and attempt < 10:
                             print(f"      {doc}→{new_doc}: {date.strftime('%m/%d')}の大学病院割当を交代")
                     else:
-                        # 緊急フォールバック: 制約緩和して誰かを割り当て
-                        emergency = [d for d in doctor_names if d not in already_on_date and d != doc]
+                        # 緊急フォールバック: 制約緩和して誰かを割り当て（ABS-001は維持）
+                        emergency = [
+                            d for d in doctor_names
+                            if d not in already_on_date
+                            and d != doc
+                            and get_avail_code(date, d) != 0
+                        ]
                         if emergency:
                             emergency.sort(key=lambda d: bg_counts.get(d, 0))
                             new_doc = emergency[0]
@@ -3717,8 +3738,13 @@ def fix_university_weekday_balance_violations(pattern_df, max_attempts=150, verb
                         if verbose and attempt < 10:
                             print(f"      {doc}→{new_doc}: {date.strftime('%m/%d')}の大学平日割当を交代")
                     else:
-                        # 緊急フォールバック
-                        emergency = [d for d in doctor_names if d not in already_on_date and d != doc]
+                        # 緊急フォールバック（ABS-001は維持）
+                        emergency = [
+                            d for d in doctor_names
+                            if d not in already_on_date
+                            and d != doc
+                            and get_avail_code(date, d) != 0
+                        ]
                         if emergency:
                             emergency.sort(key=lambda d: counts.get(d, 0))
                             new_doc = emergency[0]
@@ -3953,15 +3979,26 @@ def fix_unassigned_slots(pattern_df, verbose=True):
             candidates.sort(key=lambda d: counts.get(d, 0))
             new_doc = candidates[0]
         else:
-            # 緊急フォールバック: 制約緩和して誰かを割り当て
-            emergency = [d for d in doctor_names if d not in already_assigned_on_date]
+            # 緊急フォールバック: 制約緩和して誰かを割り当て（ABS-001は維持）
+            emergency = [
+                d for d in doctor_names
+                if d not in already_assigned_on_date
+                and get_avail_code(date, d) != 0
+            ]
             if emergency:
                 emergency.sort(key=lambda d: counts.get(d, 0))
                 new_doc = emergency[0]
             else:
-                # 最終手段: 同日重複も許容
-                all_docs = sorted(doctor_names, key=lambda d: counts.get(d, 0))
-                new_doc = all_docs[0]
+                # 最終手段: 同日重複も許容するがコード0は除外
+                all_docs = [d for d in doctor_names if get_avail_code(date, d) != 0]
+                if all_docs:
+                    all_docs.sort(key=lambda d: counts.get(d, 0))
+                    new_doc = all_docs[0]
+                else:
+                    # 全員コード0の場合は割当不可（未割当のまま）
+                    if verbose:
+                        print(f"   ❌ 未割当: {date.strftime('%Y-%m-%d')} {hosp}（全員コード0）")
+                    continue
 
         df.at[ridx, hosp] = new_doc
         counts[new_doc] = counts.get(new_doc, 0) + 1
