@@ -1,53 +1,23 @@
-# @title 当直くん v5.7.3 (絶対禁忌強化: gap>=3, 病院重複禁止)
+# @title 当直くん v6.0.0 (制約体系全面改定)
 # 修正内容:
-# v5.7.3 (2026-02-02):
-# - gap要件を >= 2 から >= 3 に強化（gap1,2両方禁止）
-# - 同一病院重複を絶対禁忌に昇格（collect_candidatesでチェック）
-# - SOFT-002（外病院重複ペナルティ）を削除（絶対禁忌で代替）
-# - 冗長なソフト優先チェックを削除（絶対禁忌でカバー）
-# v5.7.2 (2026-02-02):
-# - 絶対禁忌にABS-002/ABS-003（コード2/3列制限）を追加
-# - 同一病院重複チェックを全列（大学系+外病院）に拡張
-# - 出力を1パターンのみに変更（3パターン同一問題の解消）
-# - パターン選択ロジックを改善（絶対禁忌クリア優先）
-# v5.7.1 (2026-02-02):
-# - 最適化処理を無効化（バグ発生源の排除）
-#   - LOCAL_SEARCH_ENABLED = False（局所探索スキップ）
-#   - OPTIMIZATION_ENABLED = False（fix関数群スキップ）
-# - 初期パターン生成の絶対禁忌チェックのみで品質担保
-# - validate_absolute_constraints()で最終検証
-# - 最適化が不要な理由: 初期生成時に絶対禁忌を厳守すればfix不要
-# v5.7 (2026-02-02):
-# - 局所探索（local_search_swap）で外病院重複チェックを追加
-#   - gap_violations > 0 に加えて external_hosp_dup_violations > 0 も拒否
-# - 公平性バランス関数で外病院重複チェックを追加
-#   - min_docを外病院に移動する前に重複チェック
-# v5.6 (2026-02-02):
-# - 絶対禁忌にgap1（連日シフト）と外病院重複禁止を追加
-#   - 全てのフォールバックでgap >= 2を強制
-#   - 全てのフォールバックで同一外病院への複数回割当を禁止
-#   - 初期パターン生成のフォールバックに絶対禁忌チェック追加
-#   - fix_hard_constraint_violations: 絶対禁忌チェック追加
-#   - fix_target_cap_violations: 絶対禁忌チェック追加
-#   - fix_bg_over_2_violations: 絶対禁忌チェック追加
-#   - fix_weekday_bg_over_2_violations: 絶対禁忌チェック追加
-#   - fix_unassigned_slots: 絶対禁忌チェック追加
-# v5.5 (2026-02-02):
-# - 全てのfix関数の緊急フォールバックにABS-001チェックを追加
-#   - fix_ch_kate_violations: スワップ時のコード0チェック追加
-#   - fix_target_cap_violations: 緊急フォールバックにコード0チェック追加
-#   - fix_bg_over_2_violations: 緊急フォールバックにコード0チェック追加
-#   - fix_weekday_bg_over_2_violations: 緊急フォールバックにコード0チェック追加
-#   - fix_unassigned_slots: 全フォールバックにコード0チェック追加
-# v5.4 (2026-02-02):
-# - 初期パターン生成のフォールバックでABS-001チェックを追加
-#   - collect_candidatesで候補がいない場合のフォールバックでコード0を除外
-#   - 全員コード0の日は未割当のまま（後でfix関数で処理）
-# v5.3 (2026-01-31):
-# - 制約ID体系を導入（ABS-001〜006, HARD-001〜004, SEMI-001〜004, SOFT-001〜014）
-#   - 28個の制約ID定数を追加
-#   - build_hard_constraint_violations()でID付き違反ログ出力
-#   - 違反DataFrameに「制約ID」列を追加
+# v6.0.0 (2026-02-02):
+# - 制約体系を全面改定
+# - 絶対禁忌(ABS): 11項目
+#   - ABS-001〜009: 既存の絶対禁忌
+#   - ABS-010: TARGET_CAP遵守（n超過禁止）
+#   - ABS-011: 大学系2回まで（B-K列合計）
+# - ハード制約(HARD): 3項目
+#   - HARD-001: B/I列1回まで（グループA）
+#   - HARD-002: C-H/J-K列1回まで（グループB）
+#   - HARD-003: 外病院1回以上（L-Y列）
+# - 準ハード制約(SEMI): 2項目
+#   - SEMI-001: B列のみカテ表コード必須（sheet3「1」は例外）
+#   - SEMI-002: C-H列のみカテ当番日必須（I-K列は対象外、sheet3「1」は例外）
+# - ソフト制約(SOFT): 3項目
+#   - SOFT-001: 公平性（max-min最小化）
+#   - SOFT-002: コード1.2優先（大学系0回ペナルティ）
+#   - SOFT-003: 大学/外病院差（差3以上ペナルティ）
+# - 不要な制約を削除（HARD/ABSで吸収）
 # - ABS-001（コード0禁止）修正
 #   - fix_hard_constraint_violations()の緊急フォールバックでコード0チェック追加
 #   - 最終手段でもコード0医師を除外
@@ -249,7 +219,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "5.7.3"
+VERSION = "6.0.0"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -290,18 +260,21 @@ LOCAL_MAX_ITERS = 3000        # 1候補あたりの入替試行回数
 LOCAL_PATIENCE = 1200         # 改善が出ない試行がこの回数続いたら打ち切り
 LOCAL_REFRESH_EVERY = 200     # 問題医師（gap/重複）を再抽出する間隔
 
-# スコア重み（必要なら調整）
-# 優先順位: TARGET_CAP > gap > DUP を死守
-W_FAIR_TOTAL = 30          # 全合計（active内 max-min）- 公平性強化
-W_GAP = 100                # gap(3日未満) - 優先度2位
-W_HOSP_DUP = 0             # 同一病院複数回（v5.7.3: 絶対禁忌のためペナルティ不要）
-W_EXTERNAL_HOSP_DUP = 0    # 外病院重複（v5.7.3: 絶対禁忌のためペナルティ不要）
-W_UNASSIGNED = 100         # 未割当
-W_CAP = 200                # cap超え（厳格化：優先度1位）
-W_BG_SPREAD = 3            # 大学合計（累計）ばらつき
-W_HT_SPREAD = 3            # 外病院合計（累計）ばらつき
-W_WD_SPREAD = 2            # 平日（累計）ばらつき
-W_WE_SPREAD = 3            # 休日合計（累計）ばらつき
+# v6.0.0 スコア重み（ソフト制約のみ）
+# 絶対禁忌(ABS)とハード制約(HARD)は候補選定時にチェック済み
+W_FAIR_TOTAL = 30          # SOFT-001: 公平性（max-min最小化）
+W_CODE_12_UNIV = 150       # SOFT-002: コード1.2優先（大学系0回ペナルティ）
+W_BG_HT_DIFF = 100         # SOFT-003: 大学/外病院差（差3以上ペナルティ）
+# 以下は絶対禁忌のためペナルティ不要（v6.0.0）
+W_GAP = 0                  # ABS-007で対応
+W_HOSP_DUP = 0             # ABS-008で対応
+W_EXTERNAL_HOSP_DUP = 0    # ABS-008で対応
+W_UNASSIGNED = 0           # ABS-009で対応
+W_CAP = 0                  # ABS-010で対応
+W_BG_SPREAD = 0            # 削除（簡略化）
+W_HT_SPREAD = 0            # 削除（簡略化）
+W_WD_SPREAD = 0            # 削除（簡略化）
+W_WE_SPREAD = 0            # 削除（簡略化）
 W_BK_LY_BALANCE = 2        # B-K/L-Y の比率バランス（なるべく1:1）
 
 # =========================
@@ -957,6 +930,8 @@ def choose_doctor_for_slot(
     assigned_bk,
     assigned_ly,
     assigned_bh,
+    assigned_bi,      # v6.0.0: B/I列の合計（HARD-001）
+    assigned_chjk,    # v6.0.0: C-H/J-K列の合計（HARD-002）
     assigned_hosp_count,
 ):
     idx = shift_df.columns.get_loc(hospital_name)
@@ -966,86 +941,111 @@ def choose_doctor_for_slot(
     is_LY_range = L_COL_INDEX <= idx <= L_Y_END_INDEX
     is_BK = is_bk_slot(idx)
     is_LY = is_ly_slot(idx)
+    # v6.0.0: 新しい列グループ
+    is_B_or_I = (idx == B_COL_INDEX or idx == I_COL_INDEX)  # グループA
+    is_CH_or_JK = ((C_COL_INDEX <= idx <= H_COL_INDEX) or (J_COL_INDEX <= idx <= K_COL_INDEX))  # グループB
+    is_B_only = (idx == B_COL_INDEX)  # SEMI-001対象
+    is_CH_only = (C_COL_INDEX <= idx <= H_COL_INDEX)  # SEMI-002対象
     dow = pd.to_datetime(date).weekday()
     weekday = dow < 5
 
     def collect_candidates(
-        relax_schedule=False,
-        relax_bh_limit=False,
-        relax_ch_kate=False,
+        relax_semi=False,  # v6.0.0: SEMI制約を緩和（sheet3「1」以外も許容）
     ):
         candidates = []
         for doc in doctor_names:
-            # ★ 絶対禁忌1: 同日重複禁止（緩和不可）
+            # === 絶対禁忌（ABS）: 緩和不可 ===
+
+            # ABS-006: 同日重複禁止
             if date in assigned_dates[doc]:
                 continue
 
             code = get_avail_code(date, doc)
 
-            # ★ 絶対禁忌2: コード0は全列禁止（緩和不可）
+            # ABS-001: コード0は全列禁止
             if code == 0:
                 continue
 
-            # ★ 絶対禁忌3: コード2はR-Y列禁止（緩和不可）
+            # ABS-002: コード2はB〜Q列のみ（R-Y列禁止）
             if code == 2 and not (B_COL_INDEX <= idx <= Q_COL_INDEX):
                 continue
 
-            # ★ 絶対禁忌4: コード3は大学系(B-K)禁止（緩和不可）
+            # ABS-003: コード3はL〜Y列のみ（大学系禁止）
             if code == 3 and not (L_COL_INDEX <= idx <= L_Y_END_INDEX):
                 continue
 
-            # ★ 絶対禁忌5: その日にカテ表コードあり→L〜Y列不可（緩和不可）
+            # ABS-004: カテ表コードありの日はL〜Y列不可
             if L_COL_INDEX <= idx <= L_Y_END_INDEX:
                 if get_sched_code(date, doc):
                     continue
 
-            # ★ 絶対禁忌6: 水曜日L〜Y列禁止医師（緩和不可）
+            # ABS-005: 水曜日L〜Y列禁止医師
             if dow == 2 and is_LY_range:
                 if doc in WED_FORBIDDEN_DOCTORS:
                     continue
 
-            # ★ 絶対禁忌7: 同一病院重複禁止（緩和不可）
-            if assigned_hosp_count[doc].get(hospital_name, 0) >= 1:
-                continue
-
-            # ★ 絶対禁忌8: gap >= 3日必須（緩和不可）
+            # ABS-007: gap >= 3日必須
             if assigned_dates[doc]:
                 min_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_dates[doc])
                 if min_gap < 3:
                     continue
 
-            # ★ 準ハード制約: B〜K列はカテ表コード保有医師のみカテ表コードが必要
-            # ただしsheet3「1」の医師（SHEET3_CODE_1_DOCTORS）は例外として許容
-            if B_COL_INDEX <= idx <= B_K_END_INDEX:
-                if doc in SCHEDULE_CODE_HOLDERS and not get_sched_code(date, doc):
-                    if doc not in EXTRA_ALLOWED and doc not in SHEET3_CODE_1_DOCTORS:
-                        continue
-
-            # ★ 準ハード制約: C〜H列（休日大学系）はカテ当番ありの日 OR カテ当番なし医師のみ
-            if not relax_ch_kate and is_ch_slot(idx):
-                if not is_eligible_for_ch_slot(doc, date):
-                    continue
-
-            # ★ 準ハード制約: B列/I-K列（平日大学系）はカテ当番なし OR カテ当番あり OR sheet3「1」
-            if not relax_ch_kate and is_weekday_university_slot(idx):
-                if not is_eligible_for_weekday_university_slot(doc, date):
-                    continue
-
-            # ★ 準ハード制約: B〜H列は2回まで（relax_bh_limitで緩和可能）
-            if not relax_bh_limit and is_BH and assigned_bh[doc] >= 2:
+            # ABS-008: 同一病院重複禁止（全列）
+            if assigned_hosp_count[doc].get(hospital_name, 0) >= 1:
                 continue
 
+            # ABS-010: TARGET_CAP遵守（n超過禁止）
             if assigned_count[doc] >= TARGET_CAP.get(doc, 0):
                 continue
+
+            # ABS-011: 大学系2回まで（B-K列合計）
+            if is_BG and assigned_bg[doc] >= 2:
+                continue
+
+            # === ハード制約（HARD）: カテなし医師は必須遵守 ===
+
+            # カテ当番の有無を判定
+            is_kate_holder = doc in SCHEDULE_CODE_HOLDERS
+            is_sheet3_one = doc in SHEET3_CODE_1_DOCTORS
+
+            # HARD-001: B/I列1回まで（グループA）
+            if is_B_or_I and assigned_bi[doc] >= 1:
+                # カテなし医師は必須遵守
+                if not is_kate_holder:
+                    continue
+                # カテあり医師でもsheet3「1」以外は遵守
+                if is_kate_holder and not is_sheet3_one:
+                    continue
+
+            # HARD-002: C-H/J-K列1回まで（グループB）
+            if is_CH_or_JK and assigned_chjk[doc] >= 1:
+                # カテなし医師は必須遵守
+                if not is_kate_holder:
+                    continue
+                # カテあり医師でもsheet3「1」以外は遵守
+                if is_kate_holder and not is_sheet3_one:
+                    continue
+
+            # === 準ハード制約（SEMI）: sheet3「1」は緩和対象 ===
+
+            # SEMI-001: B列のみカテ表コード必須
+            if not relax_semi and is_B_only:
+                if is_kate_holder and not get_sched_code(date, doc):
+                    if not is_sheet3_one:
+                        continue
+
+            # SEMI-002: C-H列のみカテ当番日必須（I-K列は対象外）
+            if not relax_semi and is_CH_only:
+                if not is_eligible_for_ch_slot(doc, date):
+                    if not is_sheet3_one:
+                        continue
 
             candidates.append(doc)
         return candidates
 
     candidates = collect_candidates()
     if not candidates:
-        candidates = collect_candidates(relax_bh_limit=True)
-    if not candidates:
-        candidates = collect_candidates(relax_bh_limit=True, relax_ch_kate=True)
+        candidates = collect_candidates(relax_semi=True)
 
     if not candidates:
         return None
@@ -1163,7 +1163,9 @@ def build_schedule_pattern(seed=0):
     assigned_fg = {d: 0 for d in doctor_names}
     assigned_bk = {d: 0 for d in doctor_names}
     assigned_ly = {d: 0 for d in doctor_names}
-    assigned_bh = {d: 0 for d in doctor_names}  # B〜H列の割当回数（2回まで）
+    assigned_bh = {d: 0 for d in doctor_names}  # B〜H列の割当回数（旧: 2回まで）
+    assigned_bi = {d: 0 for d in doctor_names}  # v6.0.0: B/I列の合計（HARD-001: 1回まで）
+    assigned_chjk = {d: 0 for d in doctor_names}  # v6.0.0: C-H/J-K列の合計（HARD-002: 1回まで）
     assigned_hosp_count = {d: defaultdict(int) for d in doctor_names}
     bg_cat = {d: defaultdict(int) for d in doctor_names}
 
@@ -1186,9 +1188,17 @@ def build_schedule_pattern(seed=0):
             elif L_COL_INDEX <= hidx <= L_Y_END_INDEX:
                 assigned_ht[doc] += 1
 
-            # B〜H列のカウント
+            # B〜H列のカウント（旧）
             if B_H_START_INDEX <= hidx <= B_H_END_INDEX:
                 assigned_bh[doc] += 1
+
+            # v6.0.0: B/I列のカウント（HARD-001）
+            if hidx == B_COL_INDEX or hidx == I_COL_INDEX:
+                assigned_bi[doc] += 1
+
+            # v6.0.0: C-H/J-K列のカウント（HARD-002）
+            if (C_COL_INDEX <= hidx <= H_COL_INDEX) or (J_COL_INDEX <= hidx <= K_COL_INDEX):
+                assigned_chjk[doc] += 1
 
             dow = date.weekday()
             weekday = dow < 5
@@ -1244,58 +1254,51 @@ def build_schedule_pattern(seed=0):
                 assigned_bk=assigned_bk,
                 assigned_ly=assigned_ly,
                 assigned_bh=assigned_bh,
+                assigned_bi=assigned_bi,        # v6.0.0
+                assigned_chjk=assigned_chjk,    # v6.0.0
                 assigned_hosp_count=assigned_hosp_count,
             )
             if chosen is None:
-                # フォールバック: 絶対禁忌をすべてチェック
-                # ABS-001: コード0禁止
-                # ABS-002: コード2はB〜Q列のみ
-                # ABS-003: コード3はL〜Y列のみ
-                # gap1禁止: 連日シフト禁止（gap >= 2必須）
-                # 同日重複禁止
-                # 同一病院重複禁止（大学系・外病院両方）
+                # v6.0.0 フォールバック: 絶対禁忌(ABS)をすべてチェック
                 hidx = shift_df.columns.get_loc(hosp)
-                is_external = L_COL_INDEX <= hidx <= L_Y_END_INDEX
+                is_bg_slot = B_COL_INDEX <= hidx <= K_COL_INDEX
 
                 def is_valid_fallback(d):
                     code = get_avail_code(date, d)
                     # ABS-001: コード0禁止
                     if code == 0:
                         return False
-                    # ABS-002: コード2はB〜Q列のみ（R-Y列禁止）
+                    # ABS-002: コード2はB〜Q列のみ
                     if code == 2 and not (B_COL_INDEX <= hidx <= Q_COL_INDEX):
                         return False
-                    # ABS-003: コード3はL〜Y列のみ（大学系禁止）
+                    # ABS-003: コード3はL〜Y列のみ
                     if code == 3 and not (L_COL_INDEX <= hidx <= L_Y_END_INDEX):
                         return False
-                    # 同日重複禁止
+                    # ABS-006: 同日重複禁止
                     if date in assigned_dates[d]:
                         return False
-                    # gap >= 3日必須（gap1,2禁止）
+                    # ABS-007: gap >= 3日必須
                     if assigned_dates[d]:
                         min_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_dates[d])
                         if min_gap < 3:
                             return False
-                    # 同一病院重複禁止（全病院対象）
+                    # ABS-008: 同一病院重複禁止
                     if assigned_hosp_count[d].get(hosp, 0) >= 1:
+                        return False
+                    # ABS-010: TARGET_CAP遵守
+                    if assigned_count[d] >= TARGET_CAP.get(d, 0):
+                        return False
+                    # ABS-011: 大学系2回まで
+                    if is_bg_slot and assigned_bg[d] >= 2:
                         return False
                     return True
 
-                remaining = [
-                    d for d in doctor_names
-                    if assigned_count[d] < TARGET_CAP.get(d, 0)
-                    and is_valid_fallback(d)
-                ]
+                remaining = [d for d in doctor_names if is_valid_fallback(d)]
                 if remaining:
                     fallback_doc = min(remaining, key=lambda d: (assigned_count[d], doctor_col_index[d]))
                 else:
-                    # TARGET_CAP超過も許容するが、絶対禁忌は維持
-                    remaining_any = [d for d in doctor_names if is_valid_fallback(d)]
-                    if remaining_any:
-                        fallback_doc = min(remaining_any, key=lambda d: (assigned_count[d], doctor_col_index[d]))
-                    else:
-                        # 全員が絶対禁忌に該当する場合は未割当のまま（None）
-                        fallback_doc = None
+                    # 全員が絶対禁忌に該当する場合は未割当のまま（None）
+                    fallback_doc = None
                 if fallback_doc is not None:
                     df.at[ridx, hosp] = fallback_doc
                     chosen = fallback_doc
@@ -1320,9 +1323,17 @@ def build_schedule_pattern(seed=0):
                 elif L_COL_INDEX <= hidx <= L_Y_END_INDEX:
                     assigned_ht[chosen] += 1
 
-                # B〜H列のカウント
+                # B〜H列のカウント（旧）
                 if B_H_START_INDEX <= hidx <= B_H_END_INDEX:
                     assigned_bh[chosen] += 1
+
+                # v6.0.0: B/I列のカウント（HARD-001）
+                if hidx == B_COL_INDEX or hidx == I_COL_INDEX:
+                    assigned_bi[chosen] += 1
+
+                # v6.0.0: C-H/J-K列のカウント（HARD-002）
+                if (C_COL_INDEX <= hidx <= H_COL_INDEX) or (J_COL_INDEX <= hidx <= K_COL_INDEX):
+                    assigned_chjk[chosen] += 1
 
                 dow = date.weekday()
                 weekday = dow < 5
@@ -4170,16 +4181,18 @@ def fix_unassigned_slots(pattern_df, verbose=True):
 
 def validate_absolute_constraints(pattern_df, verbose=True):
     """
-    絶対禁忌の最終検証（v5.7.1）
+    絶対禁忌の最終検証（v6.0.0）
 
     チェック項目:
-    1. コード0割当禁止 (ABS-001)
-    2. コード2列制限 (ABS-002: B〜Q列のみ)
-    3. コード3列制限 (ABS-003: L〜Y列のみ)
-    4. 同日当直禁止 (ABS-006)
-    5. gap >= 3日必須（gap1,2禁止）
-    6. 同一病院重複禁止（全列対象）
-    7. 未割当枠なし
+    - ABS-001: コード0割当禁止
+    - ABS-002: コード2列制限（B〜Q列のみ）
+    - ABS-003: コード3列制限（L〜Y列のみ）
+    - ABS-006: 同日重複禁止
+    - ABS-007: gap >= 3日必須
+    - ABS-008: 同一病院重複禁止（全列）
+    - ABS-009: 未割当禁止
+    - ABS-010: TARGET_CAP遵守
+    - ABS-011: 大学系2回まで
 
     Returns:
         (violations_list, is_valid)
@@ -4188,9 +4201,7 @@ def validate_absolute_constraints(pattern_df, verbose=True):
 
     counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(pattern_df)
 
-    # 1. コード0割当チェック (ABS-001)
-    # 2. コード2列制限チェック (ABS-002)
-    # 3. コード3列制限チェック (ABS-003)
+    # ABS-001, ABS-002, ABS-003: コード制限チェック
     for (ridx, hosp), (date, fixed) in slot_meta.items():
         val = pattern_df.at[ridx, hosp]
         if isinstance(val, str):
@@ -4204,20 +4215,20 @@ def validate_absolute_constraints(pattern_df, verbose=True):
                         "type": "ABS-001",
                         "desc": f"コード0割当: {doc} → {date.strftime('%Y-%m-%d')} {hosp}"
                     })
-                # ABS-002: コード2はB〜Q列のみ（R-Y列禁止）
+                # ABS-002: コード2はB〜Q列のみ
                 if code == 2 and not (B_COL_INDEX <= hidx <= Q_COL_INDEX):
                     violations.append({
                         "type": "ABS-002",
-                        "desc": f"コード2列違反: {doc} → {date.strftime('%Y-%m-%d')} {hosp} (列{hidx}はB〜Q外)"
+                        "desc": f"コード2列違反: {doc} → {date.strftime('%Y-%m-%d')} {hosp}"
                     })
-                # ABS-003: コード3はL〜Y列のみ（大学系禁止）
+                # ABS-003: コード3はL〜Y列のみ
                 if code == 3 and not (L_COL_INDEX <= hidx <= L_Y_END_INDEX):
                     violations.append({
                         "type": "ABS-003",
-                        "desc": f"コード3列違反: {doc} → {date.strftime('%Y-%m-%d')} {hosp} (列{hidx}はL〜Y外)"
+                        "desc": f"コード3列違反: {doc} → {date.strftime('%Y-%m-%d')} {hosp}"
                     })
 
-    # 4. 同日当直チェック (ABS-006)
+    # ABS-006: 同日重複チェック
     for date, doc_count in build_date_doc_count(pattern_df).items():
         for doc, count in doc_count.items():
             if count > 1:
@@ -4226,38 +4237,55 @@ def validate_absolute_constraints(pattern_df, verbose=True):
                     "desc": f"同日重複: {doc} → {date.strftime('%Y-%m-%d')} ({count}回)"
                 })
 
-    # 5. gap >= 3日チェック（gap1,2禁止）
+    # ABS-007: gap >= 3日チェック
     for doc, assigns in doc_assignments.items():
         dates = sorted([d for d, _ in assigns])
         for i in range(1, len(dates)):
             gap = (dates[i] - dates[i-1]).days
             if gap < 3:
                 violations.append({
-                    "type": "gap違反",
-                    "desc": f"間隔不足: {doc} → {dates[i-1].strftime('%Y-%m-%d')} と {dates[i].strftime('%Y-%m-%d')} (gap={gap}日, 必須>=3)"
+                    "type": "ABS-007",
+                    "desc": f"gap違反: {doc} → gap={gap}日 (必須>=3)"
                 })
 
-    # 6. 同一病院重複チェック（大学系・外病院両方）
+    # ABS-008: 同一病院重複チェック
     for doc, hosp_dict in assigned_hosp_count.items():
         for hosp, count in hosp_dict.items():
             if count > 1:
                 violations.append({
-                    "type": "病院重複",
-                    "desc": f"同一病院重複: {doc} → {hosp} ({count}回)"
+                    "type": "ABS-008",
+                    "desc": f"病院重複: {doc} → {hosp} ({count}回)"
                 })
 
-    # 7. 未割当枠チェック
+    # ABS-009: 未割当枠チェック
     for (ridx, hosp), (date, fixed) in slot_meta.items():
         val = pattern_df.at[ridx, hosp]
         if not isinstance(val, str):
             violations.append({
-                "type": "未割当",
+                "type": "ABS-009",
                 "desc": f"未割当: {date.strftime('%Y-%m-%d')} {hosp}"
             })
         elif normalize_name(val) not in doctor_names:
             violations.append({
-                "type": "未割当",
+                "type": "ABS-009",
                 "desc": f"不明医師: {date.strftime('%Y-%m-%d')} {hosp} → {val}"
+            })
+
+    # ABS-010: TARGET_CAP遵守チェック
+    for doc, count in counts.items():
+        cap = TARGET_CAP.get(doc, 0)
+        if count > cap:
+            violations.append({
+                "type": "ABS-010",
+                "desc": f"TARGET_CAP超過: {doc} → {count}回 (上限{cap})"
+            })
+
+    # ABS-011: 大学系2回までチェック
+    for doc, bg_count in bg_counts.items():
+        if bg_count > 2:
+            violations.append({
+                "type": "ABS-011",
+                "desc": f"大学系3回以上: {doc} → {bg_count}回 (上限2)"
             })
 
     is_valid = len(violations) == 0
@@ -4727,13 +4755,21 @@ print("  ├─ sheet1〜4: 元データ")
 print("  ├─ pattern_01: 最良スケジュール（絶対禁忌クリア）")
 print("  ├─ pattern_01_今月/累計: サマリー")
 print("  └─ pattern_01_diag: 診断シート")
-print("\n【v5.7.3 絶対禁忌チェック項目】")
-print("  ├─ コード0割当禁止 (ABS-001)")
-print("  ├─ コード2列制限 (ABS-002: B〜Q列のみ)")
-print("  ├─ コード3列制限 (ABS-003: L〜Y列のみ)")
-print("  ├─ 同日重複禁止 (ABS-006)")
-print("  ├─ 間隔3日以上必須 (gap >= 3)")
-print("  └─ 同一病院重複禁止（全列対象）")
+print("\n【v6.0.0 制約チェック項目】")
+print("  絶対禁忌(ABS): 11項目")
+print("  ├─ ABS-001: コード0割当禁止")
+print("  ├─ ABS-002: コード2列制限（B〜Q列のみ）")
+print("  ├─ ABS-003: コード3列制限（L〜Y列のみ）")
+print("  ├─ ABS-006: 同日重複禁止")
+print("  ├─ ABS-007: gap >= 3日必須")
+print("  ├─ ABS-008: 同一病院重複禁止（全列）")
+print("  ├─ ABS-009: 未割当禁止")
+print("  ├─ ABS-010: TARGET_CAP遵守")
+print("  └─ ABS-011: 大学系2回まで")
+print("  ハード制約(HARD): 3項目")
+print("  ├─ HARD-001: B/I列1回まで")
+print("  ├─ HARD-002: C-H/J-K列1回まで")
+print("  └─ HARD-003: 外病院1回以上")
 print("="*60)
 
 if COLAB_AVAILABLE:
