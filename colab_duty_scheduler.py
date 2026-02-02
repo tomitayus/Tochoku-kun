@@ -1,5 +1,10 @@
-# @title 当直くん v5.7.2 (絶対禁忌完全遵守 + 単一パターン出力)
+# @title 当直くん v5.7.3 (絶対禁忌強化: gap>=3, 病院重複禁止)
 # 修正内容:
+# v5.7.3 (2026-02-02):
+# - gap要件を >= 2 から >= 3 に強化（gap1,2両方禁止）
+# - 同一病院重複を絶対禁忌に昇格（collect_candidatesでチェック）
+# - SOFT-002（外病院重複ペナルティ）を削除（絶対禁忌で代替）
+# - 冗長なソフト優先チェックを削除（絶対禁忌でカバー）
 # v5.7.2 (2026-02-02):
 # - 絶対禁忌にABS-002/ABS-003（コード2/3列制限）を追加
 # - 同一病院重複チェックを全列（大学系+外病院）に拡張
@@ -244,7 +249,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "5.7.2"
+VERSION = "5.7.3"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -289,8 +294,8 @@ LOCAL_REFRESH_EVERY = 200     # 問題医師（gap/重複）を再抽出する�
 # 優先順位: TARGET_CAP > gap > DUP を死守
 W_FAIR_TOTAL = 30          # 全合計（active内 max-min）- 公平性強化
 W_GAP = 100                # gap(3日未満) - 優先度2位
-W_HOSP_DUP = 0             # 同一病院複数回（大学病院：デフォルトなのでペナルティなし）
-W_EXTERNAL_HOSP_DUP = 150  # 外病院重複（ほぼ禁忌：非常に高いペナルティ）
+W_HOSP_DUP = 0             # 同一病院複数回（v5.7.3: 絶対禁忌のためペナルティ不要）
+W_EXTERNAL_HOSP_DUP = 0    # 外病院重複（v5.7.3: 絶対禁忌のためペナルティ不要）
 W_UNASSIGNED = 100         # 未割当
 W_CAP = 200                # cap超え（厳格化：優先度1位）
 W_BG_SPREAD = 3            # 大学合計（累計）ばらつき
@@ -968,7 +973,6 @@ def choose_doctor_for_slot(
         relax_schedule=False,
         relax_bh_limit=False,
         relax_ch_kate=False,
-        relax_gap=False,  # 間隔2日も許容
     ):
         candidates = []
         for doc in doctor_names:
@@ -1000,6 +1004,16 @@ def choose_doctor_for_slot(
                 if doc in WED_FORBIDDEN_DOCTORS:
                     continue
 
+            # ★ 絶対禁忌7: 同一病院重複禁止（緩和不可）
+            if assigned_hosp_count[doc].get(hospital_name, 0) >= 1:
+                continue
+
+            # ★ 絶対禁忌8: gap >= 3日必須（緩和不可）
+            if assigned_dates[doc]:
+                min_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_dates[doc])
+                if min_gap < 3:
+                    continue
+
             # ★ 準ハード制約: B〜K列はカテ表コード保有医師のみカテ表コードが必要
             # ただしsheet3「1」の医師（SHEET3_CODE_1_DOCTORS）は例外として許容
             if B_COL_INDEX <= idx <= B_K_END_INDEX:
@@ -1021,16 +1035,6 @@ def choose_doctor_for_slot(
             if not relax_bh_limit and is_BH and assigned_bh[doc] >= 2:
                 continue
 
-            # ★ 準ハード制約: 間隔チェック（通常3日以上、緩和時2日も許容）
-            if assigned_dates[doc]:
-                min_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_dates[doc])
-                if relax_gap:
-                    if min_gap < 2:  # 緩和時は2日未満がNG
-                        continue
-                else:
-                    if min_gap < 3:  # 通常は3日未満がNG
-                        continue
-
             if assigned_count[doc] >= TARGET_CAP.get(doc, 0):
                 continue
 
@@ -1042,8 +1046,6 @@ def choose_doctor_for_slot(
         candidates = collect_candidates(relax_bh_limit=True)
     if not candidates:
         candidates = collect_candidates(relax_bh_limit=True, relax_ch_kate=True)
-    if not candidates:
-        candidates = collect_candidates(relax_bh_limit=True, relax_ch_kate=True, relax_gap=True)
 
     if not candidates:
         return None
@@ -1107,10 +1109,7 @@ def choose_doctor_for_slot(
         min_imbalance = min(imbalance_score(d) for d in candidates)
         candidates = [d for d in candidates if imbalance_score(d) == min_imbalance]
 
-    # 2 同一病院0回優先
-    no_dup = [d for d in candidates if assigned_hosp_count[d].get(hospital_name, 0) == 0]
-    if no_dup:
-        candidates = no_dup
+    # (削除: 同一病院重複は絶対禁忌として collect_candidates でチェック済み)
 
     # 3 B〜G はカテ表あり優先（ソフト優先）
     if is_BG:
@@ -1138,10 +1137,7 @@ def choose_doctor_for_slot(
     if under_floor:
         candidates = under_floor
 
-    # 1 gap>=3
-    gap_ok = [d for d in candidates if gaps[d] >= 3]
-    if gap_ok:
-        candidates = gap_ok
+    # (削除: gap >= 3 は絶対禁忌として collect_candidates でチェック済み)
 
     # 10 同点なら右側
     return max(candidates, key=lambda d: doctor_col_index[d])
@@ -1275,10 +1271,10 @@ def build_schedule_pattern(seed=0):
                     # 同日重複禁止
                     if date in assigned_dates[d]:
                         return False
-                    # gap1禁止: 連日シフト禁止
+                    # gap >= 3日必須（gap1,2禁止）
                     if assigned_dates[d]:
                         min_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_dates[d])
-                        if min_gap < 2:
+                        if min_gap < 3:
                             return False
                     # 同一病院重複禁止（全病院対象）
                     if assigned_hosp_count[d].get(hosp, 0) >= 1:
@@ -4181,7 +4177,7 @@ def validate_absolute_constraints(pattern_df, verbose=True):
     2. コード2列制限 (ABS-002: B〜Q列のみ)
     3. コード3列制限 (ABS-003: L〜Y列のみ)
     4. 同日当直禁止 (ABS-006)
-    5. gap1禁止（連日シフト禁止、gap >= 2必須）
+    5. gap >= 3日必須（gap1,2禁止）
     6. 同一病院重複禁止（全列対象）
     7. 未割当枠なし
 
@@ -4230,15 +4226,15 @@ def validate_absolute_constraints(pattern_df, verbose=True):
                     "desc": f"同日重複: {doc} → {date.strftime('%Y-%m-%d')} ({count}回)"
                 })
 
-    # 5. gap1チェック（連日シフト禁止）
+    # 5. gap >= 3日チェック（gap1,2禁止）
     for doc, assigns in doc_assignments.items():
         dates = sorted([d for d, _ in assigns])
         for i in range(1, len(dates)):
             gap = (dates[i] - dates[i-1]).days
-            if gap < 2:
+            if gap < 3:
                 violations.append({
-                    "type": "gap1",
-                    "desc": f"連日シフト: {doc} → {dates[i-1].strftime('%Y-%m-%d')} と {dates[i].strftime('%Y-%m-%d')} (gap={gap}日)"
+                    "type": "gap違反",
+                    "desc": f"間隔不足: {doc} → {dates[i-1].strftime('%Y-%m-%d')} と {dates[i].strftime('%Y-%m-%d')} (gap={gap}日, 必須>=3)"
                 })
 
     # 6. 同一病院重複チェック（大学系・外病院両方）
@@ -4731,12 +4727,12 @@ print("  ├─ sheet1〜4: 元データ")
 print("  ├─ pattern_01: 最良スケジュール（絶対禁忌クリア）")
 print("  ├─ pattern_01_今月/累計: サマリー")
 print("  └─ pattern_01_diag: 診断シート")
-print("\n【v5.7.1 絶対禁忌チェック項目】")
+print("\n【v5.7.3 絶対禁忌チェック項目】")
 print("  ├─ コード0割当禁止 (ABS-001)")
 print("  ├─ コード2列制限 (ABS-002: B〜Q列のみ)")
 print("  ├─ コード3列制限 (ABS-003: L〜Y列のみ)")
 print("  ├─ 同日重複禁止 (ABS-006)")
-print("  ├─ 連日シフト禁止 (gap >= 2)")
+print("  ├─ 間隔3日以上必須 (gap >= 3)")
 print("  └─ 同一病院重複禁止（全列対象）")
 print("="*60)
 
