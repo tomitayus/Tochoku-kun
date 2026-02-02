@@ -1,5 +1,15 @@
-# @title 当直くん v5.5 (全fix関数のABS-001完全対応)
+# @title 当直くん v5.6 (絶対禁忌: gap1・外病院重複も完全対応)
 # 修正内容:
+# v5.6 (2026-02-02):
+# - 絶対禁忌にgap1（連日シフト）と外病院重複禁止を追加
+#   - 全てのフォールバックでgap >= 2を強制
+#   - 全てのフォールバックで同一外病院への複数回割当を禁止
+#   - 初期パターン生成のフォールバックに絶対禁忌チェック追加
+#   - fix_hard_constraint_violations: 絶対禁忌チェック追加
+#   - fix_target_cap_violations: 絶対禁忌チェック追加
+#   - fix_bg_over_2_violations: 絶対禁忌チェック追加
+#   - fix_weekday_bg_over_2_violations: 絶対禁忌チェック追加
+#   - fix_unassigned_slots: 絶対禁忌チェック追加
 # v5.5 (2026-02-02):
 # - 全てのfix関数の緊急フォールバックにABS-001チェックを追加
 #   - fix_ch_kate_violations: スワップ時のコード0チェック追加
@@ -217,7 +227,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "5.5"
+VERSION = "5.6"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -1223,21 +1233,41 @@ def build_schedule_pattern(seed=0):
                 assigned_hosp_count=assigned_hosp_count,
             )
             if chosen is None:
-                # フォールバック: コード0は絶対に除外（ABS-001）
+                # フォールバック: 絶対禁忌をすべてチェック
+                # ABS-001: コード0禁止
+                # gap1禁止: 連日シフト禁止（gap >= 2必須）
+                # 外病院重複禁止: 同一外病院への複数回割当禁止
+                hidx = shift_df.columns.get_loc(hosp)
+                is_external = L_COL_INDEX <= hidx <= L_Y_END_INDEX
+
+                def is_valid_fallback(d):
+                    # ABS-001: コード0禁止
+                    if get_avail_code(date, d) == 0:
+                        return False
+                    # gap1禁止: 連日シフト禁止
+                    if assigned_dates[d]:
+                        min_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_dates[d])
+                        if min_gap < 2:
+                            return False
+                    # 外病院重複禁止
+                    if is_external and assigned_hosp_count[d].get(hosp, 0) >= 1:
+                        return False
+                    return True
+
                 remaining = [
                     d for d in doctor_names
                     if assigned_count[d] < TARGET_CAP.get(d, 0)
-                    and get_avail_code(date, d) != 0  # ABS-001: コード0は絶対禁止
+                    and is_valid_fallback(d)
                 ]
                 if remaining:
                     fallback_doc = min(remaining, key=lambda d: (assigned_count[d], doctor_col_index[d]))
                 else:
-                    # TARGET_CAP超過も許容するが、コード0は除外
-                    remaining_any = [d for d in doctor_names if get_avail_code(date, d) != 0]
+                    # TARGET_CAP超過も許容するが、絶対禁忌は維持
+                    remaining_any = [d for d in doctor_names if is_valid_fallback(d)]
                     if remaining_any:
                         fallback_doc = min(remaining_any, key=lambda d: (assigned_count[d], doctor_col_index[d]))
                     else:
-                        # 全員コード0の場合は未割当のまま（None）
+                        # 全員が絶対禁忌に該当する場合は未割当のまま（None）
                         fallback_doc = None
                 if fallback_doc is not None:
                     df.at[ridx, hosp] = fallback_doc
@@ -2336,13 +2366,51 @@ def fix_hard_constraint_violations(pattern_df, max_attempts=50, verbose=True):
                 fixed_in_this_iteration += 1
                 total_fixed += 1
             else:
-                # 緊急フォールバック: 同日重複を避け、ABS-001（コード0）も必ず回避
-                # 同日重複のみ避ける
-                emergency_candidates = [
-                    d for d in doctor_names
-                    if d not in already_assigned_on_date
-                    and get_avail_code(date, d) != 0  # ABS-001: コード0は絶対禁止
-                ]
+                # 緊急フォールバック: 絶対禁忌をすべて回避
+                # 医師の現在の割当日を取得（gap1チェック用）
+                def get_doc_dates(d):
+                    dates = []
+                    for ridx2 in df.index:
+                        dt2 = df.at[ridx2, date_col_shift]
+                        if pd.isna(dt2):
+                            continue
+                        dt2 = pd.to_datetime(dt2).normalize().tz_localize(None)
+                        for h in hospital_cols:
+                            v = df.at[ridx2, h]
+                            if isinstance(v, str) and normalize_name(v) == d:
+                                dates.append(dt2)
+                    return dates
+
+                # 医師の外病院割当回数を取得
+                def get_doc_hosp_count(d, target_hosp):
+                    count = 0
+                    for ridx2 in df.index:
+                        v = df.at[ridx2, target_hosp]
+                        if isinstance(v, str) and normalize_name(v) == d:
+                            count += 1
+                    return count
+
+                is_external = L_COL_INDEX <= col_idx <= L_Y_END_INDEX
+
+                def is_valid_emergency(d):
+                    # 同日重複禁止
+                    if d in already_assigned_on_date:
+                        return False
+                    # ABS-001: コード0禁止
+                    if get_avail_code(date, d) == 0:
+                        return False
+                    # gap1禁止
+                    doc_dates = get_doc_dates(d)
+                    if doc_dates:
+                        min_gap = min(abs((date - dt).days) for dt in doc_dates)
+                        if min_gap < 2:
+                            return False
+                    # 外病院重複禁止
+                    if is_external and get_doc_hosp_count(d, hosp) >= 1:
+                        return False
+                    return True
+
+                emergency_candidates = [d for d in doctor_names if is_valid_emergency(d)]
                 if emergency_candidates:
                     # 全体合計が最も少ない医師を選択
                     emergency_candidates.sort(key=lambda d: prev_total.get(d, 0) + len([1 for h in hospital_cols for ridx2 in df.index if isinstance(df.at[ridx2, h], str) and normalize_name(df.at[ridx2, h]) == d]))
@@ -2353,21 +2421,10 @@ def fix_hard_constraint_violations(pattern_df, max_attempts=50, verbose=True):
                     if verbose:
                         print(f"   ⚠️ 緊急フォールバック: {date.strftime('%Y-%m-%d')} {hosp} → {new_doc}")
                 else:
-                    # 最終手段: コード0以外で同日重複も許容（未割当よりはまし）
-                    final_candidates = [d for d in doctor_names if get_avail_code(date, d) != 0]
-                    if final_candidates:
-                        final_candidates.sort(key=lambda d: prev_total.get(d, 0) + len([1 for h in hospital_cols for ridx2 in df.index if isinstance(df.at[ridx2, h], str) and normalize_name(df.at[ridx2, h]) == d]))
-                        new_doc = final_candidates[0]
-                        df.at[ridx, hosp] = new_doc
-                        fixed_in_this_iteration += 1
-                        total_fixed += 1
-                        if verbose:
-                            print(f"   ⚠️ 最終フォールバック（同日重複あり）: {date.strftime('%Y-%m-%d')} {hosp} → {new_doc}")
-                    else:
-                        # 全員コード0の場合は未割当のままにする
-                        total_failed += 1
-                        if verbose:
-                            print(f"   ❌ 修正不可（全員コード0）: {date.strftime('%Y-%m-%d')} {hosp}")
+                    # 絶対禁忌を満たす候補がいない場合は未割当のまま
+                    total_failed += 1
+                    if verbose:
+                        print(f"   ❌ 修正不可（絶対禁忌回避不可）: {date.strftime('%Y-%m-%d')} {hosp}")
 
         # 進捗がなければループ終了
         # 修正が進まなくてもmax_attemptsまで試行を続ける
@@ -2582,7 +2639,7 @@ def fix_code_2_extra_violations(pattern_df, max_attempts=100, verbose=True):
 
     for attempt in range(max_attempts):
         # 現在の割当回数を再計算
-        counts, *_ = recompute_stats(df)
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
 
         # CODE_2医師でBASE_TARGETを超えている医師を特定
         code_2_over_docs = []
@@ -2665,14 +2722,31 @@ def fix_code_2_extra_violations(pattern_df, max_attempts=100, verbose=True):
                     total_fixed += 1
                     fixed_in_this_iteration += 1
                 else:
-                    # 緊急フォールバック: 制約緩和して誰かを割り当て（未割当防止）
-                    # ABS-001: コード0は絶対禁止
-                    emergency = [
-                        d for d in doctor_names
-                        if d not in already_assigned_on_date
-                        and d != over_doc
-                        and get_avail_code(date, d) != 0
-                    ]
+                    # 緊急フォールバック: 絶対禁忌をすべて回避
+                    col_idx = shift_df.columns.get_loc(hosp)
+                    is_external = L_COL_INDEX <= col_idx <= L_Y_END_INDEX
+
+                    def is_valid_emergency_target(d):
+                        # 同日重複禁止
+                        if d in already_assigned_on_date:
+                            return False
+                        if d == over_doc:
+                            return False
+                        # ABS-001: コード0禁止
+                        if get_avail_code(date, d) == 0:
+                            return False
+                        # gap1禁止
+                        doc_dates = sorted([dt for dt, _ in doc_assignments.get(d, [])])
+                        if doc_dates:
+                            min_gap = min(abs((date - dt).days) for dt in doc_dates)
+                            if min_gap < 2:
+                                return False
+                        # 外病院重複禁止
+                        if is_external and assigned_hosp_count.get(d, {}).get(hosp, 0) >= 1:
+                            return False
+                        return True
+
+                    emergency = [d for d in doctor_names if is_valid_emergency_target(d)]
                     if emergency:
                         emergency.sort(key=lambda d: counts.get(d, 0))
                         new_doc = emergency[0]
@@ -2686,7 +2760,7 @@ def fix_code_2_extra_violations(pattern_df, max_attempts=100, verbose=True):
                     else:
                         # 最終手段: 元の医師を維持（削除しない）
                         if verbose:
-                            print(f"      ⚠️ {over_doc}の{date.strftime('%m/%d')} {hosp}を維持（代替不可）")
+                            print(f"      ⚠️ {over_doc}の{date.strftime('%m/%d')} {hosp}を維持（絶対禁忌回避不可）")
 
         if fixed_in_this_iteration == 0:
             break
@@ -3566,13 +3640,29 @@ def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True)
                         if verbose and attempt < 10:
                             print(f"      {doc}→{new_doc}: {date.strftime('%m/%d')}の大学病院割当を交代")
                     else:
-                        # 緊急フォールバック: 制約緩和して誰かを割り当て（ABS-001は維持）
-                        emergency = [
-                            d for d in doctor_names
-                            if d not in already_on_date
-                            and d != doc
-                            and get_avail_code(date, d) != 0
-                        ]
+                        # 緊急フォールバック: 絶対禁忌をすべて回避
+                        hosp_idx = shift_df.columns.get_loc(hosp)
+                        is_external_hosp = L_COL_INDEX <= hosp_idx <= L_Y_END_INDEX
+
+                        def is_valid_bg_emergency(d):
+                            # 同日重複禁止
+                            if d in already_on_date or d == doc:
+                                return False
+                            # ABS-001: コード0禁止
+                            if get_avail_code(date, d) == 0:
+                                return False
+                            # gap1禁止
+                            d_dates = sorted([dt for dt, _ in doc_assignments.get(d, [])])
+                            if d_dates:
+                                min_gap = min(abs((date - dt).days) for dt in d_dates)
+                                if min_gap < 2:
+                                    return False
+                            # 外病院重複禁止
+                            if is_external_hosp and assigned_hosp_count.get(d, {}).get(hosp, 0) >= 1:
+                                return False
+                            return True
+
+                        emergency = [d for d in doctor_names if is_valid_bg_emergency(d)]
                         if emergency:
                             emergency.sort(key=lambda d: bg_counts.get(d, 0))
                             new_doc = emergency[0]
@@ -3583,7 +3673,7 @@ def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True)
                             # 最終手段: 元の医師を維持（削除しない）
                             df.at[ridx, hosp] = doc
                             if verbose and attempt < 10:
-                                print(f"      {doc}: {date.strftime('%m/%d')}の割当維持（代替不可）")
+                                print(f"      {doc}: {date.strftime('%m/%d')}の割当維持（絶対禁忌回避不可）")
                     fixed_in_this_iteration += 1
                     total_fixed += 1
 
@@ -3738,13 +3828,29 @@ def fix_university_weekday_balance_violations(pattern_df, max_attempts=150, verb
                         if verbose and attempt < 10:
                             print(f"      {doc}→{new_doc}: {date.strftime('%m/%d')}の大学平日割当を交代")
                     else:
-                        # 緊急フォールバック（ABS-001は維持）
-                        emergency = [
-                            d for d in doctor_names
-                            if d not in already_on_date
-                            and d != doc
-                            and get_avail_code(date, d) != 0
-                        ]
+                        # 緊急フォールバック: 絶対禁忌をすべて回避
+                        hosp_idx = shift_df.columns.get_loc(hosp)
+                        is_external_hosp = L_COL_INDEX <= hosp_idx <= L_Y_END_INDEX
+
+                        def is_valid_weekday_emergency(d):
+                            # 同日重複禁止
+                            if d in already_on_date or d == doc:
+                                return False
+                            # ABS-001: コード0禁止
+                            if get_avail_code(date, d) == 0:
+                                return False
+                            # gap1禁止
+                            d_dates = sorted([dt for dt, _ in doc_assignments.get(d, [])])
+                            if d_dates:
+                                min_gap = min(abs((date - dt).days) for dt in d_dates)
+                                if min_gap < 2:
+                                    return False
+                            # 外病院重複禁止
+                            if is_external_hosp and assigned_hosp_count.get(d, {}).get(hosp, 0) >= 1:
+                                return False
+                            return True
+
+                        emergency = [d for d in doctor_names if is_valid_weekday_emergency(d)]
                         if emergency:
                             emergency.sort(key=lambda d: counts.get(d, 0))
                             new_doc = emergency[0]
@@ -3755,7 +3861,7 @@ def fix_university_weekday_balance_violations(pattern_df, max_attempts=150, verb
                             # 最終手段: 元の医師を維持
                             df.at[ridx, hosp] = doc
                             if verbose and attempt < 10:
-                                print(f"      {doc}: {date.strftime('%m/%d')}の割当維持（代替不可）")
+                                print(f"      {doc}: {date.strftime('%m/%d')}の割当維持（絶対禁忌回避不可）")
                     fixed_in_this_iteration += 1
                     total_fixed += 1
                     break
@@ -3948,7 +4054,7 @@ def fix_unassigned_slots(pattern_df, verbose=True):
     df = pattern_df.copy()
     total_fixed = 0
 
-    counts, *_ = recompute_stats(df)
+    counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
 
     for (ridx, hosp), (date, fixed) in slot_meta.items():
         val = df.at[ridx, hosp]
@@ -3979,26 +4085,37 @@ def fix_unassigned_slots(pattern_df, verbose=True):
             candidates.sort(key=lambda d: counts.get(d, 0))
             new_doc = candidates[0]
         else:
-            # 緊急フォールバック: 制約緩和して誰かを割り当て（ABS-001は維持）
-            emergency = [
-                d for d in doctor_names
-                if d not in already_assigned_on_date
-                and get_avail_code(date, d) != 0
-            ]
+            # 緊急フォールバック: 絶対禁忌をすべて回避
+            col_idx = shift_df.columns.get_loc(hosp)
+            is_external = L_COL_INDEX <= col_idx <= L_Y_END_INDEX
+
+            def is_valid_unassigned_fallback(d):
+                # 同日重複禁止
+                if d in already_assigned_on_date:
+                    return False
+                # ABS-001: コード0禁止
+                if get_avail_code(date, d) == 0:
+                    return False
+                # gap1禁止
+                d_dates = sorted([dt for dt, _ in doc_assignments.get(d, [])])
+                if d_dates:
+                    min_gap = min(abs((date - dt).days) for dt in d_dates)
+                    if min_gap < 2:
+                        return False
+                # 外病院重複禁止
+                if is_external and assigned_hosp_count.get(d, {}).get(hosp, 0) >= 1:
+                    return False
+                return True
+
+            emergency = [d for d in doctor_names if is_valid_unassigned_fallback(d)]
             if emergency:
                 emergency.sort(key=lambda d: counts.get(d, 0))
                 new_doc = emergency[0]
             else:
-                # 最終手段: 同日重複も許容するがコード0は除外
-                all_docs = [d for d in doctor_names if get_avail_code(date, d) != 0]
-                if all_docs:
-                    all_docs.sort(key=lambda d: counts.get(d, 0))
-                    new_doc = all_docs[0]
-                else:
-                    # 全員コード0の場合は割当不可（未割当のまま）
-                    if verbose:
-                        print(f"   ❌ 未割当: {date.strftime('%Y-%m-%d')} {hosp}（全員コード0）")
-                    continue
+                # 絶対禁忌を満たす候補がいない場合は未割当のまま
+                if verbose:
+                    print(f"   ❌ 未割当: {date.strftime('%Y-%m-%d')} {hosp}（絶対禁忌回避不可）")
+                continue
 
         df.at[ridx, hosp] = new_doc
         counts[new_doc] = counts.get(new_doc, 0) + 1
