@@ -1,5 +1,13 @@
-# @title 当直くん v6.0.0 (制約体系全面改定)
+# @title 当直くん v6.0.1 (段階的制約緩和)
 # 修正内容:
+# v6.0.1 (2026-02-02):
+# - 段階的制約緩和を実装（ABS-009回避優先）
+#   1. 全制約適用 → 候補なし
+#   2. SEMI緩和 → 候補なし
+#   3. HARD緩和 → 候補なし
+#   4. 緊急フォールバック（ABSのみ）
+# - 全フォールバック関数にABS-004, ABS-005チェック追加
+# - gap制約をgap>=3に統一（以前はgap<2だった箇所を修正）
 # v6.0.0 (2026-02-02):
 # - 制約体系を全面改定
 # - 絶対禁忌(ABS): 11項目
@@ -951,6 +959,7 @@ def choose_doctor_for_slot(
 
     def collect_candidates(
         relax_semi=False,  # v6.0.0: SEMI制約を緩和（sheet3「1」以外も許容）
+        relax_hard=False,  # v6.0.1: HARD制約を緩和（ABS-009回避のため）
     ):
         candidates = []
         for doc in doctor_names:
@@ -1009,7 +1018,7 @@ def choose_doctor_for_slot(
             is_sheet3_one = doc in SHEET3_CODE_1_DOCTORS
 
             # HARD-001: B/I列1回まで（グループA）
-            if is_B_or_I and assigned_bi[doc] >= 1:
+            if not relax_hard and is_B_or_I and assigned_bi[doc] >= 1:
                 # カテなし医師は必須遵守
                 if not is_kate_holder:
                     continue
@@ -1018,7 +1027,7 @@ def choose_doctor_for_slot(
                     continue
 
             # HARD-002: C-H/J-K列1回まで（グループB）
-            if is_CH_or_JK and assigned_chjk[doc] >= 1:
+            if not relax_hard and is_CH_or_JK and assigned_chjk[doc] >= 1:
                 # カテなし医師は必須遵守
                 if not is_kate_holder:
                     continue
@@ -1043,9 +1052,15 @@ def choose_doctor_for_slot(
             candidates.append(doc)
         return candidates
 
+    # v6.0.1: 段階的制約緩和（ABS-009回避優先）
+    # 1. 全制約適用
     candidates = collect_candidates()
+    # 2. SEMI緩和
     if not candidates:
         candidates = collect_candidates(relax_semi=True)
+    # 3. HARD緩和（SEMI緩和済み）
+    if not candidates:
+        candidates = collect_candidates(relax_semi=True, relax_hard=True)
 
     if not candidates:
         return None
@@ -1259,9 +1274,11 @@ def build_schedule_pattern(seed=0):
                 assigned_hosp_count=assigned_hosp_count,
             )
             if chosen is None:
-                # v6.0.0 フォールバック: 絶対禁忌(ABS)をすべてチェック
+                # v6.0.1 フォールバック: 絶対禁忌(ABS)をすべてチェック
                 hidx = shift_df.columns.get_loc(hosp)
                 is_bg_slot = B_COL_INDEX <= hidx <= K_COL_INDEX
+                is_ly_slot = L_COL_INDEX <= hidx <= L_Y_END_INDEX
+                day_of_week = pd.to_datetime(date).weekday()
 
                 def is_valid_fallback(d):
                     code = get_avail_code(date, d)
@@ -1272,7 +1289,13 @@ def build_schedule_pattern(seed=0):
                     if code == 2 and not (B_COL_INDEX <= hidx <= Q_COL_INDEX):
                         return False
                     # ABS-003: コード3はL〜Y列のみ
-                    if code == 3 and not (L_COL_INDEX <= hidx <= L_Y_END_INDEX):
+                    if code == 3 and not is_ly_slot:
+                        return False
+                    # ABS-004: カテ表コードありの日はL〜Y列不可
+                    if is_ly_slot and get_sched_code(date, d):
+                        return False
+                    # ABS-005: 水曜日L〜Y列禁止医師
+                    if day_of_week == 2 and is_ly_slot and d in WED_FORBIDDEN_DOCTORS:
                         return False
                     # ABS-006: 同日重複禁止
                     if date in assigned_dates[d]:
@@ -2430,23 +2453,39 @@ def fix_hard_constraint_violations(pattern_df, max_attempts=50, verbose=True):
                     return count
 
                 is_external = L_COL_INDEX <= col_idx <= L_Y_END_INDEX
+                is_university = B_COL_INDEX <= col_idx <= K_COL_INDEX
+                day_of_week = pd.to_datetime(date).weekday()
 
                 def is_valid_emergency(d):
-                    # 同日重複禁止
+                    # 同日重複禁止 (ABS-006)
                     if d in already_assigned_on_date:
                         return False
+                    code = get_avail_code(date, d)
                     # ABS-001: コード0禁止
-                    if get_avail_code(date, d) == 0:
+                    if code == 0:
                         return False
-                    # gap1禁止
+                    # ABS-002: コード2はB〜Q列のみ
+                    if code == 2 and not (B_COL_INDEX <= col_idx <= Q_COL_INDEX):
+                        return False
+                    # ABS-003: コード3はL〜Y列のみ
+                    if code == 3 and not is_external:
+                        return False
+                    # ABS-004: カテ表コードありの日はL〜Y列不可
+                    if is_external and get_sched_code(date, d):
+                        return False
+                    # ABS-005: 水曜日L〜Y列禁止医師
+                    if day_of_week == 2 and is_external and d in WED_FORBIDDEN_DOCTORS:
+                        return False
+                    # ABS-007: gap >= 3日必須
                     doc_dates = get_doc_dates(d)
                     if doc_dates:
                         min_gap = min(abs((date - dt).days) for dt in doc_dates)
-                        if min_gap < 2:
+                        if min_gap < 3:
                             return False
-                    # 外病院重複禁止
+                    # ABS-008: 外病院重複禁止
                     if is_external and get_doc_hosp_count(d, hosp) >= 1:
                         return False
+                    # ABS-010/011: TARGET_CAPとBG上限は静的チェック困難なためスキップ
                     return True
 
                 emergency_candidates = [d for d in doctor_names if is_valid_emergency(d)]
@@ -2764,23 +2803,38 @@ def fix_code_2_extra_violations(pattern_df, max_attempts=100, verbose=True):
                     # 緊急フォールバック: 絶対禁忌をすべて回避
                     col_idx = shift_df.columns.get_loc(hosp)
                     is_external = L_COL_INDEX <= col_idx <= L_Y_END_INDEX
+                    is_university = B_COL_INDEX <= col_idx <= K_COL_INDEX
+                    day_of_week = pd.to_datetime(date).weekday()
 
                     def is_valid_emergency_target(d):
-                        # 同日重複禁止
+                        # 同日重複禁止 (ABS-006)
                         if d in already_assigned_on_date:
                             return False
                         if d == over_doc:
                             return False
+                        code = get_avail_code(date, d)
                         # ABS-001: コード0禁止
-                        if get_avail_code(date, d) == 0:
+                        if code == 0:
                             return False
-                        # gap1禁止
+                        # ABS-002: コード2はB〜Q列のみ
+                        if code == 2 and not (B_COL_INDEX <= col_idx <= Q_COL_INDEX):
+                            return False
+                        # ABS-003: コード3はL〜Y列のみ
+                        if code == 3 and not is_external:
+                            return False
+                        # ABS-004: カテ表コードありの日はL〜Y列不可
+                        if is_external and get_sched_code(date, d):
+                            return False
+                        # ABS-005: 水曜日L〜Y列禁止医師
+                        if day_of_week == 2 and is_external and d in WED_FORBIDDEN_DOCTORS:
+                            return False
+                        # ABS-007: gap >= 3日必須
                         doc_dates = sorted([dt for dt, _ in doc_assignments.get(d, [])])
                         if doc_dates:
                             min_gap = min(abs((date - dt).days) for dt in doc_dates)
-                            if min_gap < 2:
+                            if min_gap < 3:
                                 return False
-                        # 外病院重複禁止
+                        # ABS-008: 外病院重複禁止
                         if is_external and assigned_hosp_count.get(d, {}).get(hosp, 0) >= 1:
                             return False
                         return True
@@ -3682,21 +3736,36 @@ def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True)
                         # 緊急フォールバック: 絶対禁忌をすべて回避
                         hosp_idx = shift_df.columns.get_loc(hosp)
                         is_external_hosp = L_COL_INDEX <= hosp_idx <= L_Y_END_INDEX
+                        is_university_hosp = B_COL_INDEX <= hosp_idx <= K_COL_INDEX
+                        day_of_week = pd.to_datetime(date).weekday()
 
                         def is_valid_bg_emergency(d):
-                            # 同日重複禁止
+                            # 同日重複禁止 (ABS-006)
                             if d in already_on_date or d == doc:
                                 return False
+                            code = get_avail_code(date, d)
                             # ABS-001: コード0禁止
-                            if get_avail_code(date, d) == 0:
+                            if code == 0:
                                 return False
-                            # gap1禁止
+                            # ABS-002: コード2はB〜Q列のみ
+                            if code == 2 and not (B_COL_INDEX <= hosp_idx <= Q_COL_INDEX):
+                                return False
+                            # ABS-003: コード3はL〜Y列のみ
+                            if code == 3 and not is_external_hosp:
+                                return False
+                            # ABS-004: カテ表コードありの日はL〜Y列不可
+                            if is_external_hosp and get_sched_code(date, d):
+                                return False
+                            # ABS-005: 水曜日L〜Y列禁止医師
+                            if day_of_week == 2 and is_external_hosp and d in WED_FORBIDDEN_DOCTORS:
+                                return False
+                            # ABS-007: gap >= 3日必須
                             d_dates = sorted([dt for dt, _ in doc_assignments.get(d, [])])
                             if d_dates:
                                 min_gap = min(abs((date - dt).days) for dt in d_dates)
-                                if min_gap < 2:
+                                if min_gap < 3:
                                     return False
-                            # 外病院重複禁止
+                            # ABS-008: 外病院重複禁止
                             if is_external_hosp and assigned_hosp_count.get(d, {}).get(hosp, 0) >= 1:
                                 return False
                             return True
@@ -3870,21 +3939,36 @@ def fix_university_weekday_balance_violations(pattern_df, max_attempts=150, verb
                         # 緊急フォールバック: 絶対禁忌をすべて回避
                         hosp_idx = shift_df.columns.get_loc(hosp)
                         is_external_hosp = L_COL_INDEX <= hosp_idx <= L_Y_END_INDEX
+                        is_university_hosp = B_COL_INDEX <= hosp_idx <= K_COL_INDEX
+                        day_of_week = pd.to_datetime(date).weekday()
 
                         def is_valid_weekday_emergency(d):
-                            # 同日重複禁止
+                            # 同日重複禁止 (ABS-006)
                             if d in already_on_date or d == doc:
                                 return False
+                            code = get_avail_code(date, d)
                             # ABS-001: コード0禁止
-                            if get_avail_code(date, d) == 0:
+                            if code == 0:
                                 return False
-                            # gap1禁止
+                            # ABS-002: コード2はB〜Q列のみ
+                            if code == 2 and not (B_COL_INDEX <= hosp_idx <= Q_COL_INDEX):
+                                return False
+                            # ABS-003: コード3はL〜Y列のみ
+                            if code == 3 and not is_external_hosp:
+                                return False
+                            # ABS-004: カテ表コードありの日はL〜Y列不可
+                            if is_external_hosp and get_sched_code(date, d):
+                                return False
+                            # ABS-005: 水曜日L〜Y列禁止医師
+                            if day_of_week == 2 and is_external_hosp and d in WED_FORBIDDEN_DOCTORS:
+                                return False
+                            # ABS-007: gap >= 3日必須
                             d_dates = sorted([dt for dt, _ in doc_assignments.get(d, [])])
                             if d_dates:
                                 min_gap = min(abs((date - dt).days) for dt in d_dates)
-                                if min_gap < 2:
+                                if min_gap < 3:
                                     return False
-                            # 外病院重複禁止
+                            # ABS-008: 外病院重複禁止
                             if is_external_hosp and assigned_hosp_count.get(d, {}).get(hosp, 0) >= 1:
                                 return False
                             return True
@@ -4135,21 +4219,36 @@ def fix_unassigned_slots(pattern_df, verbose=True):
             # 緊急フォールバック: 絶対禁忌をすべて回避
             col_idx = shift_df.columns.get_loc(hosp)
             is_external = L_COL_INDEX <= col_idx <= L_Y_END_INDEX
+            is_university = B_COL_INDEX <= col_idx <= K_COL_INDEX
+            day_of_week = pd.to_datetime(date).weekday()
 
             def is_valid_unassigned_fallback(d):
-                # 同日重複禁止
+                # 同日重複禁止 (ABS-006)
                 if d in already_assigned_on_date:
                     return False
+                code = get_avail_code(date, d)
                 # ABS-001: コード0禁止
-                if get_avail_code(date, d) == 0:
+                if code == 0:
                     return False
-                # gap1禁止
+                # ABS-002: コード2はB〜Q列のみ
+                if code == 2 and not (B_COL_INDEX <= col_idx <= Q_COL_INDEX):
+                    return False
+                # ABS-003: コード3はL〜Y列のみ
+                if code == 3 and not is_external:
+                    return False
+                # ABS-004: カテ表コードありの日はL〜Y列不可
+                if is_external and get_sched_code(date, d):
+                    return False
+                # ABS-005: 水曜日L〜Y列禁止医師
+                if day_of_week == 2 and is_external and d in WED_FORBIDDEN_DOCTORS:
+                    return False
+                # ABS-007: gap >= 3日必須
                 d_dates = sorted([dt for dt, _ in doc_assignments.get(d, [])])
                 if d_dates:
                     min_gap = min(abs((date - dt).days) for dt in d_dates)
-                    if min_gap < 2:
+                    if min_gap < 3:
                         return False
-                # 外病院重複禁止
+                # ABS-008: 外病院重複禁止
                 if is_external and assigned_hosp_count.get(d, {}).get(hosp, 0) >= 1:
                     return False
                 return True
