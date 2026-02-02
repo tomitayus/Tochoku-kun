@@ -1276,8 +1276,8 @@ def build_schedule_pattern(seed=0):
             if chosen is None:
                 # v6.0.1 フォールバック: 絶対禁忌(ABS)をすべてチェック
                 hidx = shift_df.columns.get_loc(hosp)
-                is_bg_slot = B_COL_INDEX <= hidx <= K_COL_INDEX
-                is_ly_slot = L_COL_INDEX <= hidx <= L_Y_END_INDEX
+                is_bg_slot_here = B_COL_INDEX <= hidx <= K_COL_INDEX
+                is_ly_slot_here = L_COL_INDEX <= hidx <= L_Y_END_INDEX
                 day_of_week = pd.to_datetime(date).weekday()
 
                 def is_valid_fallback(d):
@@ -1289,13 +1289,13 @@ def build_schedule_pattern(seed=0):
                     if code == 2 and not (B_COL_INDEX <= hidx <= Q_COL_INDEX):
                         return False
                     # ABS-003: コード3はL〜Y列のみ
-                    if code == 3 and not is_ly_slot:
+                    if code == 3 and not is_ly_slot_here:
                         return False
                     # ABS-004: カテ表コードありの日はL〜Y列不可
-                    if is_ly_slot and get_sched_code(date, d):
+                    if is_ly_slot_here and get_sched_code(date, d):
                         return False
                     # ABS-005: 水曜日L〜Y列禁止医師
-                    if day_of_week == 2 and is_ly_slot and d in WED_FORBIDDEN_DOCTORS:
+                    if day_of_week == 2 and is_ly_slot_here and d in WED_FORBIDDEN_DOCTORS:
                         return False
                     # ABS-006: 同日重複禁止
                     if date in assigned_dates[d]:
@@ -1312,7 +1312,7 @@ def build_schedule_pattern(seed=0):
                     if assigned_count[d] >= TARGET_CAP.get(d, 0):
                         return False
                     # ABS-011: 大学系2回まで
-                    if is_bg_slot and assigned_bg[d] >= 2:
+                    if is_bg_slot_here and assigned_bg[d] >= 2:
                         return False
                     return True
 
