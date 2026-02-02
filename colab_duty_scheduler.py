@@ -1,5 +1,9 @@
-# @title 当直くん v5.3 (制約ID体系・ABS-001修正)
+# @title 当直くん v5.4 (初期パターン生成のABS-001修正)
 # 修正内容:
+# v5.4 (2026-02-02):
+# - 初期パターン生成のフォールバックでABS-001チェックを追加
+#   - collect_candidatesで候補がいない場合のフォールバックでコード0を除外
+#   - 全員コード0の日は未割当のまま（後でfix関数で処理）
 # v5.3 (2026-01-31):
 # - 制約ID体系を導入（ABS-001〜006, HARD-001〜004, SEMI-001〜004, SOFT-001〜014）
 #   - 28個の制約ID定数を追加
@@ -206,7 +210,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "5.3"
+VERSION = "5.4"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -1212,51 +1216,66 @@ def build_schedule_pattern(seed=0):
                 assigned_hosp_count=assigned_hosp_count,
             )
             if chosen is None:
-                remaining = [d for d in doctor_names if assigned_count[d] < TARGET_CAP.get(d, 0)]
+                # フォールバック: コード0は絶対に除外（ABS-001）
+                remaining = [
+                    d for d in doctor_names
+                    if assigned_count[d] < TARGET_CAP.get(d, 0)
+                    and get_avail_code(date, d) != 0  # ABS-001: コード0は絶対禁止
+                ]
                 if remaining:
                     fallback_doc = min(remaining, key=lambda d: (assigned_count[d], doctor_col_index[d]))
                 else:
-                    fallback_doc = min(doctor_names, key=lambda d: (assigned_count[d], doctor_col_index[d]))
-                df.at[ridx, hosp] = fallback_doc
-                chosen = fallback_doc
+                    # TARGET_CAP超過も許容するが、コード0は除外
+                    remaining_any = [d for d in doctor_names if get_avail_code(date, d) != 0]
+                    if remaining_any:
+                        fallback_doc = min(remaining_any, key=lambda d: (assigned_count[d], doctor_col_index[d]))
+                    else:
+                        # 全員コード0の場合は未割当のまま（None）
+                        fallback_doc = None
+                if fallback_doc is not None:
+                    df.at[ridx, hosp] = fallback_doc
+                    chosen = fallback_doc
+                # fallback_doc が None の場合は未割当のまま（後続処理をスキップ）
             else:
                 df.at[ridx, hosp] = chosen
 
-            assigned_count[chosen] += 1
-            assigned_dates[chosen].add(date)
-            assigned_hosp_count[chosen][hosp] += 1
+            # chosen が None でなければカウント更新
+            if chosen is not None:
+                assigned_count[chosen] += 1
+                assigned_dates[chosen].add(date)
+                assigned_hosp_count[chosen][hosp] += 1
 
-            hidx = shift_df.columns.get_loc(hosp)
-            if B_COL_INDEX <= hidx <= K_COL_INDEX:
-                assigned_bg[chosen] += 1
-                if B_COL_INDEX <= hidx <= E_COL_INDEX:
-                    assigned_be[chosen] += 1
-                elif F_COL_INDEX <= hidx <= G_COL_INDEX:
-                    assigned_fg[chosen] += 1
-                bg_cat[chosen][classify_bg_category(date, hosp)] += 1
-            elif L_COL_INDEX <= hidx <= L_Y_END_INDEX:
-                assigned_ht[chosen] += 1
+                hidx = shift_df.columns.get_loc(hosp)
+                if B_COL_INDEX <= hidx <= K_COL_INDEX:
+                    assigned_bg[chosen] += 1
+                    if B_COL_INDEX <= hidx <= E_COL_INDEX:
+                        assigned_be[chosen] += 1
+                    elif F_COL_INDEX <= hidx <= G_COL_INDEX:
+                        assigned_fg[chosen] += 1
+                    bg_cat[chosen][classify_bg_category(date, hosp)] += 1
+                elif L_COL_INDEX <= hidx <= L_Y_END_INDEX:
+                    assigned_ht[chosen] += 1
 
-            # B〜H列のカウント
-            if B_H_START_INDEX <= hidx <= B_H_END_INDEX:
-                assigned_bh[chosen] += 1
+                # B〜H列のカウント
+                if B_H_START_INDEX <= hidx <= B_H_END_INDEX:
+                    assigned_bh[chosen] += 1
 
-            dow = date.weekday()
-            weekday = dow < 5
-            holi_flag = (
-                is_holiday(date)
-                or dow >= 5
-                or (weekday and hidx in (C_COL_INDEX, D_COL_INDEX, F_COL_INDEX, G_COL_INDEX))
-            )
-            if holi_flag:
-                assigned_weekend[chosen] += 1
-            else:
-                assigned_weekday[chosen] += 1
+                dow = date.weekday()
+                weekday = dow < 5
+                holi_flag = (
+                    is_holiday(date)
+                    or dow >= 5
+                    or (weekday and hidx in (C_COL_INDEX, D_COL_INDEX, F_COL_INDEX, G_COL_INDEX))
+                )
+                if holi_flag:
+                    assigned_weekend[chosen] += 1
+                else:
+                    assigned_weekday[chosen] += 1
 
-            if is_bk_slot(hidx):
-                assigned_bk[chosen] += 1
-            elif is_ly_slot(hidx):
-                assigned_ly[chosen] += 1
+                if is_bk_slot(hidx):
+                    assigned_bk[chosen] += 1
+                elif is_ly_slot(hidx):
+                    assigned_ly[chosen] += 1
 
     return (
         df,
