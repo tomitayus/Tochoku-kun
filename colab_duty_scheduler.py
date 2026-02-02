@@ -1,5 +1,10 @@
-# @title 当直くん v5.6 (絶対禁忌: gap1・外病院重複も完全対応)
+# @title 当直くん v5.7 (最適化後の絶対禁忌チェック強化)
 # 修正内容:
+# v5.7 (2026-02-02):
+# - 局所探索（local_search_swap）で外病院重複チェックを追加
+#   - gap_violations > 0 に加えて external_hosp_dup_violations > 0 も拒否
+# - 公平性バランス関数で外病院重複チェックを追加
+#   - min_docを外病院に移動する前に重複チェック
 # v5.6 (2026-02-02):
 # - 絶対禁忌にgap1（連日シフト）と外病院重複禁止を追加
 #   - 全てのフォールバックでgap >= 2を強制
@@ -227,7 +232,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "5.6"
+VERSION = "5.7"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -1895,9 +1900,10 @@ def local_search_swap(pattern_df, max_iters=2000, patience=800, refresh_every=20
             ly2,
         )
 
-        # gap違反が1以上のパターンは採用しない（ハード制約）
+        # 絶対禁忌チェック: gap違反または外病院重複があれば拒否
         new_gap_violations = new_metrics.get("gap_violations", 0)
-        if new_gap_violations > 0:
+        new_external_hosp_dup = new_metrics.get("external_hosp_dup_violations", 0)
+        if new_gap_violations > 0 or new_external_hosp_dup > 0:
             # revert
             df.at[r1, h1], df.at[r2, h2] = doc1, doc2
             if d1 != d2:
@@ -3990,6 +3996,14 @@ def fix_fairness_imbalance(pattern_df, max_attempts=200, verbose=True):
 
                     if not gap_ok:
                         continue
+
+                    # 外病院重複チェック
+                    hosp_idx = shift_df.columns.get_loc(hosp)
+                    is_external = L_COL_INDEX <= hosp_idx <= L_Y_END_INDEX
+                    if is_external:
+                        # min_docがこの外病院に既に割り当てられている場合は拒否
+                        if assigned_hosp_count.get(min_doc, {}).get(hosp, 0) >= 1:
+                            continue
 
                     # max_docから削除した場合のgap違反チェック
                     max_doc_dates = sorted([d for d, h in doc_assignments.get(max_doc, []) if h != hosp or d != date])
