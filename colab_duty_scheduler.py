@@ -4608,44 +4608,31 @@ balance_patterns = sorted(
     reverse=True
 )
 
-# v5.7.1: 最良パターンを1つだけ選択（複数軸で評価し、総合的に最良のものを選ぶ）
-# 優先順位: 1. 絶対禁忌クリア → 2. gap違反0 → 3. 公平性 → 4. 総合スコア
-best_pattern = None
-if valid_patterns:
-    # 絶対禁忌クリアかつgap違反0のパターンを最優先
-    abs_and_gap_ok = [e for e in valid_patterns
-                      if e.get("absolute_constraints_valid", False)
-                      and e["metrics_after"].get("gap_violations", 0) == 0]
-    if abs_and_gap_ok:
-        # 公平性（max_minus_min_total_active）が小さい順にソート
-        abs_and_gap_ok.sort(key=lambda e: (
-            e["metrics_after"].get("max_minus_min_total_active", 0),
-            -e["raw_after"]
-        ))
-        best_pattern = abs_and_gap_ok[0]
-        best_pattern["axis_label"] = "総合最良"
-    else:
-        # 絶対禁忌クリアのみのパターン
-        abs_ok = [e for e in valid_patterns if e.get("absolute_constraints_valid", False)]
-        if abs_ok:
-            abs_ok.sort(key=lambda e: (
-                e["metrics_after"].get("gap_violations", 0),
-                e["metrics_after"].get("max_minus_min_total_active", 0),
-                -e["raw_after"]
-            ))
-            best_pattern = abs_ok[0]
-            best_pattern["axis_label"] = "絶対禁忌クリア"
-        else:
-            # フォールバック: 総合スコア最高
-            overall_sorted = sorted(valid_patterns, key=lambda e: e["raw_after"], reverse=True)
-            best_pattern = overall_sorted[0]
-            best_pattern["axis_label"] = "総合スコア"
+# v6.0.0: 絶対禁忌クリアのパターンのみを選択し、スコア上位3つを出力
+# 絶対禁忌違反のパターンは採用しない
+abs_valid_patterns = [e for e in valid_patterns if e.get("absolute_constraints_valid", False)]
 
-top_patterns = [best_pattern] if best_pattern else []
+if abs_valid_patterns:
+    # スコア順にソート（raw_after降順）
+    abs_valid_patterns.sort(key=lambda e: e["raw_after"], reverse=True)
+    # 上位3パターンを選択
+    top_patterns = abs_valid_patterns[:3]
+    for i, p in enumerate(top_patterns):
+        p["axis_label"] = f"スコア{i+1}位"
+    print(f"\n✅ 絶対禁忌クリア: {len(abs_valid_patterns)}/{len(valid_patterns)} パターン")
+    print(f"   → 上位3パターンを出力")
+else:
+    # 絶対禁忌クリアのパターンがない場合は警告
+    print(f"\n⚠️  絶対禁忌をクリアするパターンがありません")
+    print(f"   全パターンから上位3を選択（参考用）")
+    valid_patterns.sort(key=lambda e: e["raw_after"], reverse=True)
+    top_patterns = valid_patterns[:3]
+    for i, p in enumerate(top_patterns):
+        p["axis_label"] = f"参考{i+1}位（違反あり）"
 
 # ソート済みリストも作成（後方互換性のため）
 refined_sorted = sorted(valid_patterns, key=lambda e: e["raw_after"], reverse=True)
-TOP_OUTPUT_PATTERNS = 1  # v5.7.1: 1パターンのみ出力
+TOP_OUTPUT_PATTERNS = len(top_patterns)  # v6.0.0: 最大3パターン出力
 
 scores_df = pd.DataFrame(score_rows).sort_values(["raw_score", "seed"], ascending=[False, True]).reset_index(drop=True)
 
@@ -4662,28 +4649,23 @@ refined_df = pd.DataFrame([
 ]).sort_values(["raw_after", "seed"], ascending=[False, True]).reset_index(drop=True)
 
 # =========================
-# v5.7.1: 最良パターン評価
+# v6.0.0: 上位3パターン評価
 # =========================
 print("\n" + "="*60)
-print("  📊 最良パターン評価 (v5.7.1)")
+print("  📊 上位パターン評価 (v6.0.0)")
 print("="*60)
 
 if top_patterns:
-    pattern = top_patterns[0]
-    axis_label = pattern.get('axis_label', '総合スコア')
-    gap_v = pattern['metrics_after'].get('gap_violations', 0)
-    cap_v = pattern['metrics_after'].get('cap_violations', 0)
-    fairness = pattern['metrics_after'].get('max_minus_min_total_active', 0)
-    hosp_dup = pattern['metrics_after'].get('hospital_dup_violations', 0)
-    abs_valid = pattern.get('absolute_constraints_valid', False)
-    abs_viols = len(pattern.get('absolute_violations', []))
-
-    print(f"\n  評価軸: {axis_label}")
-    print(f"  絶対禁忌: {'✅ クリア' if abs_valid else f'❌ {abs_viols}件違反'}")
-    print(f"  gap違反: {gap_v}")
-    print(f"  cap違反: {cap_v}")
-    print(f"  同一病院重複: {hosp_dup}")
-    print(f"  公平性(max-min): {fairness}")
+    print(f"\n{'順位':<6}{'スコア':>10}{'公平性':>8}{'ABS違反':>8}{'seed':>8}")
+    print("-"*44)
+    for i, pattern in enumerate(top_patterns, 1):
+        raw_score = pattern.get('raw_after', 0)
+        fairness = pattern['metrics_after'].get('max_minus_min_total_active', 0)
+        abs_valid = pattern.get('absolute_constraints_valid', False)
+        abs_viols = len(pattern.get('absolute_violations', []))
+        seed = pattern.get('seed', 0)
+        status = "✅" if abs_valid else f"❌{abs_viols}"
+        print(f"{i}位{'':<4}{raw_score:>10.0f}{fairness:>8}{status:>8}{seed:>8}")
 else:
     print("\n  ⚠️ 有効なパターンが生成されませんでした")
 
