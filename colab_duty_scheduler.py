@@ -1,5 +1,10 @@
-# @title 当直くん v5.7.1 (最適化無効化バージョン - 絶対禁忌厳守)
+# @title 当直くん v5.7.2 (絶対禁忌完全遵守 + 単一パターン出力)
 # 修正内容:
+# v5.7.2 (2026-02-02):
+# - 絶対禁忌にABS-002/ABS-003（コード2/3列制限）を追加
+# - 同一病院重複チェックを全列（大学系+外病院）に拡張
+# - 出力を1パターンのみに変更（3パターン同一問題の解消）
+# - パターン選択ロジックを改善（絶対禁忌クリア優先）
 # v5.7.1 (2026-02-02):
 # - 最適化処理を無効化（バグ発生源の排除）
 #   - LOCAL_SEARCH_ENABLED = False（局所探索スキップ）
@@ -239,7 +244,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "5.7.1"
+VERSION = "5.7.2"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -1248,22 +1253,35 @@ def build_schedule_pattern(seed=0):
             if chosen is None:
                 # フォールバック: 絶対禁忌をすべてチェック
                 # ABS-001: コード0禁止
+                # ABS-002: コード2はB〜Q列のみ
+                # ABS-003: コード3はL〜Y列のみ
                 # gap1禁止: 連日シフト禁止（gap >= 2必須）
-                # 外病院重複禁止: 同一外病院への複数回割当禁止
+                # 同日重複禁止
+                # 同一病院重複禁止（大学系・外病院両方）
                 hidx = shift_df.columns.get_loc(hosp)
                 is_external = L_COL_INDEX <= hidx <= L_Y_END_INDEX
 
                 def is_valid_fallback(d):
+                    code = get_avail_code(date, d)
                     # ABS-001: コード0禁止
-                    if get_avail_code(date, d) == 0:
+                    if code == 0:
+                        return False
+                    # ABS-002: コード2はB〜Q列のみ（R-Y列禁止）
+                    if code == 2 and not (B_COL_INDEX <= hidx <= Q_COL_INDEX):
+                        return False
+                    # ABS-003: コード3はL〜Y列のみ（大学系禁止）
+                    if code == 3 and not (L_COL_INDEX <= hidx <= L_Y_END_INDEX):
+                        return False
+                    # 同日重複禁止
+                    if date in assigned_dates[d]:
                         return False
                     # gap1禁止: 連日シフト禁止
                     if assigned_dates[d]:
                         min_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_dates[d])
                         if min_gap < 2:
                             return False
-                    # 外病院重複禁止
-                    if is_external and assigned_hosp_count[d].get(hosp, 0) >= 1:
+                    # 同一病院重複禁止（全病院対象）
+                    if assigned_hosp_count[d].get(hosp, 0) >= 1:
                         return False
                     return True
 
@@ -4160,10 +4178,12 @@ def validate_absolute_constraints(pattern_df, verbose=True):
 
     チェック項目:
     1. コード0割当禁止 (ABS-001)
-    2. 同日当直禁止 (ABS-006)
-    3. gap1禁止（連日シフト禁止、gap >= 2必須）
-    4. 同一外病院重複禁止
-    5. 未割当枠なし
+    2. コード2列制限 (ABS-002: B〜Q列のみ)
+    3. コード3列制限 (ABS-003: L〜Y列のみ)
+    4. 同日当直禁止 (ABS-006)
+    5. gap1禁止（連日シフト禁止、gap >= 2必須）
+    6. 同一病院重複禁止（全列対象）
+    7. 未割当枠なし
 
     Returns:
         (violations_list, is_valid)
@@ -4172,20 +4192,36 @@ def validate_absolute_constraints(pattern_df, verbose=True):
 
     counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(pattern_df)
 
-    # 1. コード0割当チェック
+    # 1. コード0割当チェック (ABS-001)
+    # 2. コード2列制限チェック (ABS-002)
+    # 3. コード3列制限チェック (ABS-003)
     for (ridx, hosp), (date, fixed) in slot_meta.items():
         val = pattern_df.at[ridx, hosp]
         if isinstance(val, str):
             doc = normalize_name(val)
             if doc in doctor_names:
                 code = get_avail_code(date, doc)
+                hidx = shift_df.columns.get_loc(hosp)
+                # ABS-001: コード0禁止
                 if code == 0:
                     violations.append({
                         "type": "ABS-001",
                         "desc": f"コード0割当: {doc} → {date.strftime('%Y-%m-%d')} {hosp}"
                     })
+                # ABS-002: コード2はB〜Q列のみ（R-Y列禁止）
+                if code == 2 and not (B_COL_INDEX <= hidx <= Q_COL_INDEX):
+                    violations.append({
+                        "type": "ABS-002",
+                        "desc": f"コード2列違反: {doc} → {date.strftime('%Y-%m-%d')} {hosp} (列{hidx}はB〜Q外)"
+                    })
+                # ABS-003: コード3はL〜Y列のみ（大学系禁止）
+                if code == 3 and not (L_COL_INDEX <= hidx <= L_Y_END_INDEX):
+                    violations.append({
+                        "type": "ABS-003",
+                        "desc": f"コード3列違反: {doc} → {date.strftime('%Y-%m-%d')} {hosp} (列{hidx}はL〜Y外)"
+                    })
 
-    # 2. 同日当直チェック
+    # 4. 同日当直チェック (ABS-006)
     for date, doc_count in build_date_doc_count(pattern_df).items():
         for doc, count in doc_count.items():
             if count > 1:
@@ -4194,7 +4230,7 @@ def validate_absolute_constraints(pattern_df, verbose=True):
                     "desc": f"同日重複: {doc} → {date.strftime('%Y-%m-%d')} ({count}回)"
                 })
 
-    # 3. gap1チェック（連日シフト）
+    # 5. gap1チェック（連日シフト禁止）
     for doc, assigns in doc_assignments.items():
         dates = sorted([d for d, _ in assigns])
         for i in range(1, len(dates)):
@@ -4205,18 +4241,16 @@ def validate_absolute_constraints(pattern_df, verbose=True):
                     "desc": f"連日シフト: {doc} → {dates[i-1].strftime('%Y-%m-%d')} と {dates[i].strftime('%Y-%m-%d')} (gap={gap}日)"
                 })
 
-    # 4. 同一外病院重複チェック
+    # 6. 同一病院重複チェック（大学系・外病院両方）
     for doc, hosp_dict in assigned_hosp_count.items():
         for hosp, count in hosp_dict.items():
-            hidx = shift_df.columns.get_loc(hosp)
-            is_external = L_COL_INDEX <= hidx <= L_Y_END_INDEX
-            if is_external and count > 1:
+            if count > 1:
                 violations.append({
-                    "type": "外病院重複",
-                    "desc": f"同一外病院重複: {doc} → {hosp} ({count}回)"
+                    "type": "病院重複",
+                    "desc": f"同一病院重複: {doc} → {hosp} ({count}回)"
                 })
 
-    # 5. 未割当枠チェック
+    # 7. 未割当枠チェック
     for (ridx, hosp), (date, fixed) in slot_meta.items():
         val = pattern_df.at[ridx, hosp]
         if not isinstance(val, str):
@@ -4550,42 +4584,44 @@ balance_patterns = sorted(
     reverse=True
 )
 
-# 各軸から最良パターンを選択
-top_patterns = []
-selected_seeds = set()
+# v5.7.1: 最良パターンを1つだけ選択（複数軸で評価し、総合的に最良のものを選ぶ）
+# 優先順位: 1. 絶対禁忌クリア → 2. gap違反0 → 3. 公平性 → 4. 総合スコア
+best_pattern = None
+if valid_patterns:
+    # 絶対禁忌クリアかつgap違反0のパターンを最優先
+    abs_and_gap_ok = [e for e in valid_patterns
+                      if e.get("absolute_constraints_valid", False)
+                      and e["metrics_after"].get("gap_violations", 0) == 0]
+    if abs_and_gap_ok:
+        # 公平性（max_minus_min_total_active）が小さい順にソート
+        abs_and_gap_ok.sort(key=lambda e: (
+            e["metrics_after"].get("max_minus_min_total_active", 0),
+            -e["raw_after"]
+        ))
+        best_pattern = abs_and_gap_ok[0]
+        best_pattern["axis_label"] = "総合最良"
+    else:
+        # 絶対禁忌クリアのみのパターン
+        abs_ok = [e for e in valid_patterns if e.get("absolute_constraints_valid", False)]
+        if abs_ok:
+            abs_ok.sort(key=lambda e: (
+                e["metrics_after"].get("gap_violations", 0),
+                e["metrics_after"].get("max_minus_min_total_active", 0),
+                -e["raw_after"]
+            ))
+            best_pattern = abs_ok[0]
+            best_pattern["axis_label"] = "絶対禁忌クリア"
+        else:
+            # フォールバック: 総合スコア最高
+            overall_sorted = sorted(valid_patterns, key=lambda e: e["raw_after"], reverse=True)
+            best_pattern = overall_sorted[0]
+            best_pattern["axis_label"] = "総合スコア"
 
-# 軸1: 公平性重視
-if fairness_patterns and fairness_patterns[0]["seed"] not in selected_seeds:
-    fairness_patterns[0]["axis_label"] = "公平性重視"
-    top_patterns.append(fairness_patterns[0])
-    selected_seeds.add(fairness_patterns[0]["seed"])
-
-# 軸2: gap違反回避重視
-if gap_patterns and gap_patterns[0]["seed"] not in selected_seeds:
-    gap_patterns[0]["axis_label"] = "連続当直回避重視"
-    top_patterns.append(gap_patterns[0])
-    selected_seeds.add(gap_patterns[0]["seed"])
-
-# 軸3: バランス重視
-if balance_patterns and balance_patterns[0]["seed"] not in selected_seeds:
-    balance_patterns[0]["axis_label"] = "バランス重視"
-    top_patterns.append(balance_patterns[0])
-    selected_seeds.add(balance_patterns[0]["seed"])
-
-# まだ3パターン未満の場合、総合スコアから補填
-if len(top_patterns) < 3:
-    overall_sorted = sorted(valid_patterns, key=lambda e: e["raw_after"], reverse=True)
-    for pattern in overall_sorted:
-        if pattern["seed"] not in selected_seeds:
-            pattern["axis_label"] = "総合スコア"
-            top_patterns.append(pattern)
-            selected_seeds.add(pattern["seed"])
-            if len(top_patterns) >= 3:
-                break
+top_patterns = [best_pattern] if best_pattern else []
 
 # ソート済みリストも作成（後方互換性のため）
 refined_sorted = sorted(valid_patterns, key=lambda e: e["raw_after"], reverse=True)
-TOP_OUTPUT_PATTERNS = len(top_patterns)
+TOP_OUTPUT_PATTERNS = 1  # v5.7.1: 1パターンのみ出力
 
 scores_df = pd.DataFrame(score_rows).sort_values(["raw_score", "seed"], ascending=[False, True]).reset_index(drop=True)
 
@@ -4602,24 +4638,30 @@ refined_df = pd.DataFrame([
 ]).sort_values(["raw_after", "seed"], ascending=[False, True]).reset_index(drop=True)
 
 # =========================
-# TOPパターン評価（テーブル表示）
+# v5.7.1: 最良パターン評価
 # =========================
 print("\n" + "="*60)
-print("  📊 TOPパターン評価")
+print("  📊 最良パターン評価 (v5.7.1)")
 print("="*60)
 
-# テーブルヘッダー
-print(f"\n{'順位':<6}{'評価軸':<14}{'gap違反':>8}{'cap違反':>8}{'公平性':>6}{'修正数':>8}")
-print("-"*56)
-
-for rank, pattern in enumerate(top_patterns, 1):
+if top_patterns:
+    pattern = top_patterns[0]
     axis_label = pattern.get('axis_label', '総合スコア')
-    axis_short = {"公平性重視": "公平性", "連続当直回避重視": "gap回避", "バランス重視": "バランス", "総合スコア": "総合"}.get(axis_label, axis_label[:6])
-    gap_v = pattern['metrics_after']['gap_violations']
+    gap_v = pattern['metrics_after'].get('gap_violations', 0)
     cap_v = pattern['metrics_after'].get('cap_violations', 0)
     fairness = pattern['metrics_after'].get('max_minus_min_total_active', 0)
-    fixes = pattern.get('violations_fixed', 0)
-    print(f"{rank}位{'':<4}{axis_short:<14}{gap_v:>8}{cap_v:>8}{fairness:>6}{fixes:>8}")
+    hosp_dup = pattern['metrics_after'].get('hospital_dup_violations', 0)
+    abs_valid = pattern.get('absolute_constraints_valid', False)
+    abs_viols = len(pattern.get('absolute_violations', []))
+
+    print(f"\n  評価軸: {axis_label}")
+    print(f"  絶対禁忌: {'✅ クリア' if abs_valid else f'❌ {abs_viols}件違反'}")
+    print(f"  gap違反: {gap_v}")
+    print(f"  cap違反: {cap_v}")
+    print(f"  同一病院重複: {hosp_dup}")
+    print(f"  公平性(max-min): {fairness}")
+else:
+    print("\n  ⚠️ 有効なパターンが生成されませんでした")
 
 # =========================
 # 出力（pattern + summary + diagnostics）
@@ -4686,13 +4728,16 @@ print("="*60)
 print(f"\n📥 出力: {output_path}")
 print("\n【内容】")
 print("  ├─ sheet1〜4: 元データ")
-print("  ├─ pattern_01〜03: TOP3スケジュール候補")
-print("  ├─ pattern_XX_今月/累計: サマリー")
-print("  └─ pattern_XX_diag: 診断シート")
-print("\n【確認手順】")
-print("  1. 3つの評価軸から最適パターンを選択")
-print("  2. 診断シートで違反・重複を確認")
-print("  3. サマリーで医師ごとの偏りを確認")
+print("  ├─ pattern_01: 最良スケジュール（絶対禁忌クリア）")
+print("  ├─ pattern_01_今月/累計: サマリー")
+print("  └─ pattern_01_diag: 診断シート")
+print("\n【v5.7.1 絶対禁忌チェック項目】")
+print("  ├─ コード0割当禁止 (ABS-001)")
+print("  ├─ コード2列制限 (ABS-002: B〜Q列のみ)")
+print("  ├─ コード3列制限 (ABS-003: L〜Y列のみ)")
+print("  ├─ 同日重複禁止 (ABS-006)")
+print("  ├─ 連日シフト禁止 (gap >= 2)")
+print("  └─ 同一病院重複禁止（全列対象）")
 print("="*60)
 
 if COLAB_AVAILABLE:
