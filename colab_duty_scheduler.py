@@ -4238,10 +4238,17 @@ def fix_unassigned_slots(pattern_df, verbose=True):
                 already_assigned_on_date.add(normalize_name(v))
 
         # 候補医師を探す（制約チェック付き）
+        # v6.0.2: ABS-010/ABS-011も厳守（CAP+1まで、大学系3回まで）
+        col_idx = shift_df.columns.get_loc(hosp)
+        is_university = B_COL_INDEX <= col_idx <= K_COL_INDEX
+        is_external = L_COL_INDEX <= col_idx <= L_Y_END_INDEX
+
         candidates = [
             d for d in doctor_names
             if d not in already_assigned_on_date
             and can_assign_doc_to_slot(d, date, hosp)
+            and counts.get(d, 0) < TARGET_CAP.get(d, 0) + 1   # ABS-010: CAP+1まで
+            and (not is_university or bg_counts.get(d, 0) < 3)  # ABS-011: 大学系3回まで
         ]
 
         if candidates:
@@ -4250,9 +4257,6 @@ def fix_unassigned_slots(pattern_df, verbose=True):
             new_doc = candidates[0]
         else:
             # 緊急フォールバック: 絶対禁忌をすべて回避
-            col_idx = shift_df.columns.get_loc(hosp)
-            is_external = L_COL_INDEX <= col_idx <= L_Y_END_INDEX
-            is_university = B_COL_INDEX <= col_idx <= K_COL_INDEX
             day_of_week = pd.to_datetime(date).weekday()
 
             def is_valid_unassigned_fallback(d):
@@ -4284,6 +4288,12 @@ def fix_unassigned_slots(pattern_df, verbose=True):
                 # ABS-008: 外病院重複禁止
                 if is_external and assigned_hosp_count.get(d, {}).get(hosp, 0) >= 1:
                     return False
+                # v6.0.2: ABS-010: TARGET_CAP+1まで
+                if counts.get(d, 0) >= TARGET_CAP.get(d, 0) + 1:
+                    return False
+                # v6.0.2: ABS-011: 大学系3回まで
+                if is_university and bg_counts.get(d, 0) >= 3:
+                    return False
                 return True
 
             emergency = [d for d in doctor_names if is_valid_unassigned_fallback(d)]
@@ -4298,6 +4308,15 @@ def fix_unassigned_slots(pattern_df, verbose=True):
 
         df.at[ridx, hosp] = new_doc
         counts[new_doc] = counts.get(new_doc, 0) + 1
+        # v6.0.2: 追跡変数も更新（連続割当の制約チェック精度向上）
+        if is_university:
+            bg_counts[new_doc] = bg_counts.get(new_doc, 0) + 1
+        if new_doc not in assigned_hosp_count:
+            assigned_hosp_count[new_doc] = {}
+        assigned_hosp_count[new_doc][hosp] = assigned_hosp_count[new_doc].get(hosp, 0) + 1
+        if new_doc not in doc_assignments:
+            doc_assignments[new_doc] = []
+        doc_assignments[new_doc].append((date, hosp))
         total_fixed += 1
 
         if verbose:
