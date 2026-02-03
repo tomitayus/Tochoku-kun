@@ -1,5 +1,16 @@
-# @title 当直くん v6.0.1 (段階的制約緩和)
+# @title 当直くん v6.0.2 (未割当解消・パターン多様化)
 # 修正内容:
+# v6.0.2 (2026-02-03):
+# - 未割り当てスロット解消
+#   - fix_unassigned_slots()を最適化OFF時でも実行（セーフティネット）
+#   - fix_unassigned_slots内にABS-010/ABS-011チェック追加（n+2防止）
+#   - fix_unassigned_slots内の追跡変数を正確に更新（bg_counts, hosp_count, doc_assignments）
+#   - ABS-010/ABS-011は全箇所で厳守（TARGET_CAP緩和は行わない）
+#   - W_UNASSIGNED=500に設定（未割当パターンをスコアで下位に）
+# - パターン多様性の向上
+#   - tie-breakをdeterministic(右側優先)からrandom.choiceに変更
+#   - 出力パターン3つを3軸評価（公平性・gap回避・バランス）で選択
+#   - 同じseedの重複を排除して異なるパターンを提示
 # v6.0.1 (2026-02-02):
 # - 段階的制約緩和を実装（ABS-009回避優先）
 #   1. 全制約適用 → 候補なし
@@ -227,7 +238,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "6.0.0"
+VERSION = "6.0.2"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -277,7 +288,7 @@ W_BG_HT_DIFF = 100         # SOFT-003: 大学/外病院差（差3以上ペナル
 W_GAP = 0                  # ABS-007で対応
 W_HOSP_DUP = 0             # ABS-008で対応
 W_EXTERNAL_HOSP_DUP = 0    # ABS-008で対応
-W_UNASSIGNED = 0           # ABS-009で対応
+W_UNASSIGNED = 500         # v6.0.2: 未割当ペナルティ（fix_unassigned_slots有効化に伴い復活）
 W_CAP = 0                  # ABS-010で対応
 W_BG_SPREAD = 0            # 削除（簡略化）
 W_HT_SPREAD = 0            # 削除（簡略化）
@@ -1053,6 +1064,7 @@ def choose_doctor_for_slot(
         return candidates
 
     # v6.0.1: 段階的制約緩和（ABS-009回避優先）
+    # ABS制約（010/011含む）は常に厳守、SEMI/HARDのみ段階的に緩和
     # 1. 全制約適用
     candidates = collect_candidates()
     # 2. SEMI緩和
@@ -1154,8 +1166,9 @@ def choose_doctor_for_slot(
 
     # (削除: gap >= 3 は絶対禁忌として collect_candidates でチェック済み)
 
-    # 10 同点なら右側
-    return max(candidates, key=lambda d: doctor_col_index[d])
+    # 10 同点ならランダム選択（パターン多様性のため）
+    # v6.0.2: deterministic tie-break から random.choice に変更
+    return random.choice(candidates)
 
 # =========================
 # 1ヶ月分生成（greedy）
@@ -1308,7 +1321,7 @@ def build_schedule_pattern(seed=0):
                     # ABS-008: 同一病院重複禁止
                     if assigned_hosp_count[d].get(hosp, 0) >= 1:
                         return False
-                    # ABS-010: TARGET_CAP遵守
+                    # ABS-010: TARGET_CAP厳守
                     if assigned_count[d] >= TARGET_CAP.get(d, 0):
                         return False
                     # ABS-011: 大学系2回まで
@@ -4205,10 +4218,17 @@ def fix_unassigned_slots(pattern_df, verbose=True):
                 already_assigned_on_date.add(normalize_name(v))
 
         # 候補医師を探す（制約チェック付き）
+        # v6.0.2: ABS-010/ABS-011も厳守（CAP+1まで、大学系3回まで）
+        col_idx = shift_df.columns.get_loc(hosp)
+        is_university = B_COL_INDEX <= col_idx <= K_COL_INDEX
+        is_external = L_COL_INDEX <= col_idx <= L_Y_END_INDEX
+
         candidates = [
             d for d in doctor_names
             if d not in already_assigned_on_date
             and can_assign_doc_to_slot(d, date, hosp)
+            and counts.get(d, 0) < TARGET_CAP.get(d, 0)        # ABS-010: TARGET_CAP厳守
+            and (not is_university or bg_counts.get(d, 0) < 2)  # ABS-011: 大学系2回まで
         ]
 
         if candidates:
@@ -4217,9 +4237,6 @@ def fix_unassigned_slots(pattern_df, verbose=True):
             new_doc = candidates[0]
         else:
             # 緊急フォールバック: 絶対禁忌をすべて回避
-            col_idx = shift_df.columns.get_loc(hosp)
-            is_external = L_COL_INDEX <= col_idx <= L_Y_END_INDEX
-            is_university = B_COL_INDEX <= col_idx <= K_COL_INDEX
             day_of_week = pd.to_datetime(date).weekday()
 
             def is_valid_unassigned_fallback(d):
@@ -4251,6 +4268,12 @@ def fix_unassigned_slots(pattern_df, verbose=True):
                 # ABS-008: 外病院重複禁止
                 if is_external and assigned_hosp_count.get(d, {}).get(hosp, 0) >= 1:
                     return False
+                # ABS-010: TARGET_CAP厳守
+                if counts.get(d, 0) >= TARGET_CAP.get(d, 0):
+                    return False
+                # ABS-011: 大学系2回まで
+                if is_university and bg_counts.get(d, 0) >= 2:
+                    return False
                 return True
 
             emergency = [d for d in doctor_names if is_valid_unassigned_fallback(d)]
@@ -4265,6 +4288,15 @@ def fix_unassigned_slots(pattern_df, verbose=True):
 
         df.at[ridx, hosp] = new_doc
         counts[new_doc] = counts.get(new_doc, 0) + 1
+        # v6.0.2: 追跡変数も更新（連続割当の制約チェック精度向上）
+        if is_university:
+            bg_counts[new_doc] = bg_counts.get(new_doc, 0) + 1
+        if new_doc not in assigned_hosp_count:
+            assigned_hosp_count[new_doc] = {}
+        assigned_hosp_count[new_doc][hosp] = assigned_hosp_count[new_doc].get(hosp, 0) + 1
+        if new_doc not in doc_assignments:
+            doc_assignments[new_doc] = []
+        doc_assignments[new_doc].append((date, hosp))
         total_fixed += 1
 
         if verbose:
@@ -4583,13 +4615,22 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         else:
             improved_df = final_df
     else:
-        # v5.7.1: 最適化無効 - 初期パターンをそのまま使用
-        final_df = improved_df
+        # v6.0.2: 最適化無効でも fix_unassigned_slots のみ実行
         fix_count = fail_count = 0
         code_2_fix_count = cap_fix_count = univ_min_fix_count = 0
         ch_kate_fix_count = gap_fix_count = bg_ht_fix_count = 0
         ext_dup_fix_count = univ_over_2_fix_count = univ_weekday_fix_count = 0
-        fairness_fix_count = unassigned_fix_count = 0
+        fairness_fix_count = 0
+
+        # 未割り当てスロットのみ修正（絶対禁忌は遵守）
+        final_df, unassigned_success, unassigned_fix_count = fix_unassigned_slots(
+            improved_df, verbose=False
+        )
+        if unassigned_fix_count > 0:
+            counts_tmp, bg_tmp, ht_tmp, wd_tmp, we_tmp, bk_tmp, ly_tmp, bg_cat_tmp, *_ = recompute_stats(final_df)
+            sc2, raw2, met2 = evaluate_schedule_with_raw(
+                final_df, counts_tmp, bg_tmp, ht_tmp, wd_tmp, we_tmp, bk_tmp, ly_tmp
+            )
 
     # v5.7.1: 絶対禁忌の最終検証
     violations, is_valid = validate_absolute_constraints(final_df, verbose=False)
@@ -4707,19 +4748,66 @@ balance_patterns = sorted(
     reverse=True
 )
 
-# v6.0.0: 絶対禁忌クリアのパターンのみを選択し、スコア上位3つを出力
-# 絶対禁忌違反のパターンは採用しない
+# v6.0.2: 絶対禁忌クリアのパターンから3軸で多様な候補を選択
 abs_valid_patterns = [e for e in valid_patterns if e.get("absolute_constraints_valid", False)]
 
 if abs_valid_patterns:
-    # スコア順にソート（raw_after降順）
-    abs_valid_patterns.sort(key=lambda e: e["raw_after"], reverse=True)
-    # 上位3パターンを選択
-    top_patterns = abs_valid_patterns[:3]
-    for i, p in enumerate(top_patterns):
-        p["axis_label"] = f"スコア{i+1}位"
+    # 3軸評価で多様なパターンを選択（同じseedの重複を排除）
+    # 軸1: 公平性重視
+    fairness_abs = sorted(
+        abs_valid_patterns,
+        key=lambda e: (
+            -e["metrics_after"].get('cap_violations', 0) * 1000,
+            -e["metrics_after"].get('max_minus_min_total_active', 0) * 100,
+            -e["metrics_after"].get('bg_ht_imbalance_violations', 0) * 50,
+            e["raw_after"]
+        ),
+        reverse=True
+    )
+    # 軸2: gap・重複回避重視
+    gap_abs = sorted(
+        abs_valid_patterns,
+        key=lambda e: (
+            -e["metrics_after"].get('gap_violations', 0) * 1000,
+            -e["metrics_after"].get('external_hosp_dup_violations', 0) * 100,
+            -e["metrics_after"].get('hospital_dup_violations', 0) * 50,
+            e["raw_after"]
+        ),
+        reverse=True
+    )
+    # 軸3: バランス重視
+    balance_abs = sorted(
+        abs_valid_patterns,
+        key=lambda e: (
+            -e["metrics_after"].get('bg_ht_imbalance_violations', 0) * 1000,
+            -e["metrics_after"].get('bg_weekday_weekend_imbalance', 0) * 100,
+            -e["metrics_after"].get('bg_over_2_violations', 0) * 100,
+            e["raw_after"]
+        ),
+        reverse=True
+    )
+
+    axis_labels = ["公平性重視", "gap回避重視", "バランス重視"]
+    axis_bests = [fairness_abs[0], gap_abs[0], balance_abs[0]]
+    top_patterns = []
+    seen_seeds = set()
+    for label, best in zip(axis_labels, axis_bests):
+        if best["seed"] not in seen_seeds:
+            best["axis_label"] = label
+            top_patterns.append(best)
+            seen_seeds.add(best["seed"])
+    # 3つに満たない場合はスコア順で補充
+    if len(top_patterns) < 3:
+        abs_valid_patterns.sort(key=lambda e: e["raw_after"], reverse=True)
+        for e in abs_valid_patterns:
+            if e["seed"] not in seen_seeds:
+                e["axis_label"] = f"スコア上位"
+                top_patterns.append(e)
+                seen_seeds.add(e["seed"])
+                if len(top_patterns) >= 3:
+                    break
     print(f"\n✅ 絶対禁忌クリア: {len(abs_valid_patterns)}/{len(valid_patterns)} パターン")
-    print(f"   → 上位3パターンを出力")
+    print(f"   → 3軸評価で{len(top_patterns)}パターンを出力")
 else:
     # 絶対禁忌クリアのパターンがない場合は警告
     print(f"\n⚠️  絶対禁忌をクリアするパターンがありません")
