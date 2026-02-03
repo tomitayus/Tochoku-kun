@@ -3,8 +3,9 @@
 # v6.0.2 (2026-02-03):
 # - 未割り当てスロット解消
 #   - fix_unassigned_slots()を最適化OFF時でも実行（セーフティネット）
-#   - collect_candidates()に段階4,5を追加（ABS-010/011を段階的に緩和）
-#   - フォールバック処理でもABS-010(CAP+1)/ABS-011(大学3回)を段階的に緩和
+#   - fix_unassigned_slots内にABS-010/ABS-011チェック追加（n+2防止）
+#   - fix_unassigned_slots内の追跡変数を正確に更新（bg_counts, hosp_count, doc_assignments）
+#   - ABS-010/ABS-011は全箇所で厳守（TARGET_CAP緩和は行わない）
 #   - W_UNASSIGNED=500に設定（未割当パターンをスコアで下位に）
 # - パターン多様性の向上
 #   - tie-breakをdeterministic(右側優先)からrandom.choiceに変更
@@ -970,8 +971,6 @@ def choose_doctor_for_slot(
     def collect_candidates(
         relax_semi=False,  # v6.0.0: SEMI制約を緩和（sheet3「1」以外も許容）
         relax_hard=False,  # v6.0.1: HARD制約を緩和（ABS-009回避のため）
-        relax_cap=False,   # v6.0.2: ABS-010緩和（TARGET_CAP+1まで許容）
-        relax_bg=False,    # v6.0.2: ABS-011緩和（大学系3回まで許容）
     ):
         candidates = []
         for doc in doctor_names:
@@ -1016,15 +1015,11 @@ def choose_doctor_for_slot(
                 continue
 
             # ABS-010: TARGET_CAP遵守（n超過禁止）
-            cap_limit = TARGET_CAP.get(doc, 0)
-            if relax_cap:
-                cap_limit += 1  # v6.0.2: 未割当回避のため+1まで許容
-            if assigned_count[doc] >= cap_limit:
+            if assigned_count[doc] >= TARGET_CAP.get(doc, 0):
                 continue
 
             # ABS-011: 大学系2回まで（B-K列合計）
-            bg_limit = 3 if relax_bg else 2  # v6.0.2: 未割当回避のため3回まで許容
-            if is_BG and assigned_bg[doc] >= bg_limit:
+            if is_BG and assigned_bg[doc] >= 2:
                 continue
 
             # === ハード制約（HARD）: カテなし医師は必須遵守 ===
@@ -1068,7 +1063,8 @@ def choose_doctor_for_slot(
             candidates.append(doc)
         return candidates
 
-    # v6.0.2: 段階的制約緩和（ABS-009回避優先）
+    # v6.0.1: 段階的制約緩和（ABS-009回避優先）
+    # ABS制約（010/011含む）は常に厳守、SEMI/HARDのみ段階的に緩和
     # 1. 全制約適用
     candidates = collect_candidates()
     # 2. SEMI緩和
@@ -1077,12 +1073,6 @@ def choose_doctor_for_slot(
     # 3. HARD緩和（SEMI緩和済み）
     if not candidates:
         candidates = collect_candidates(relax_semi=True, relax_hard=True)
-    # 4. ABS-010緩和（TARGET_CAP+1）
-    if not candidates:
-        candidates = collect_candidates(relax_semi=True, relax_hard=True, relax_cap=True)
-    # 5. ABS-011緩和（大学系3回まで）
-    if not candidates:
-        candidates = collect_candidates(relax_semi=True, relax_hard=True, relax_cap=True, relax_bg=True)
 
     if not candidates:
         return None
@@ -1303,7 +1293,7 @@ def build_schedule_pattern(seed=0):
                 is_ly_slot_here = L_COL_INDEX <= hidx <= L_Y_END_INDEX
                 day_of_week = pd.to_datetime(date).weekday()
 
-                def is_valid_fallback(d, allow_cap_plus1=False, allow_bg3=False):
+                def is_valid_fallback(d):
                     code = get_avail_code(date, d)
                     # ABS-001: コード0禁止
                     if code == 0:
@@ -1331,25 +1321,15 @@ def build_schedule_pattern(seed=0):
                     # ABS-008: 同一病院重複禁止
                     if assigned_hosp_count[d].get(hosp, 0) >= 1:
                         return False
-                    # ABS-010: TARGET_CAP遵守
-                    cap_lim = TARGET_CAP.get(d, 0) + (1 if allow_cap_plus1 else 0)
-                    if assigned_count[d] >= cap_lim:
+                    # ABS-010: TARGET_CAP厳守
+                    if assigned_count[d] >= TARGET_CAP.get(d, 0):
                         return False
-                    # ABS-011: 大学系2回まで（緩和時3回まで）
-                    bg_lim = 3 if allow_bg3 else 2
-                    if is_bg_slot_here and assigned_bg[d] >= bg_lim:
+                    # ABS-011: 大学系2回まで
+                    if is_bg_slot_here and assigned_bg[d] >= 2:
                         return False
                     return True
 
-                # v6.0.2: 段階的フォールバック（未割当を減らす）
-                # 段階1: 全ABS制約
                 remaining = [d for d in doctor_names if is_valid_fallback(d)]
-                # 段階2: ABS-010緩和（CAP+1）
-                if not remaining:
-                    remaining = [d for d in doctor_names if is_valid_fallback(d, allow_cap_plus1=True)]
-                # 段階3: ABS-010+ABS-011緩和
-                if not remaining:
-                    remaining = [d for d in doctor_names if is_valid_fallback(d, allow_cap_plus1=True, allow_bg3=True)]
                 if remaining:
                     fallback_doc = min(remaining, key=lambda d: (assigned_count[d], doctor_col_index[d]))
                 else:
@@ -4247,8 +4227,8 @@ def fix_unassigned_slots(pattern_df, verbose=True):
             d for d in doctor_names
             if d not in already_assigned_on_date
             and can_assign_doc_to_slot(d, date, hosp)
-            and counts.get(d, 0) < TARGET_CAP.get(d, 0) + 1   # ABS-010: CAP+1まで
-            and (not is_university or bg_counts.get(d, 0) < 3)  # ABS-011: 大学系3回まで
+            and counts.get(d, 0) < TARGET_CAP.get(d, 0)        # ABS-010: TARGET_CAP厳守
+            and (not is_university or bg_counts.get(d, 0) < 2)  # ABS-011: 大学系2回まで
         ]
 
         if candidates:
@@ -4288,11 +4268,11 @@ def fix_unassigned_slots(pattern_df, verbose=True):
                 # ABS-008: 外病院重複禁止
                 if is_external and assigned_hosp_count.get(d, {}).get(hosp, 0) >= 1:
                     return False
-                # v6.0.2: ABS-010: TARGET_CAP+1まで
-                if counts.get(d, 0) >= TARGET_CAP.get(d, 0) + 1:
+                # ABS-010: TARGET_CAP厳守
+                if counts.get(d, 0) >= TARGET_CAP.get(d, 0):
                     return False
-                # v6.0.2: ABS-011: 大学系3回まで
-                if is_university and bg_counts.get(d, 0) >= 3:
+                # ABS-011: 大学系2回まで
+                if is_university and bg_counts.get(d, 0) >= 2:
                     return False
                 return True
 
