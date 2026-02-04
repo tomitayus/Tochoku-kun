@@ -1,17 +1,18 @@
-# @title 当直くん v6.2.0 (固定割当ABS検証 + gap/dup事前バリデーション)
+# @title 当直くん v6.2.0 (固定割当の制約除外 + fix関数保護)
 # 修正内容:
 # v6.2.0 (2026-02-04):
-# - 固定割当（事前割当）のABS制約バリデーションを追加
-#   - sheet1に医師名が直接記載されている固定割当に対して、ABS制約を検証
-#   - ABS-001（コード0禁止）違反: 固定割当を無効化し、自動枠（free slot）に変換
-#   - ABS-002/003（コード2/3の列制約）違反: 同上
-#   - ABS-004（カテ当番日の外病院禁止）違反: 同上
-#   - ABS-006（水曜日L-Y禁止医師）違反: 同上
-#   - 違反検出時に警告メッセージを出力し、preassigned_countも修正
-#   - これにより、別月のデータで事前割当の可否コード不整合による違反を防止
-# - 固定割当の同日重複・gap<3チェックを追加
-#   - 同日に複数の固定割当がある場合、2件目以降をfree slotに変換
-#   - gap<3日の固定割当がある場合、後発をfree slotに変換
+# - 固定割当（事前割当）を制約違反の検出・ペナルティ計算から除外
+#   - sheet1に医師名が直接記載された固定割当は意図的な配置であるため、
+#     ABS/SEMI/SOFT全ての制約チェック対象から除外する
+#   - 固定割当が片方でも含まれるgap<3はペナルティ対象外
+#   - 固定割当による同一病院重複もペナルティ対象外
+#   - build_hard_constraint_violationsで固定割当スロットをスキップ
+#   - C-H列カテ当番違反チェックでも固定割当をスキップ
+# - fix関数が固定割当を移動・削除しないよう保護
+#   - is_preassigned_slot()ヘルパー関数を追加
+#   - 全fix関数（gap/dup/cap/code2/code12/imbalance/over2/weekday）で
+#     固定割当スロットを移動対象から除外
+#   - 固定割当は意図的な配置のため、最適化で変更してはならない
 # v6.1.0 (2026-02-04):
 # - gap>=3上限によるTARGET_CAP自動調整
 #   - 各医師の利用可能日分布からgap>=3で可能な最大割当数を計算
@@ -740,95 +741,6 @@ for ridx in shift_df.index:
         if is_slot_value(val):
             slots_by_date[date]["free"].append((ridx, hosp))
             total_slots += 1
-
-# =========================
-# v6.2.0: 固定割当のABS制約バリデーション
-# sheet1に直接書かれた医師名が、ABS制約を満たしているかチェック
-# 違反がある場合は固定割当を解除し、自動枠（free slot）に変換
-# =========================
-preassigned_invalid = []  # 無効な固定割当のリスト（警告出力用）
-preassigned_dates_by_doc = defaultdict(list)  # 医師ごとの固定割当日（gap/同日チェック用）
-
-# まず全固定割当を日付順に収集
-all_preassigned = []
-for date in sorted(slots_by_date.keys()):
-    for ridx, hosp, doc in slots_by_date[date]["preassigned"]:
-        all_preassigned.append((date, ridx, hosp, doc))
-
-# ABS制約チェック + 同日重複 + gap<3チェック
-invalid_set = set()  # (date, ridx, hosp) のセット
-for date, ridx, hosp, doc in all_preassigned:
-    hidx = shift_df.columns.get_loc(hosp)
-    code = get_avail_code(date, doc)
-    sched_code = get_sched_code(date, doc)
-    dow = date.weekday()
-    reason = None
-
-    # ABS-001: コード0禁止
-    if code == 0:
-        reason = f"ABS-001: {doc}の可否コードが0（割当不可）"
-
-    # ABS-002: コード2はB〜Q列のみ
-    elif code == 2 and not (B_COL_INDEX <= hidx <= Q_COL_INDEX):
-        reason = f"ABS-002: {doc}はコード2（B〜Q列のみ）だが列{hidx}({hosp})に割当"
-
-    # ABS-003: コード3はL〜Y列のみ
-    elif code == 3 and not (L_COL_INDEX <= hidx <= L_Y_END_INDEX):
-        reason = f"ABS-003: {doc}はコード3（L〜Y列のみ）だが列{hidx}({hosp})に割当"
-
-    # ABS-004: カテ表コードありの日はL〜Y列不可
-    elif L_COL_INDEX <= hidx <= L_Y_END_INDEX and sched_code:
-        reason = f"ABS-004: {doc}はカテ当番({sched_code})がある日に外病院({hosp})に割当"
-
-    # ABS-006: 水曜日L〜Y列禁止医師
-    elif dow == 2 and L_COL_INDEX <= hidx <= L_Y_END_INDEX and doc in WED_FORBIDDEN_DOCTORS:
-        reason = f"ABS-006: {doc}は水曜日のL〜Y列({hosp})禁止"
-
-    # ABS-005: 同日重複チェック
-    if reason is None and date in preassigned_dates_by_doc[doc]:
-        reason = f"ABS-005: {doc}は{date.strftime('%m/%d')}に既に固定割当あり（同日重複）"
-
-    # ABS-007: gap<3チェック
-    if reason is None and preassigned_dates_by_doc[doc]:
-        min_gap = min(abs((date - d).days) for d in preassigned_dates_by_doc[doc])
-        if min_gap < 3:
-            reason = f"ABS-007: {doc}の固定割当間隔が{min_gap}日（3日未満）"
-
-    if reason:
-        invalid_set.add((date, ridx, hosp))
-        preassigned_invalid.append({
-            "date": date,
-            "ridx": ridx,
-            "hosp": hosp,
-            "doc": doc,
-            "reason": reason,
-        })
-    else:
-        preassigned_dates_by_doc[doc].append(date)
-
-# 無効な固定割当をfree slotに変換
-if preassigned_invalid:
-    print(f"\n⚠️ 固定割当のABS制約違反を{len(preassigned_invalid)}件検出 → 自動枠に変換")
-    for item in preassigned_invalid:
-        date = item["date"]
-        ridx = item["ridx"]
-        hosp = item["hosp"]
-        doc = item["doc"]
-        reason = item["reason"]
-        print(f"   ├─ {date.strftime('%Y-%m-%d')} {hosp}: {reason}")
-
-        # slots_by_dateから固定割当を削除し、free slotに変換
-        slots_by_date[date]["preassigned"] = [
-            (r, h, d) for r, h, d in slots_by_date[date]["preassigned"]
-            if not (r == ridx and h == hosp)
-        ]
-        slots_by_date[date]["free"].append((ridx, hosp))
-        preassigned_count[doc] -= 1
-
-        # sheet1のDataFrameも1に戻す（自動枠として扱うため）
-        shift_df.at[ridx, hosp] = 1
-
-    print(f"   └─ {len(preassigned_invalid)}件を自動枠に変換完了")
 
 if len(doctor_names) == 0:
     raise ValueError("❌ sheet2 に医師名がありません")
@@ -1779,8 +1691,10 @@ def evaluate_schedule_with_raw(
         fairness_penalty = max(0, diff_total - 1)
 
     # gap(4日未満) と 同一病院重複
-    dates_by_doc = defaultdict(list)
+    # v6.2.0: 各割当が固定割当かどうかも記録（gap/dup計算で固定割当を除外するため）
+    dates_by_doc = defaultdict(list)  # doc -> [(date, is_preassigned), ...]
     hosp_counts_by_doc = {doc: defaultdict(int) for doc in doctor_names}
+    hosp_preassigned_counts = {doc: defaultdict(int) for doc in doctor_names}  # 固定割当分
 
     for ridx in pattern_df.index:
         date = pattern_df.at[ridx, date_col_shift]
@@ -1791,14 +1705,20 @@ def evaluate_schedule_with_raw(
             val = pattern_df.at[ridx, hosp]
             val_norm = normalize_name(val) if isinstance(val, str) else ""  # 🔧 FIX
             if val_norm in doctor_names:
-                dates_by_doc[val_norm].append(date)
+                is_pre = is_preassigned_slot(ridx, hosp)
+                dates_by_doc[val_norm].append((date, is_pre))
                 hosp_counts_by_doc[val_norm][hosp] += 1
+                if is_pre:
+                    hosp_preassigned_counts[val_norm][hosp] += 1
 
     gap_violations = 0
-    for doc, dlist in dates_by_doc.items():
-        dlist = sorted(dlist)
-        for i in range(1, len(dlist)):
-            if (dlist[i] - dlist[i - 1]).days < 3:
+    for doc, date_flags in dates_by_doc.items():
+        sorted_dates = sorted(date_flags, key=lambda x: x[0])
+        for i in range(1, len(sorted_dates)):
+            if (sorted_dates[i][0] - sorted_dates[i - 1][0]).days < 3:
+                # v6.2.0: 固定割当が片方でも含まれるgapは許容（意図的な配置）
+                if sorted_dates[i][1] or sorted_dates[i - 1][1]:
+                    continue
                 gap_violations += 1
 
     hosp_dup_violations = 0
@@ -1807,6 +1727,8 @@ def evaluate_schedule_with_raw(
         for hosp, c in hdict.items():
             # CC分を除外（CCは特別シフトなので重複カウントから除外）
             c_no_cc = c - cc_hosp_counts.get(doc, {}).get(hosp, 0)
+            # v6.2.0: 固定割当分も除外（固定割当による重複は許容）
+            c_no_cc -= hosp_preassigned_counts.get(doc, {}).get(hosp, 0)
             if c_no_cc > 1:
                 # 病院が外病院（L～Y列）かどうかを判定
                 hidx = shift_df.columns.get_loc(hosp)
@@ -1887,6 +1809,7 @@ def evaluate_schedule_with_raw(
 
     # C-H列（休日大学系）カテ当番違反
     # カテ当番保有医師がその日にカテ当番なしでC-H列に割り当てられている場合
+    # v6.2.0: 固定割当は許容（意図的な配置のため）
     ch_kate_violations = 0
     for ridx in pattern_df.index:
         date = pattern_df.at[ridx, date_col_shift]
@@ -1894,6 +1817,9 @@ def evaluate_schedule_with_raw(
             continue
         date = pd.to_datetime(date).normalize().tz_localize(None)
         for hosp in hospital_cols:
+            # v6.2.0: 固定割当は許容
+            if is_preassigned_slot(ridx, hosp):
+                continue
             idx = shift_df.columns.get_loc(hosp)
             if not is_ch_slot(idx):
                 continue
@@ -2342,6 +2268,17 @@ def build_summaries(pattern_df, counts, bg_counts, ht_counts, wd_counts, we_coun
 # 診断シート生成（偏り & gap違反一覧）
 # =========================
 def build_gap_details(doc_assignments):
+    """gap違反（3日未満の間隔）の詳細リストを生成
+    v6.2.0: 固定割当が含まれるgapは除外（意図的な配置のため）
+    """
+    # 各(date, hosp)が固定割当かどうかを逆引きするため、slot_metaからhosp逆引き表を構築
+    def _is_preassigned_assignment(date, hosp):
+        """doc_assignmentsの(date,hosp)が固定割当かを判定"""
+        for (ridx, h), (d, fixed) in slot_meta.items():
+            if h == hosp and d == date and fixed:
+                return True
+        return False
+
     rows = []
     for doc, assigns in doc_assignments.items():
         assigns_sorted = sorted(assigns, key=lambda x: (x[0], x[1]))
@@ -2350,6 +2287,9 @@ def build_gap_details(doc_assignments):
             d_cur, h_cur = assigns_sorted[i]
             gap = (d_cur - d_prev).days
             if gap < 3:
+                # v6.2.0: 固定割当が片方でも含まれるgapは許容
+                if _is_preassigned_assignment(d_prev, h_prev) or _is_preassigned_assignment(d_cur, h_cur):
+                    continue
                 rows.append({
                     "氏名": doc,
                     "前回日付": d_prev,
@@ -2479,7 +2419,9 @@ def build_metrics_df(score_clamped, raw_score, metrics):
     return pd.DataFrame(rows)
 
 def build_hard_constraint_violations(pattern_df):
-    """ハード制約違反の詳細リストを生成"""
+    """ハード制約違反の詳細リストを生成
+    v6.2.0: 固定割当（事前割当）スロットは検査対象外（意図的な配置のため）
+    """
     rows = []
 
     for ridx in pattern_df.index:
@@ -2490,6 +2432,10 @@ def build_hard_constraint_violations(pattern_df):
         dow = date.weekday()
 
         for hosp in hospital_cols:
+            # v6.2.0: 固定割当は意図的な配置のため、違反検出をスキップ
+            if is_preassigned_slot(ridx, hosp):
+                continue
+
             val = pattern_df.at[ridx, hosp]
             if not isinstance(val, str):
                 continue
@@ -5295,21 +5241,11 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
 
         # diagnostics
         df_doctors, df_gap, df_same, df_hdup, df_unass, df_metrics, df_hard_violations = build_diagnostics(entry["pattern_df"])
-        # v6.2.0: 固定割当バリデーション結果を診断に追加
-        if preassigned_invalid:
-            df_preassign_invalid = pd.DataFrame([
-                {"日付": item["date"], "病院": item["hosp"], "医師名": item["doc"], "理由": item["reason"]}
-                for item in preassigned_invalid
-            ])
-        else:
-            df_preassign_invalid = pd.DataFrame(columns=["日付", "病院", "医師名", "理由"])
-
         write_diagnostics_sheet(
             writer,
             sheet_name=f"{sheet_label}_diag",
             diagnostics=[
                 ("医師ごとの偏り", df_doctors),
-                ("固定割当バリデーション（自動枠に変換済み）", df_preassign_invalid),
                 ("制約違反: gap（3日未満）", df_gap),
                 ("制約違反: 同日重複", df_same),
                 ("制約違反: 同一病院重複", df_hdup),
