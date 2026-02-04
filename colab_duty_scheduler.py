@@ -1,5 +1,13 @@
-# @title 当直くん v6.2.0 (固定割当の制約除外 + fix関数保護)
+# @title 当直くん v6.3.0 (未割当回避のためのABS緩和 + シート統合)
 # 修正内容:
+# v6.3.0 (2026-02-04):
+# - 未割当を許容せず、ABS制約も段階的に緩和して必ず割当
+#   - 第4段階緩和: relax_abs=True を追加
+#   - gap>=3、同一病院重複、TARGET_CAP、大学系2回制限を緩和可能に
+#   - 同日重複(ABS-006)とコード0(ABS-001)のみ絶対禁止として維持
+# - Excel出力のシート整理
+#   - sheet1-4（元データ）を出力から削除
+#   - 今月/累計/diagを1シートに統合（{pattern}_summary）
 # v6.2.0 (2026-02-04):
 # - 固定割当（事前割当）を制約違反の検出・ペナルティ計算から除外
 #   - sheet1に医師名が直接記載された固定割当は意図的な配置であるため、
@@ -279,7 +287,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "6.2.0"
+VERSION = "6.3.0"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -1062,18 +1070,20 @@ def choose_doctor_for_slot(
     def collect_candidates(
         relax_semi=False,  # v6.0.0: SEMI制約を緩和（sheet3「1」以外も許容）
         relax_hard=False,  # v6.0.1: HARD制約を緩和（ABS-009回避のため）
+        relax_abs=False,   # v6.3.0: ABS制約を緩和（未割当回避のため）
     ):
         candidates = []
         for doc in doctor_names:
-            # === 絶対禁忌（ABS）: 緩和不可 ===
+            # === 絶対禁忌（ABS）===
+            # v6.3.0: relax_abs=Trueでも緩和しない制約（物理的に不可能）
 
-            # ABS-006: 同日重複禁止
+            # ABS-006: 同日重複禁止（絶対不可）
             if date in assigned_dates[doc]:
                 continue
 
             code = get_avail_code(date, doc)
 
-            # ABS-001: コード0は全列禁止
+            # ABS-001: コード0は全列禁止（絶対不可）
             if code == 0:
                 continue
 
@@ -1095,22 +1105,24 @@ def choose_doctor_for_slot(
                 if doc in WED_FORBIDDEN_DOCTORS:
                     continue
 
+            # === v6.3.0: 以下のABS制約はrelax_abs=Trueで緩和可能 ===
+
             # ABS-007: gap >= 3日必須
-            if assigned_dates[doc]:
+            if not relax_abs and assigned_dates[doc]:
                 min_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_dates[doc])
                 if min_gap < 3:
                     continue
 
             # ABS-008: 同一病院重複禁止（全列）
-            if assigned_hosp_count[doc].get(hospital_name, 0) >= 1:
+            if not relax_abs and assigned_hosp_count[doc].get(hospital_name, 0) >= 1:
                 continue
 
             # ABS-010: TARGET_CAP遵守（n超過禁止）
-            if assigned_count[doc] >= TARGET_CAP.get(doc, 0):
+            if not relax_abs and assigned_count[doc] >= TARGET_CAP.get(doc, 0):
                 continue
 
             # ABS-011: 大学系2回まで（B-K列合計）
-            if is_BG and assigned_bg[doc] >= 2:
+            if not relax_abs and is_BG and assigned_bg[doc] >= 2:
                 continue
 
             # === ハード制約（HARD）: カテなし医師は必須遵守 ===
@@ -1154,8 +1166,7 @@ def choose_doctor_for_slot(
             candidates.append(doc)
         return candidates
 
-    # v6.0.1: 段階的制約緩和（ABS-009回避優先）
-    # ABS制約（010/011含む）は常に厳守、SEMI/HARDのみ段階的に緩和
+    # v6.3.0: 段階的制約緩和（未割当回避を最優先）
     # 1. 全制約適用
     candidates = collect_candidates()
     # 2. SEMI緩和
@@ -1164,8 +1175,12 @@ def choose_doctor_for_slot(
     # 3. HARD緩和（SEMI緩和済み）
     if not candidates:
         candidates = collect_candidates(relax_semi=True, relax_hard=True)
+    # 4. ABS緩和（SEMI/HARD緩和済み）- 未割当を絶対に回避
+    if not candidates:
+        candidates = collect_candidates(relax_semi=True, relax_hard=True, relax_abs=True)
 
     if not candidates:
+        # 全制約緩和後も候補なし（コード0または同日重複のみ）
         return None
 
     any_under_floor = any(assigned_count[d] < floor_shifts for d in active_doctors)
@@ -5203,29 +5218,38 @@ base_name = uploaded_filename.rsplit(".", 1)[0]
 output_filename = f"{base_name}_v{VERSION}.xlsx"
 output_path = output_filename
 
-def write_diagnostics_sheet(writer, sheet_name, diagnostics):
+def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnostics):
+    """v6.3.0: 今月/累計/診断を1シートに統合して出力"""
     startrow = 0
+
+    # 今月サマリー
+    ws = writer.book.create_sheet(sheet_name)
+    writer.sheets[sheet_name] = ws
+    ws.cell(row=1, column=1, value="【今月サマリー】")
+    df_month.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
+    startrow = len(df_month.index) + 4
+
+    # 累計サマリー
+    ws.cell(row=startrow, column=1, value="【累計サマリー】")
+    df_total.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
+    startrow += len(df_total.index) + 4
+
+    # 診断情報
     for title, df in diagnostics:
-        df.to_excel(writer, sheet_name=sheet_name, startrow=startrow + 1, index=False)
-        ws = writer.sheets[sheet_name]
-        ws.cell(row=startrow + 1, column=1, value=title)
+        ws.cell(row=startrow, column=1, value=title)
+        df.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
         startrow += len(df.index) + 3
 
 
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-    # 元シート
-    shift_df.to_excel(writer, sheet_name="sheet1", index=False)
-    availability_raw.to_excel(writer, sheet_name="sheet2", index=False)
-    schedule_raw.to_excel(writer, sheet_name="sheet3", index=False)
-    sheet4_raw_out.to_excel(writer, sheet_name="sheet4", index=False)
+    # v6.3.0: sheet1-4は出力しない（元データ不要）
 
     # TOPパターン出力
     for rank, entry in enumerate(top_patterns, start=1):
         axis_label = entry.get('axis_label', '総合スコア')
         sheet_label = f"pattern_{rank:02d}"
 
-        # パターンシートのコメント行に軸ラベルを追加
-        pattern_df_with_label = entry["pattern_df"].copy()
+        # パターンシート
         entry["pattern_df"].to_excel(writer, sheet_name=sheet_label, index=False)
 
         # シート名に軸ラベルを追加（Excelの制限により簡略化）
@@ -5233,25 +5257,24 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         axis_short = {"公平性重視": "公平性", "連続当直回避重視": "gap回避", "バランス重視": "バランス", "総合スコア": "総合"}.get(axis_label, axis_label)
         ws.cell(row=1, column=len(entry["pattern_df"].columns) + 2, value=f"【{axis_short}】")
 
-        # summary（今月/累計）
+        # v6.3.0: 今月/累計/診断を1シートに統合
         counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(entry["pattern_df"])
         df_month, df_total = build_summaries(entry["pattern_df"], counts, bg_counts, ht_counts, wd_counts, we_counts, bg_cat)
-        df_month.to_excel(writer, sheet_name=f"{sheet_label}_今月", index=False)
-        df_total.to_excel(writer, sheet_name=f"{sheet_label}_累計", index=False)
-
-        # diagnostics
         df_doctors, df_gap, df_same, df_hdup, df_unass, df_metrics, df_hard_violations = build_diagnostics(entry["pattern_df"])
-        write_diagnostics_sheet(
+
+        write_combined_summary_sheet(
             writer,
-            sheet_name=f"{sheet_label}_diag",
+            sheet_name=f"{sheet_label}_summary",
+            df_month=df_month,
+            df_total=df_total,
             diagnostics=[
-                ("医師ごとの偏り", df_doctors),
-                ("制約違反: gap（3日未満）", df_gap),
-                ("制約違反: 同日重複", df_same),
-                ("制約違反: 同一病院重複", df_hdup),
-                ("制約違反: 未割当枠", df_unass),
-                ("制約違反: 重要/推奨ルール", df_hard_violations),
-                ("スコアサマリー", df_metrics),
+                ("【医師ごとの偏り】", df_doctors),
+                ("【制約違反: gap（3日未満）】", df_gap),
+                ("【制約違反: 同日重複】", df_same),
+                ("【制約違反: 同一病院重複】", df_hdup),
+                ("【制約違反: 未割当枠】", df_unass),
+                ("【制約違反: 重要/推奨ルール】", df_hard_violations),
+                ("【スコアサマリー】", df_metrics),
             ],
         )
 
@@ -5260,10 +5283,9 @@ print("  🎉 完了")
 print("="*60)
 print(f"\n📥 出力: {output_path}")
 print("\n【内容】")
-print("  sheet1〜4: 元データ")
 for rank in range(1, len(top_patterns) + 1):
     label = f"pattern_{rank:02d}"
-    print(f"  {label}: スケジュール / {label}_今月・累計: サマリー / {label}_diag: 診断")
+    print(f"  {label}: スケジュール / {label}_summary: サマリー・診断")
 print("="*60)
 
 if COLAB_AVAILABLE:
