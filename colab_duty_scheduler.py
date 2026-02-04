@@ -833,24 +833,24 @@ if shortage > 0:
 floor_shifts = BASE_TARGET
 
 print(f"\n✅ 割当設計完了")
-print(f"   ├─ 全枠数: {total_slots} | active医師: {len(active_doctors)}人")
-print(f"   ├─ 基本割当: {BASE_TARGET}回 (+1回対象: {len(EXTRA_ALLOWED)}人)")
 total_cap_final = sum(TARGET_CAP[d] for d in active_doctors)
-print(f"   ├─ 割当容量合計: {total_cap_final} / {total_slots}枠")
+print(f"   全枠数: {total_slots} | active医師: {len(active_doctors)}人")
+print(f"   基本割当: {BASE_TARGET}回 | +1回対象: {len(EXTRA_ALLOWED)}人")
+print(f"   割当容量: {total_cap_final} / {total_slots}枠")
 
 # gap3制限された医師の詳細表示
 gap3_limited = [(d, compute_max_gap3_assignments(d)) for d in active_doctors if compute_max_gap3_assignments(d) < BASE_TARGET]
 if gap3_limited:
-    print(f"   ├─ gap>=3制約でCAP切下げ: {len(gap3_limited)}人")
+    print(f"   gap>=3制約でCAP切下げ: {len(gap3_limited)}人")
     for doc, mx in gap3_limited:
         avail = sum(1 for dt in all_shift_dates if get_avail_code(dt, doc) != 0)
-        print(f"   │    {doc}: 利用可能{avail}日 → gap3上限{mx}回 (CAP={TARGET_CAP[doc]})")
+        print(f"     {doc}: 利用可能{avail}日 → gap3上限{mx}回 (CAP={TARGET_CAP[doc]})")
 
 # 可否コード2の医師の情報表示
 code_2_in_active = [d for d in active_sorted_by_index if d in CODE_2_DOCTORS]
 code_2_in_extra = [d for d in EXTRA_ALLOWED if d in CODE_2_DOCTORS]
 if code_2_in_active:
-    print(f"   ├─ CODE_2医師: {len(code_2_in_active)}人（うちEXTRA対象: {len(code_2_in_extra)}人）")
+    print(f"   CODE_2医師: {len(code_2_in_active)}人（うちEXTRA対象: {len(code_2_in_extra)}人）")
 
 # =========================
 # B-K / L-Y 比率バランス（sheet3で「3」記載の医師は除外）
@@ -878,12 +878,8 @@ if RATIO_EXEMPT_DOCTORS:
     print(f"   比率バランス除外（sheet3に3あり）: {sorted(RATIO_EXEMPT_DOCTORS)}")
 
 SCHEDULE_CODE_HOLDERS = {doc for doc in doctor_names if has_any_schedule_code(doc)}
-print(f"   └─ カテ表保有: {len(SCHEDULE_CODE_HOLDERS)}人")
-
-# カテ当番なし医師（sheet3に1つもアルファベットがない医師）
-# C-H列（休日大学系）に自由に割り当て可能
 NO_KATE_DOCTORS = {doc for doc in doctor_names if not has_any_schedule_code(doc)}
-print(f"   └─ カテ当番なし: {len(NO_KATE_DOCTORS)}人")
+print(f"   カテ表保有: {len(SCHEDULE_CODE_HOLDERS)}人 | カテ当番なし: {len(NO_KATE_DOCTORS)}人")
 
 # sheet3で「1」を持つ医師（平日大学系でカテ当番不一致を許容）
 def has_sheet3_code_1(doc):
@@ -5110,16 +5106,15 @@ print("  📊 上位パターン評価 (v6.0.0)")
 print("="*60)
 
 if top_patterns:
-    print(f"\n{'順位':<6}{'スコア':>10}{'公平性':>8}{'ABS違反':>8}{'seed':>8}")
-    print("-"*44)
+    print()
     for i, pattern in enumerate(top_patterns, 1):
         raw_score = pattern.get('raw_after', 0)
         fairness = pattern['metrics_after'].get('max_minus_min_total_active', 0)
         abs_valid = pattern.get('absolute_constraints_valid', False)
         abs_viols = len(pattern.get('absolute_violations', []))
         seed = pattern.get('seed', 0)
-        status = "✅" if abs_valid else f"❌{abs_viols}"
-        print(f"{i}位{'':<4}{raw_score:>10.0f}{fairness:>8}{status:>8}{seed:>8}")
+        abs_str = "ABS=OK" if abs_valid else f"ABS=NG({abs_viols}件)"
+        print(f"  {i}位: スコア {raw_score:.0f} / 公平性 {fairness} / {abs_str} / seed={seed}")
 else:
     print("\n  ⚠️ 有効なパターンが生成されませんでした")
 
@@ -5187,25 +5182,10 @@ print("  🎉 完了")
 print("="*60)
 print(f"\n📥 出力: {output_path}")
 print("\n【内容】")
-print("  ├─ sheet1〜4: 元データ")
-print("  ├─ pattern_01: 最良スケジュール（絶対禁忌クリア）")
-print("  ├─ pattern_01_今月/累計: サマリー")
-print("  └─ pattern_01_diag: 診断シート")
-print("\n【v6.0.0 制約チェック項目】")
-print("  絶対禁忌(ABS): 11項目")
-print("  ├─ ABS-001: コード0割当禁止")
-print("  ├─ ABS-002: コード2列制限（B〜Q列のみ）")
-print("  ├─ ABS-003: コード3列制限（L〜Y列のみ）")
-print("  ├─ ABS-006: 同日重複禁止")
-print("  ├─ ABS-007: gap >= 3日必須")
-print("  ├─ ABS-008: 同一病院重複禁止（全列）")
-print("  ├─ ABS-009: 未割当禁止")
-print("  ├─ ABS-010: TARGET_CAP遵守")
-print("  └─ ABS-011: 大学系2回まで")
-print("  ハード制約(HARD): 3項目")
-print("  ├─ HARD-001: B/I列1回まで")
-print("  ├─ HARD-002: C-H/J-K列1回まで")
-print("  └─ HARD-003: 外病院1回以上")
+print("  sheet1〜4: 元データ")
+for rank in range(1, len(top_patterns) + 1):
+    label = f"pattern_{rank:02d}"
+    print(f"  {label}: スケジュール / {label}_今月・累計: サマリー / {label}_diag: 診断")
 print("="*60)
 
 if COLAB_AVAILABLE:
