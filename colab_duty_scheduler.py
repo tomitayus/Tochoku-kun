@@ -1,5 +1,12 @@
-# @title 当直くん v6.0.5 (CODE_2医師EXTRA対象化 + 未割当最終パス)
+# @title 当直くん v6.1.0 (gap/dup最終パス + diagシート改善)
 # 修正内容:
+# v6.1.0 (2026-02-04):
+# - 収束ループ後にgap/外病院重複の最終パスを追加（safe_fix不使用）
+#   - safe_fixがrevertしたgap/dup修正を最終的に解消
+#   - 順序: gap修正 → 外病院重複修正 → 未割当修正（依存関係順）
+# - diagシート再構成:
+#   - 1.医師ごとの偏り 2.制約違反一覧 3.スコアサマリー の順序に変更
+#   - メトリクスを日本語の「スコアサマリー」に置換（項目/値/説明の3列）
 # v6.0.5 (2026-02-04):
 # - CODE_2医師もEXTRA_ALLOWED対象に含める（枠不足解消）
 #   - CODE_2除外だと他医師の制約(gap/dup等)で物理的に枠が足りなくなる
@@ -252,7 +259,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "6.0.5"
+VERSION = "6.1.0"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -2278,8 +2285,30 @@ def build_doctor_diag(counts, bg_counts, ht_counts, wd_counts, we_counts, doc_as
     return df.sort_values(["active", "累計_全合計"], ascending=[False, False]).reset_index(drop=True)
 
 def build_metrics_df(score_clamped, raw_score, metrics):
-    row = {"score": float(score_clamped), "raw_score": float(raw_score), **metrics}
-    return pd.DataFrame([row])
+    """スコアサマリーを日本語で生成（旧メトリクス）"""
+    rows = [
+        {"項目": "総合スコア（0〜100）", "値": float(score_clamped), "説明": "制約違反のペナルティを100から引いた値（高いほど良い）"},
+        {"項目": "ペナルティ合計", "値": float(metrics.get("penalty_total", 0)), "説明": "全制約違反のペナルティ合計（低いほど良い）"},
+        {"項目": "--- 制約違反 ---", "値": "", "説明": ""},
+        {"項目": "未割当枠", "値": int(metrics.get("unassigned_slots", 0)), "説明": "医師が割り当てられていないスロット数"},
+        {"項目": "TARGET_CAP超過", "値": int(metrics.get("cap_violations", 0)), "説明": "割当上限を超えた回数"},
+        {"項目": "gap違反（3日未満）", "値": int(metrics.get("gap_violations", 0)), "説明": "当直間隔が3日未満の件数"},
+        {"項目": "同一病院重複（全体）", "値": int(metrics.get("hospital_dup_violations", 0)), "説明": "同じ病院に2回以上割当された件数"},
+        {"項目": "外病院重複", "値": int(metrics.get("external_hosp_dup_violations", 0)), "説明": "外病院(L〜Y列)の同一病院重複"},
+        {"項目": "CODE_2医師CAP超過", "値": int(metrics.get("code_2_extra_violations", 0)), "説明": "可否コード2医師のTARGET_CAP超過"},
+        {"項目": "大学系3回以上", "値": int(metrics.get("bg_over_2_violations", 0)), "説明": "大学系(B〜K列)に3回以上割当"},
+        {"項目": "外病院0回", "値": int(metrics.get("ht_0_violations", 0)), "説明": "外病院に1回も割当されていない医師数"},
+        {"項目": "C-Hカテ当番違反", "値": int(metrics.get("ch_kate_violations", 0)), "説明": "C〜H列にカテ当番日以外で割当"},
+        {"項目": "--- 公平性 ---", "値": "", "説明": ""},
+        {"項目": "割当回数の偏り（max-min）", "値": int(metrics.get("max_minus_min_total_active", 0)), "説明": "active医師間の最大-最小割当回数差"},
+        {"項目": "公平性ペナルティ", "値": int(metrics.get("fairness_penalty", 0)), "説明": "偏りが2以上で発生するペナルティ"},
+        {"項目": "--- 偏り（累計spread） ---", "値": "", "説明": ""},
+        {"項目": "大学系spread", "値": float(metrics.get("bg_spread_cum", 0)), "説明": "累計大学回数のmax-min（前月+今月）"},
+        {"項目": "外病院spread", "値": float(metrics.get("ht_spread_cum", 0)), "説明": "累計外病院回数のmax-min"},
+        {"項目": "平日spread", "値": float(metrics.get("weekday_spread_cum", 0)), "説明": "累計平日回数のmax-min"},
+        {"項目": "休日spread", "値": float(metrics.get("weekend_spread_cum", 0)), "説明": "累計休日回数のmax-min"},
+    ]
+    return pd.DataFrame(rows)
 
 def build_hard_constraint_violations(pattern_df):
     """ハード制約違反の詳細リストを生成"""
@@ -4729,9 +4758,20 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
                 break
 
         # ── 収束ループ後の最終パス ──
-        # safe_fixがrevertした未割当てを含め、残存する未割当てを最終的に埋める
-        # ABS-009（未割当て）は最も深刻な違反のため、safe_fixを通さず直接実行
-        final_df, _, final_unassigned_fc = fix_unassigned_slots(current_df, verbose=False)
+        # safe_fixがrevertしたABS違反を最終的に解消する
+        # ABS制約の優先度: gap/病院重複を先に修正 → 未割当を最後に埋める
+        # safe_fixを通さず直接実行（ABS違反同士のトレードオフを許容）
+
+        # 1) gap違反を修正（safe_fix不使用: 移動先が見つからず削除→未割当になっても許容）
+        final_df, _, final_gap_fc = fix_gap_violations(current_df, max_attempts=200, verbose=False)
+        total_fix_counts["gap"] = total_fix_counts.get("gap", 0) + final_gap_fc
+
+        # 2) 外病院重複を修正
+        final_df, _, final_dup_fc = fix_external_hospital_dup_violations(final_df, max_attempts=150, verbose=False)
+        total_fix_counts["ext_dup"] = total_fix_counts.get("ext_dup", 0) + final_dup_fc
+
+        # 3) 未割当スロットを埋める（gap/dup修正で発生した未割当を含む）
+        final_df, _, final_unassigned_fc = fix_unassigned_slots(final_df, verbose=False)
         total_fix_counts["unassigned"] = total_fix_counts.get("unassigned", 0) + final_unassigned_fc
 
         fix_count = total_fix_counts.get("hard", 0)
@@ -5047,13 +5087,13 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             writer,
             sheet_name=f"{sheet_label}_diag",
             diagnostics=[
-                ("🚨 ハード制約違反", df_hard_violations),
                 ("医師ごとの偏り", df_doctors),
-                ("gap違反", df_gap),
-                ("同日重複", df_same),
-                ("同一病院重複", df_hdup),
-                ("未割当枠", df_unass),
-                ("メトリクス", df_metrics),
+                ("制約違反: gap（3日未満）", df_gap),
+                ("制約違反: 同日重複", df_same),
+                ("制約違反: 同一病院重複", df_hdup),
+                ("制約違反: 未割当枠", df_unass),
+                ("制約違反: ハード/SEMI", df_hard_violations),
+                ("スコアサマリー", df_metrics),
             ],
         )
 
