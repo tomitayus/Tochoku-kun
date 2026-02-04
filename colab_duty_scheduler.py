@@ -1,5 +1,11 @@
-# @title 当直くん v6.0.4 (収束ループ後の未割当最終パス追加)
+# @title 当直くん v6.0.5 (CODE_2医師EXTRA対象化 + 未割当最終パス)
 # 修正内容:
+# v6.0.5 (2026-02-04):
+# - CODE_2医師もEXTRA_ALLOWED対象に含める（枠不足解消）
+#   - CODE_2除外だと他医師の制約(gap/dup等)で物理的に枠が足りなくなる
+#   - CODE_2医師のn+1回目はB〜Q列（大学系）に割り当て可能
+#   - code_2_extra_violationsをTARGET_CAPベースに変更（BASE_TARGET→TARGET_CAP）
+#   - fix_code_2_extra_violationsも同様にTARGET_CAPベースに変更
 # v6.0.4 (2026-02-04):
 # - 収束ループ後にfix_unassigned_slotsの最終パスを追加（safe_fix不使用）
 #   - safe_fixがrevertした未割当てや、他fix関数が作った未割当てを確実に埋める
@@ -246,7 +252,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "6.0.4"
+VERSION = "6.0.5"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -735,7 +741,8 @@ if len(active_doctors) == 0:
 if inactive_doctors:
     print(f"⚠️ inactive医師（解析除外、出力のみ）: {len(inactive_doctors)}人")
 
-# 可否コード2の医師（大学系のみ可能、EXTRA枠対象外）
+# 可否コード2の医師（大学系のみ可能）
+# v6.0.5: CODE_2医師もEXTRA枠対象に含める（除外すると物理的に枠不足になりうる）
 def has_code_2_anywhere(doc):
     """医師がsheet2でいずれかの日に可否コード2を持っているか"""
     if doc not in availability_df.columns:
@@ -751,11 +758,12 @@ CODE_2_DOCTORS = {doc for doc in doctor_names if has_code_2_anywhere(doc)}
 BASE_TARGET = total_slots // len(active_doctors)
 EXTRA_SLOTS = total_slots - BASE_TARGET * len(active_doctors)
 
-# 余り枠は右側（下位）の医師に割り当てる（可否コード2の医師は除外：ハード制約）
-# 例：小林(0), 及川(1), ..., 大河内(30), 猪股(31) の場合、右側の医師を選択
+# 余り枠は右側（下位）の医師に割り当てる
+# v6.0.5: CODE_2医師もEXTRA対象に含める
+#   - CODE_2除外だと、他医師の制約(gap/dup等)で枠が埋まらず未割当が発生する
+#   - CODE_2医師のn+1回目はB〜Q列（大学系）に割り当てればよい
 active_sorted_by_index = sorted(active_doctors, key=lambda d: doctor_col_index[d])  # 昇順ソート
-# 可否コード2の医師はEXTRA枠対象から除外（大学系のみ可のため、外病院枠増加は不適切）
-extra_eligible = [d for d in active_sorted_by_index if d not in CODE_2_DOCTORS]
+extra_eligible = active_sorted_by_index  # 全active医師がEXTRA対象
 EXTRA_ALLOWED = set(extra_eligible[-EXTRA_SLOTS:] if EXTRA_SLOTS > 0 else [])  # 最後のEXTRA_SLOTS人（右側/下位）
 
 TARGET_CAP = {d: 0 for d in doctor_names}
@@ -773,10 +781,11 @@ print(f"\n✅ 割当設計完了")
 print(f"   ├─ 全枠数: {total_slots} | active医師: {len(active_doctors)}人")
 print(f"   ├─ 基本割当: {BASE_TARGET}回 (+1回対象: {len(EXTRA_ALLOWED)}人)")
 
-# 可否コード2の医師がEXTRA枠から除外されていることを表示
+# 可否コード2の医師の情報表示
 code_2_in_active = [d for d in active_sorted_by_index if d in CODE_2_DOCTORS]
+code_2_in_extra = [d for d in EXTRA_ALLOWED if d in CODE_2_DOCTORS]
 if code_2_in_active:
-    print(f"   └─ CODE_2医師（EXTRA対象外）: {len(code_2_in_active)}人")
+    print(f"   ├─ CODE_2医師: {len(code_2_in_active)}人（うちEXTRA対象: {len(code_2_in_extra)}人）")
 
 # =========================
 # B-K / L-Y 比率バランス（sheet3で「3」記載の医師は除外）
@@ -1577,13 +1586,15 @@ def evaluate_schedule_with_raw(
         if assigned_count.get(doc, 0) > cap:
             cap_violations += (assigned_count[doc] - cap)
 
-    # CODE_2医師のn+1違反（BASE_TARGET超過）
+    # CODE_2医師のTARGET_CAP超過チェック
+    # v6.0.5: CODE_2もEXTRA対象のため、TARGET_CAPベースで判定（BASE_TARGETではなく）
     code_2_extra_violations = 0
     for doc in CODE_2_DOCTORS:
         if doc not in active_doctors:
             continue
-        if assigned_count.get(doc, 0) > BASE_TARGET:
-            code_2_extra_violations += (assigned_count[doc] - BASE_TARGET)
+        cap = TARGET_CAP.get(doc, 0)
+        if assigned_count.get(doc, 0) > cap:
+            code_2_extra_violations += (assigned_count[doc] - cap)
 
     # 全合計公平性（activeのみ、CC除外）
     # CCは大型連休特別シフトなので公平性計算から除外
@@ -2778,8 +2789,8 @@ def fix_target_cap_violations(pattern_df, max_attempts=100, verbose=True):
 
 def fix_code_2_extra_violations(pattern_df, max_attempts=100, verbose=True):
     """
-    可否コード2医師のn+1回違反を修正する（ハード制約）
-    CODE_2_DOCTORSはBASE_TARGET回までしか割当できない
+    可否コード2医師のTARGET_CAP超過違反を修正する
+    v6.0.5: CODE_2もEXTRA対象のため、TARGET_CAPベースで判定
 
     Args:
         pattern_df: スケジュールDataFrame
@@ -2796,14 +2807,15 @@ def fix_code_2_extra_violations(pattern_df, max_attempts=100, verbose=True):
         # 現在の割当回数を再計算
         counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
 
-        # CODE_2医師でBASE_TARGETを超えている医師を特定
+        # CODE_2医師でTARGET_CAPを超えている医師を特定
         code_2_over_docs = []
         for doc in CODE_2_DOCTORS:
             if doc not in active_doctors:
                 continue
             current = counts.get(doc, 0)
-            if current > BASE_TARGET:
-                code_2_over_docs.append((doc, current - BASE_TARGET))
+            cap = TARGET_CAP.get(doc, 0)
+            if current > cap:
+                code_2_over_docs.append((doc, current - cap))
 
         # 違反がなければ終了
         if not code_2_over_docs:
@@ -2937,14 +2949,14 @@ def fix_code_2_extra_violations(pattern_df, max_attempts=100, verbose=True):
 
     # 最終状態を確認
     counts, *_ = recompute_stats(df)
-    remaining = sum(1 for doc in CODE_2_DOCTORS if doc in active_doctors and counts.get(doc, 0) > BASE_TARGET)
+    remaining = sum(1 for doc in CODE_2_DOCTORS if doc in active_doctors and counts.get(doc, 0) > TARGET_CAP.get(doc, 0))
 
     if verbose:
         if remaining == 0:
             if total_fixed > 0:
-                print(f"   ✅ 全ての可否コード2医師のn+1違反を修正しました（修正数: {total_fixed}）")
+                print(f"   ✅ 全ての可否コード2医師のTARGET_CAP違反を修正しました（修正数: {total_fixed}）")
         else:
-            print(f"   ⚠️ {remaining}件の可否コード2医師のn+1違反が残っています（修正数: {total_fixed}）")
+            print(f"   ⚠️ {remaining}件の可否コード2医師のTARGET_CAP違反が残っています（修正数: {total_fixed}）")
 
     return df, (remaining == 0), total_fixed
 
