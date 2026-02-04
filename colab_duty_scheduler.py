@@ -1,12 +1,19 @@
-# @title 当直くん v6.1.0 (gap/dup最終パス + diagシート改善)
+# @title 当直くん v6.1.0 (gap3上限CAP + safe_fix gap/dup保護 + diagシート改善)
 # 修正内容:
 # v6.1.0 (2026-02-04):
+# - gap>=3上限によるTARGET_CAP自動調整
+#   - 各医師の利用可能日分布からgap>=3で可能な最大割当数を計算
+#   - CAPが物理上限を超えている場合は切り下げ（gap違反の根本原因を除去）
+#   - 余った枠は他の余裕ある医師に再配分
+# - safe_fix改善: gap(ABS-007)/dup(ABS-008)の個別増加もrevert対象
+#   - 他のfix関数がgap/dupを犠牲にして別制約を直す「トレード」を防止
 # - 収束ループ後にgap/外病院重複の最終パスを追加（safe_fix不使用）
 #   - safe_fixがrevertしたgap/dup修正を最終的に解消
 #   - 順序: gap修正 → 外病院重複修正 → 未割当修正（依存関係順）
 # - diagシート再構成:
 #   - 1.医師ごとの偏り 2.制約違反一覧 3.スコアサマリー の順序に変更
 #   - メトリクスを日本語の「スコアサマリー」に置換（項目/値/説明の3列）
+#   - 医師テーブルに「gap3上限」「利用可能日数」列を追加
 # v6.0.5 (2026-02-04):
 # - CODE_2医師もEXTRA_ALLOWED対象に含める（枠不足解消）
 #   - CODE_2除外だと他医師の制約(gap/dup等)で物理的に枠が足りなくなる
@@ -782,11 +789,62 @@ for d in doctor_names:
     if preassigned_count.get(d, 0) > TARGET_CAP.get(d, 0):
         TARGET_CAP[d] = preassigned_count[d]
 
+# v6.1.0: gap>=3を満たせる最大割当数でTARGET_CAPを制限
+# 利用可能日の分布が偏っている医師は、CAPまで割当するとgap違反が不可避になる
+# → 事前に物理的上限を計算してCAPを切り下げる
+def compute_max_gap3_assignments(doc):
+    """gap>=3を満たしつつ割当可能な最大回数を貪欲法で計算"""
+    avail_dates = sorted([d for d in all_shift_dates if get_avail_code(d, doc) != 0])
+    if not avail_dates:
+        return 0
+    count = 0
+    last_assigned = None
+    for d in avail_dates:
+        if last_assigned is None or (d - last_assigned).days >= 3:
+            count += 1
+            last_assigned = d
+    return count
+
+gap3_cap_adjusted = 0
+for d in active_doctors:
+    max_gap3 = compute_max_gap3_assignments(d)
+    if max_gap3 < TARGET_CAP[d]:
+        gap3_cap_adjusted += 1
+        TARGET_CAP[d] = max_gap3
+
+if gap3_cap_adjusted > 0:
+    print(f"   ⚠️ gap>=3制約により{gap3_cap_adjusted}人のTARGET_CAPを切り下げ")
+
+# CAPを切り下げた分、余った枠を他の医師に再配分
+total_cap = sum(TARGET_CAP[d] for d in active_doctors)
+shortage = total_slots - total_cap
+if shortage > 0:
+    # 余裕のある医師（現CAP < gap3上限）に+1ずつ配分
+    for d in sorted(active_doctors, key=lambda x: doctor_col_index[x], reverse=True):
+        if shortage <= 0:
+            break
+        max_gap3 = compute_max_gap3_assignments(d)
+        if TARGET_CAP[d] < max_gap3:
+            TARGET_CAP[d] += 1
+            shortage -= 1
+    if shortage > 0:
+        print(f"   ⚠️ {shortage}枠の再配分先なし（全医師がgap3上限）")
+
 floor_shifts = BASE_TARGET
 
 print(f"\n✅ 割当設計完了")
 print(f"   ├─ 全枠数: {total_slots} | active医師: {len(active_doctors)}人")
 print(f"   ├─ 基本割当: {BASE_TARGET}回 (+1回対象: {len(EXTRA_ALLOWED)}人)")
+total_cap_final = sum(TARGET_CAP[d] for d in active_doctors)
+print(f"   ├─ 割当容量合計: {total_cap_final} / {total_slots}枠")
+
+# gap3制限された医師の詳細表示
+gap3_limited = [(d, compute_max_gap3_assignments(d)) for d in active_doctors if compute_max_gap3_assignments(d) < BASE_TARGET]
+if gap3_limited:
+    print(f"   ├─ gap>=3制約でCAP切下げ: {len(gap3_limited)}人")
+    for doc, mx in gap3_limited:
+        avail = sum(1 for dt in all_shift_dates if get_avail_code(dt, doc) != 0)
+        print(f"   │    {doc}: 利用可能{avail}日 → gap3上限{mx}回 (CAP={TARGET_CAP[doc]})")
 
 # 可否コード2の医師の情報表示
 code_2_in_active = [d for d in active_sorted_by_index if d in CODE_2_DOCTORS]
@@ -2244,10 +2302,16 @@ def build_doctor_diag(counts, bg_counts, ht_counts, wd_counts, we_counts, doc_as
         min_gap = min(gaps) if gaps else None
         hosp_excess = sum(max(0, c - 1) for c in assigned_hosp_count.get(doc, {}).values())
 
+        # gap3上限: この医師がgap>=3を守りつつ割当可能な最大回数
+        gap3_max = compute_max_gap3_assignments(doc) if doc in active_set else 0
+        avail_days = sum(1 for dt in all_shift_dates if get_avail_code(dt, doc) != 0)
+
         row = {
             "氏名": doc,
             "active": 1 if doc in active_set else 0,
             "cap": TARGET_CAP.get(doc, 0),
+            "gap3上限": gap3_max,
+            "利用可能日数": avail_days,
             "preassigned": preassigned_count.get(doc, 0),
 
             "今月_全合計": counts.get(doc, 0),
@@ -4541,15 +4605,24 @@ def validate_absolute_constraints(pattern_df, verbose=True):
 
 def safe_fix(fix_func, df, verbose=False, **kwargs):
     """
-    v6.0.3: fix関数の安全ラッパー
-    fix関数実行後にABS違反が増えた場合はrevertする。
-    これにより、fix関数が他の制約を壊すことを構造的に防止する。
+    v6.0.3/v6.1.0: fix関数の安全ラッパー
+    fix関数実行後にABS違反が増えた場合、またはgap/dup違反が新たに発生した場合はrevertする。
+    v6.1.0: 総数だけでなく、gap(ABS-007)/dup(ABS-008)の個別増加もrevert対象に追加。
+    これにより、他の制約を直す代わりにgap/dupが悪化する「トレード」を防止する。
 
     Returns:
         (fixed_df, success, fix_count) + fix_func固有の追加戻り値
     """
+    def count_by_type(violations):
+        counts = {}
+        for v in violations:
+            t = v.get("type", "")
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
     pre_violations, _ = validate_absolute_constraints(df, verbose=False)
     pre_count = len(pre_violations)
+    pre_by_type = count_by_type(pre_violations)
 
     result = fix_func(df, verbose=verbose, **kwargs)
     fixed_df = result[0]
@@ -4557,12 +4630,24 @@ def safe_fix(fix_func, df, verbose=False, **kwargs):
 
     post_violations, _ = validate_absolute_constraints(fixed_df, verbose=False)
     post_count = len(post_violations)
+    post_by_type = count_by_type(post_violations)
 
-    if post_count > pre_count:
-        # ABS違反が増えた → revert
-        if verbose:
+    # revert条件1: ABS違反の総数が増えた
+    should_revert = post_count > pre_count
+
+    # revert条件2: gap(ABS-007)またはdup(ABS-008)が増えた（トレード防止）
+    # ただしfix_gap_violations/fix_external_hospital_dup_violations自体は除外
+    if not should_revert and fix_func.__name__ not in ("fix_gap_violations", "fix_external_hospital_dup_violations"):
+        for critical_type in ("ABS-007", "ABS-008"):
+            if post_by_type.get(critical_type, 0) > pre_by_type.get(critical_type, 0):
+                should_revert = True
+                if verbose:
+                    print(f"   ⚠️ {fix_func.__name__}: {critical_type}増加 → revert")
+                break
+
+    if should_revert:
+        if verbose and post_count > pre_count:
             print(f"   ⚠️ {fix_func.__name__}: ABS違反増加({pre_count}→{post_count}) → revert")
-        # 元のdfと同じ形式で返す（fix_count=0）
         if len(result) == 4:
             return df, False, 0, 0
         else:
