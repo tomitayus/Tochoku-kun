@@ -1,5 +1,9 @@
-# @title 当直くん v6.0.3 (safe_fix + 収束ループ)
+# @title 当直くん v6.0.4 (収束ループ後の未割当最終パス追加)
 # 修正内容:
+# v6.0.4 (2026-02-04):
+# - 収束ループ後にfix_unassigned_slotsの最終パスを追加（safe_fix不使用）
+#   - safe_fixがrevertした未割当てや、他fix関数が作った未割当てを確実に埋める
+#   - ABS-009（未割当て）は最も深刻な違反のため、最終パスでは直接実行
 # v6.0.3 (2026-02-03):
 # - 根本改善: safe_fixラッパー + 収束ループで最適化を再有効化
 #   - is_valid_full_assignment(): 全ABS制約を統合チェックする関数を追加
@@ -242,7 +246,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "6.0.3"
+VERSION = "6.0.4"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -4712,7 +4716,12 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
             if round_fixed == 0:
                 break
 
-        final_df = current_df
+        # ── 収束ループ後の最終パス ──
+        # safe_fixがrevertした未割当てを含め、残存する未割当てを最終的に埋める
+        # ABS-009（未割当て）は最も深刻な違反のため、safe_fixを通さず直接実行
+        final_df, _, final_unassigned_fc = fix_unassigned_slots(current_df, verbose=False)
+        total_fix_counts["unassigned"] = total_fix_counts.get("unassigned", 0) + final_unassigned_fc
+
         fix_count = total_fix_counts.get("hard", 0)
         code_2_fix_count = total_fix_counts.get("code2", 0)
         cap_fix_count = total_fix_counts.get("cap", 0)
