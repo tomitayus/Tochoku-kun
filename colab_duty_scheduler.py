@@ -1,5 +1,26 @@
-# @title 当直くん v6.1.0 (gap3上限CAP + safe_fix gap/dup保護 + diagシート改善)
+# @title 当直くん v6.3.0 (未割当回避のためのABS緩和 + シート統合)
 # 修正内容:
+# v6.3.0 (2026-02-04):
+# - 未割当を許容せず、ABS制約も段階的に緩和して必ず割当
+#   - 第4段階緩和: relax_abs=True を追加
+#   - gap>=3、同一病院重複、TARGET_CAP、大学系2回制限を緩和可能に
+#   - 同日重複(ABS-006)とコード0(ABS-001)のみ絶対禁止として維持
+# - Excel出力のシート整理
+#   - sheet1-4（元データ）を出力から削除
+#   - 今月/累計/diagを1シートに統合（{pattern}_summary）
+# v6.2.0 (2026-02-04):
+# - 固定割当（事前割当）を制約違反の検出・ペナルティ計算から除外
+#   - sheet1に医師名が直接記載された固定割当は意図的な配置であるため、
+#     ABS/SEMI/SOFT全ての制約チェック対象から除外する
+#   - 固定割当が片方でも含まれるgap<3はペナルティ対象外
+#   - 固定割当による同一病院重複もペナルティ対象外
+#   - build_hard_constraint_violationsで固定割当スロットをスキップ
+#   - C-H列カテ当番違反チェックでも固定割当をスキップ
+# - fix関数が固定割当を移動・削除しないよう保護
+#   - is_preassigned_slot()ヘルパー関数を追加
+#   - 全fix関数（gap/dup/cap/code2/code12/imbalance/over2/weekday）で
+#     固定割当スロットを移動対象から除外
+#   - 固定割当は意図的な配置のため、最適化で変更してはならない
 # v6.1.0 (2026-02-04):
 # - gap>=3上限によるTARGET_CAP自動調整
 #   - 各医師の利用可能日分布からgap>=3で可能な最大割当数を計算
@@ -266,7 +287,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "6.1.0"
+VERSION = "6.3.0"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -1049,18 +1070,20 @@ def choose_doctor_for_slot(
     def collect_candidates(
         relax_semi=False,  # v6.0.0: SEMI制約を緩和（sheet3「1」以外も許容）
         relax_hard=False,  # v6.0.1: HARD制約を緩和（ABS-009回避のため）
+        relax_abs=False,   # v6.3.0: ABS制約を緩和（未割当回避のため）
     ):
         candidates = []
         for doc in doctor_names:
-            # === 絶対禁忌（ABS）: 緩和不可 ===
+            # === 絶対禁忌（ABS）===
+            # v6.3.0: relax_abs=Trueでも緩和しない制約（物理的に不可能）
 
-            # ABS-006: 同日重複禁止
+            # ABS-006: 同日重複禁止（絶対不可）
             if date in assigned_dates[doc]:
                 continue
 
             code = get_avail_code(date, doc)
 
-            # ABS-001: コード0は全列禁止
+            # ABS-001: コード0は全列禁止（絶対不可）
             if code == 0:
                 continue
 
@@ -1082,22 +1105,24 @@ def choose_doctor_for_slot(
                 if doc in WED_FORBIDDEN_DOCTORS:
                     continue
 
+            # === v6.3.0: 以下のABS制約はrelax_abs=Trueで緩和可能 ===
+
             # ABS-007: gap >= 3日必須
-            if assigned_dates[doc]:
+            if not relax_abs and assigned_dates[doc]:
                 min_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_dates[doc])
                 if min_gap < 3:
                     continue
 
             # ABS-008: 同一病院重複禁止（全列）
-            if assigned_hosp_count[doc].get(hospital_name, 0) >= 1:
+            if not relax_abs and assigned_hosp_count[doc].get(hospital_name, 0) >= 1:
                 continue
 
             # ABS-010: TARGET_CAP遵守（n超過禁止）
-            if assigned_count[doc] >= TARGET_CAP.get(doc, 0):
+            if not relax_abs and assigned_count[doc] >= TARGET_CAP.get(doc, 0):
                 continue
 
             # ABS-011: 大学系2回まで（B-K列合計）
-            if is_BG and assigned_bg[doc] >= 2:
+            if not relax_abs and is_BG and assigned_bg[doc] >= 2:
                 continue
 
             # === ハード制約（HARD）: カテなし医師は必須遵守 ===
@@ -1141,8 +1166,7 @@ def choose_doctor_for_slot(
             candidates.append(doc)
         return candidates
 
-    # v6.0.1: 段階的制約緩和（ABS-009回避優先）
-    # ABS制約（010/011含む）は常に厳守、SEMI/HARDのみ段階的に緩和
+    # v6.3.0: 段階的制約緩和（未割当回避を最優先）
     # 1. 全制約適用
     candidates = collect_candidates()
     # 2. SEMI緩和
@@ -1151,8 +1175,12 @@ def choose_doctor_for_slot(
     # 3. HARD緩和（SEMI緩和済み）
     if not candidates:
         candidates = collect_candidates(relax_semi=True, relax_hard=True)
+    # 4. ABS緩和（SEMI/HARD緩和済み）- 未割当を絶対に回避
+    if not candidates:
+        candidates = collect_candidates(relax_semi=True, relax_hard=True, relax_abs=True)
 
     if not candidates:
+        # 全制約緩和後も候補なし（コード0または同日重複のみ）
         return None
 
     any_under_floor = any(assigned_count[d] < floor_shifts for d in active_doctors)
@@ -1491,6 +1519,13 @@ for date in all_dates:
         slot_meta[(ridx, hosp)] = (date, False)
         movable_positions.append((ridx, hosp, date))
 
+def is_preassigned_slot(ridx, hosp):
+    """v6.2.0: そのスロットが固定割当（事前割当）かどうかを判定"""
+    meta = slot_meta.get((ridx, hosp))
+    if meta is None:
+        return False
+    return meta[1]  # fixed flag
+
 # =========================
 # パターン統計再計算（pattern_df から）
 # =========================
@@ -1671,8 +1706,10 @@ def evaluate_schedule_with_raw(
         fairness_penalty = max(0, diff_total - 1)
 
     # gap(4日未満) と 同一病院重複
-    dates_by_doc = defaultdict(list)
+    # v6.2.0: 各割当が固定割当かどうかも記録（gap/dup計算で固定割当を除外するため）
+    dates_by_doc = defaultdict(list)  # doc -> [(date, is_preassigned), ...]
     hosp_counts_by_doc = {doc: defaultdict(int) for doc in doctor_names}
+    hosp_preassigned_counts = {doc: defaultdict(int) for doc in doctor_names}  # 固定割当分
 
     for ridx in pattern_df.index:
         date = pattern_df.at[ridx, date_col_shift]
@@ -1683,14 +1720,20 @@ def evaluate_schedule_with_raw(
             val = pattern_df.at[ridx, hosp]
             val_norm = normalize_name(val) if isinstance(val, str) else ""  # 🔧 FIX
             if val_norm in doctor_names:
-                dates_by_doc[val_norm].append(date)
+                is_pre = is_preassigned_slot(ridx, hosp)
+                dates_by_doc[val_norm].append((date, is_pre))
                 hosp_counts_by_doc[val_norm][hosp] += 1
+                if is_pre:
+                    hosp_preassigned_counts[val_norm][hosp] += 1
 
     gap_violations = 0
-    for doc, dlist in dates_by_doc.items():
-        dlist = sorted(dlist)
-        for i in range(1, len(dlist)):
-            if (dlist[i] - dlist[i - 1]).days < 3:
+    for doc, date_flags in dates_by_doc.items():
+        sorted_dates = sorted(date_flags, key=lambda x: x[0])
+        for i in range(1, len(sorted_dates)):
+            if (sorted_dates[i][0] - sorted_dates[i - 1][0]).days < 3:
+                # v6.2.0: 固定割当が片方でも含まれるgapは許容（意図的な配置）
+                if sorted_dates[i][1] or sorted_dates[i - 1][1]:
+                    continue
                 gap_violations += 1
 
     hosp_dup_violations = 0
@@ -1699,6 +1742,8 @@ def evaluate_schedule_with_raw(
         for hosp, c in hdict.items():
             # CC分を除外（CCは特別シフトなので重複カウントから除外）
             c_no_cc = c - cc_hosp_counts.get(doc, {}).get(hosp, 0)
+            # v6.2.0: 固定割当分も除外（固定割当による重複は許容）
+            c_no_cc -= hosp_preassigned_counts.get(doc, {}).get(hosp, 0)
             if c_no_cc > 1:
                 # 病院が外病院（L～Y列）かどうかを判定
                 hidx = shift_df.columns.get_loc(hosp)
@@ -1779,6 +1824,7 @@ def evaluate_schedule_with_raw(
 
     # C-H列（休日大学系）カテ当番違反
     # カテ当番保有医師がその日にカテ当番なしでC-H列に割り当てられている場合
+    # v6.2.0: 固定割当は許容（意図的な配置のため）
     ch_kate_violations = 0
     for ridx in pattern_df.index:
         date = pattern_df.at[ridx, date_col_shift]
@@ -1786,6 +1832,9 @@ def evaluate_schedule_with_raw(
             continue
         date = pd.to_datetime(date).normalize().tz_localize(None)
         for hosp in hospital_cols:
+            # v6.2.0: 固定割当は許容
+            if is_preassigned_slot(ridx, hosp):
+                continue
             idx = shift_df.columns.get_loc(hosp)
             if not is_ch_slot(idx):
                 continue
@@ -2234,6 +2283,17 @@ def build_summaries(pattern_df, counts, bg_counts, ht_counts, wd_counts, we_coun
 # 診断シート生成（偏り & gap違反一覧）
 # =========================
 def build_gap_details(doc_assignments):
+    """gap違反（3日未満の間隔）の詳細リストを生成
+    v6.2.0: 固定割当が含まれるgapは除外（意図的な配置のため）
+    """
+    # 各(date, hosp)が固定割当かどうかを逆引きするため、slot_metaからhosp逆引き表を構築
+    def _is_preassigned_assignment(date, hosp):
+        """doc_assignmentsの(date,hosp)が固定割当かを判定"""
+        for (ridx, h), (d, fixed) in slot_meta.items():
+            if h == hosp and d == date and fixed:
+                return True
+        return False
+
     rows = []
     for doc, assigns in doc_assignments.items():
         assigns_sorted = sorted(assigns, key=lambda x: (x[0], x[1]))
@@ -2242,6 +2302,9 @@ def build_gap_details(doc_assignments):
             d_cur, h_cur = assigns_sorted[i]
             gap = (d_cur - d_prev).days
             if gap < 3:
+                # v6.2.0: 固定割当が片方でも含まれるgapは許容
+                if _is_preassigned_assignment(d_prev, h_prev) or _is_preassigned_assignment(d_cur, h_cur):
+                    continue
                 rows.append({
                     "氏名": doc,
                     "前回日付": d_prev,
@@ -2371,7 +2434,9 @@ def build_metrics_df(score_clamped, raw_score, metrics):
     return pd.DataFrame(rows)
 
 def build_hard_constraint_violations(pattern_df):
-    """ハード制約違反の詳細リストを生成"""
+    """ハード制約違反の詳細リストを生成
+    v6.2.0: 固定割当（事前割当）スロットは検査対象外（意図的な配置のため）
+    """
     rows = []
 
     for ridx in pattern_df.index:
@@ -2382,6 +2447,10 @@ def build_hard_constraint_violations(pattern_df):
         dow = date.weekday()
 
         for hosp in hospital_cols:
+            # v6.2.0: 固定割当は意図的な配置のため、違反検出をスキップ
+            if is_preassigned_slot(ridx, hosp):
+                continue
+
             val = pattern_df.at[ridx, hosp]
             if not isinstance(val, str):
                 continue
@@ -2766,6 +2835,9 @@ def fix_target_cap_violations(pattern_df, max_attempts=100, verbose=True):
                 for hosp in hospital_cols:
                     val = df.at[ridx, hosp]
                     if isinstance(val, str) and normalize_name(val) == over_doc:
+                        # v6.2.0: 固定割当は移動対象外
+                        if is_preassigned_slot(ridx, hosp):
+                            continue
                         over_doc_positions.append((ridx, hosp, date))
 
             import random
@@ -2935,6 +3007,9 @@ def fix_code_2_extra_violations(pattern_df, max_attempts=100, verbose=True):
                 for hosp in hospital_cols:
                     val = df.at[ridx, hosp]
                     if isinstance(val, str) and normalize_name(val) == over_doc:
+                        # v6.2.0: 固定割当は移動対象外
+                        if is_preassigned_slot(ridx, hosp):
+                            continue
                         over_doc_positions.append((ridx, hosp, date))
 
             import random
@@ -3103,6 +3178,9 @@ def fix_university_minimum_requirement(pattern_df, max_attempts=100, verbose=Tru
                     if L_COL_INDEX <= idx <= L_Y_END_INDEX:
                         val = df.at[ridx, hosp]
                         if isinstance(val, str) and normalize_name(val) == zero_doc:
+                            # v6.2.0: 固定割当は移動対象外
+                            if is_preassigned_slot(ridx, hosp):
+                                continue
                             zero_doc_ly_positions.append((ridx, hosp, date))
 
             # 外病院の割当を1つ大学系に変更
@@ -3402,6 +3480,9 @@ def fix_bg_ht_imbalance_violations(pattern_df, max_attempts=100, verbose=True):
                     if source_range[0] <= idx <= source_range[1]:
                         val = df.at[ridx, hosp]
                         if isinstance(val, str) and normalize_name(val) == doc:
+                            # v6.2.0: 固定割当は移動対象外
+                            if is_preassigned_slot(ridx, hosp):
+                                continue
                             source_positions.append((ridx, hosp, date))
 
             # 1つ移動を試みる
@@ -3518,6 +3599,9 @@ def fix_gap_violations(pattern_df, max_attempts=200, verbose=True):
                 for hosp in hospital_cols:
                     val = df.at[ridx, hosp]
                     if isinstance(val, str) and normalize_name(val) == doc:
+                        # v6.2.0: 固定割当は移動対象外
+                        if is_preassigned_slot(ridx, hosp):
+                            continue
                         positions_at_date2.append((ridx, hosp, date))
 
             # 各positionに対して修正を試みる
@@ -3690,6 +3774,9 @@ def fix_external_hospital_dup_violations(pattern_df, max_attempts=150, verbose=T
 
                 val = df.at[ridx, dup_hosp]
                 if isinstance(val, str) and normalize_name(val) == doc:
+                    # v6.2.0: 固定割当は移動対象外
+                    if is_preassigned_slot(ridx, dup_hosp):
+                        continue
                     dup_positions.append((ridx, dup_hosp, date))
 
             # 重複のうち1つを残して、残りを別の病院に移動または削除
@@ -3849,6 +3936,9 @@ def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True)
 
                     val = df.at[ridx, hosp]
                     if isinstance(val, str) and normalize_name(val) == doc:
+                        # v6.2.0: 固定割当は移動対象外
+                        if is_preassigned_slot(ridx, hosp):
+                            continue
                         bg_positions.append((ridx, hosp, date))
 
             # 移動数を決定
@@ -4054,6 +4144,9 @@ def fix_university_weekday_balance_violations(pattern_df, max_attempts=150, verb
 
                     val = df.at[ridx, hosp]
                     if isinstance(val, str) and normalize_name(val) == doc:
+                        # v6.2.0: 固定割当は移動対象外
+                        if is_preassigned_slot(ridx, hosp):
+                            continue
                         # 平日か
                         category = classify_bg_category(date, hosp)
                         if category == "平日":
@@ -5125,29 +5218,38 @@ base_name = uploaded_filename.rsplit(".", 1)[0]
 output_filename = f"{base_name}_v{VERSION}.xlsx"
 output_path = output_filename
 
-def write_diagnostics_sheet(writer, sheet_name, diagnostics):
+def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnostics):
+    """v6.3.0: 今月/累計/診断を1シートに統合して出力"""
     startrow = 0
+
+    # 今月サマリー
+    ws = writer.book.create_sheet(sheet_name)
+    writer.sheets[sheet_name] = ws
+    ws.cell(row=1, column=1, value="【今月サマリー】")
+    df_month.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
+    startrow = len(df_month.index) + 4
+
+    # 累計サマリー
+    ws.cell(row=startrow, column=1, value="【累計サマリー】")
+    df_total.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
+    startrow += len(df_total.index) + 4
+
+    # 診断情報
     for title, df in diagnostics:
-        df.to_excel(writer, sheet_name=sheet_name, startrow=startrow + 1, index=False)
-        ws = writer.sheets[sheet_name]
-        ws.cell(row=startrow + 1, column=1, value=title)
+        ws.cell(row=startrow, column=1, value=title)
+        df.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
         startrow += len(df.index) + 3
 
 
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-    # 元シート
-    shift_df.to_excel(writer, sheet_name="sheet1", index=False)
-    availability_raw.to_excel(writer, sheet_name="sheet2", index=False)
-    schedule_raw.to_excel(writer, sheet_name="sheet3", index=False)
-    sheet4_raw_out.to_excel(writer, sheet_name="sheet4", index=False)
+    # v6.3.0: sheet1-4は出力しない（元データ不要）
 
     # TOPパターン出力
     for rank, entry in enumerate(top_patterns, start=1):
         axis_label = entry.get('axis_label', '総合スコア')
         sheet_label = f"pattern_{rank:02d}"
 
-        # パターンシートのコメント行に軸ラベルを追加
-        pattern_df_with_label = entry["pattern_df"].copy()
+        # パターンシート
         entry["pattern_df"].to_excel(writer, sheet_name=sheet_label, index=False)
 
         # シート名に軸ラベルを追加（Excelの制限により簡略化）
@@ -5155,25 +5257,24 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         axis_short = {"公平性重視": "公平性", "連続当直回避重視": "gap回避", "バランス重視": "バランス", "総合スコア": "総合"}.get(axis_label, axis_label)
         ws.cell(row=1, column=len(entry["pattern_df"].columns) + 2, value=f"【{axis_short}】")
 
-        # summary（今月/累計）
+        # v6.3.0: 今月/累計/診断を1シートに統合
         counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(entry["pattern_df"])
         df_month, df_total = build_summaries(entry["pattern_df"], counts, bg_counts, ht_counts, wd_counts, we_counts, bg_cat)
-        df_month.to_excel(writer, sheet_name=f"{sheet_label}_今月", index=False)
-        df_total.to_excel(writer, sheet_name=f"{sheet_label}_累計", index=False)
-
-        # diagnostics
         df_doctors, df_gap, df_same, df_hdup, df_unass, df_metrics, df_hard_violations = build_diagnostics(entry["pattern_df"])
-        write_diagnostics_sheet(
+
+        write_combined_summary_sheet(
             writer,
-            sheet_name=f"{sheet_label}_diag",
+            sheet_name=f"{sheet_label}_summary",
+            df_month=df_month,
+            df_total=df_total,
             diagnostics=[
-                ("医師ごとの偏り", df_doctors),
-                ("制約違反: gap（3日未満）", df_gap),
-                ("制約違反: 同日重複", df_same),
-                ("制約違反: 同一病院重複", df_hdup),
-                ("制約違反: 未割当枠", df_unass),
-                ("制約違反: ハード/SEMI", df_hard_violations),
-                ("スコアサマリー", df_metrics),
+                ("【医師ごとの偏り】", df_doctors),
+                ("【制約違反: gap（3日未満）】", df_gap),
+                ("【制約違反: 同日重複】", df_same),
+                ("【制約違反: 同一病院重複】", df_hdup),
+                ("【制約違反: 未割当枠】", df_unass),
+                ("【制約違反: 重要/推奨ルール】", df_hard_violations),
+                ("【スコアサマリー】", df_metrics),
             ],
         )
 
@@ -5182,10 +5283,9 @@ print("  🎉 完了")
 print("="*60)
 print(f"\n📥 出力: {output_path}")
 print("\n【内容】")
-print("  sheet1〜4: 元データ")
 for rank in range(1, len(top_patterns) + 1):
     label = f"pattern_{rank:02d}"
-    print(f"  {label}: スケジュール / {label}_今月・累計: サマリー / {label}_diag: 診断")
+    print(f"  {label}: スケジュール / {label}_summary: サマリー・診断")
 print("="*60)
 
 if COLAB_AVAILABLE:
