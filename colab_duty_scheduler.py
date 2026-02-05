@@ -1,5 +1,10 @@
-# @title 当直くん v6.5.0 (Excel構造変更対応 + 7日間隔ルール)
+# @title 当直くん v6.5.1 (SEMI制約判定バグ修正)
 # 修正内容:
+# v6.5.1 (2026-02-05):
+# - SEMI制約の違反検出バグを修正
+#   - SEMI-001: B列のみ（従来はB-K列全体を誤検出していた）
+#   - SEMI-002: C-H列のみ（I-K列は対象外として正しく除外）
+#   - これにより大量のSEMI違反が誤検出される問題を解消
 # v6.5.0 (2026-02-05):
 # - Excel構造変更に対応
 #   - Sheet1:Z列「カテ当番」を病院列から除外し、チーム当番日として使用
@@ -1102,22 +1107,18 @@ def has_any_schedule_code(doc):
     v6.5.0: Sheet4:属性またはSheet3のカテ表コードで判定
     """
     # v6.5.0: Sheet4:属性にカテチーム（A,B,C,D,E等）があればTrue
-    try:
-        if 'doctor_kate_team' in globals():
-            team = doctor_kate_team.get(doc, "")
-            if team and team not in ("0", "3", ""):
-                return True
-    except Exception:
-        pass
+    if 'doctor_kate_team' in globals() and doctor_kate_team:
+        team = doctor_kate_team.get(doc, "")
+        if team and team not in ("0", "3", "", "nan", "None"):
+            return True
 
     # 従来方式: Sheet3のカテ表コードをチェック
-    if doc not in schedule_df.columns:
-        return False
-    values = schedule_df[doc].dropna()
-    for v in values:
-        s = str(v).strip()
-        if s and s != "0" and s != "3":  # 0と3以外のコードがあればTrue
-            return True
+    if len(schedule_df.columns) > 0 and doc in schedule_df.columns:
+        values = schedule_df[doc].dropna()
+        for v in values:
+            s = str(v).strip()
+            if s and s != "0" and s != "3":  # 0と3以外のコードがあればTrue
+                return True
     return False
 
 RATIO_EXEMPT_DOCTORS = {doc for doc in doctor_names if has_sheet3_code_3(doc)}
@@ -1127,6 +1128,32 @@ if RATIO_EXEMPT_DOCTORS:
 SCHEDULE_CODE_HOLDERS = {doc for doc in doctor_names if has_any_schedule_code(doc)}
 NO_KATE_DOCTORS = {doc for doc in doctor_names if not has_any_schedule_code(doc)}
 print(f"   カテ表保有: {len(SCHEDULE_CODE_HOLDERS)}人 | カテ当番なし: {len(NO_KATE_DOCTORS)}人")
+
+# v6.5.0: デバッグ情報
+if len(SCHEDULE_CODE_HOLDERS) == 0:
+    # カテ表保有者が0人の場合、問題がある
+    sample_teams = [(d, doctor_kate_team.get(d, "")) for d in list(doctor_names)[:5]]
+    print(f"   ⚠️ カテ表保有者0人 - doctor_kate_team サンプル = {sample_teams}")
+else:
+    print(f"   カテ表保有者 (例): {list(SCHEDULE_CODE_HOLDERS)[:5]}")
+
+# v6.5.0: get_sched_code()の動作確認
+if kate_team_by_date and doctor_kate_team:
+    # サンプル日付でget_sched_code()の動作を確認
+    sample_date = list(kate_team_by_date.keys())[0] if kate_team_by_date else None
+    if sample_date:
+        sample_team = kate_team_by_date[sample_date]
+        # このチームに属する医師を探す
+        matching_docs = [d for d in doctor_names if doctor_kate_team.get(d) == sample_team]
+        non_matching_docs = [d for d in doctor_names if doctor_kate_team.get(d) and doctor_kate_team.get(d) != sample_team][:3]
+        if matching_docs:
+            sample_doc = matching_docs[0]
+            result = get_sched_code(sample_date, sample_doc)
+            print(f"   📋 カテ当番判定テスト: {sample_date.strftime('%m/%d')}(チーム{sample_team}) + {sample_doc}(チーム{doctor_kate_team.get(sample_doc)}) = {result}")
+        if non_matching_docs:
+            sample_doc2 = non_matching_docs[0]
+            result2 = get_sched_code(sample_date, sample_doc2)
+            print(f"   📋 カテ当番判定テスト: {sample_date.strftime('%m/%d')}(チーム{sample_team}) + {sample_doc2}(チーム{doctor_kate_team.get(sample_doc2)}) = {result2}")
 
 # sheet3で「1」を持つ医師（平日大学系でカテ当番不一致を許容）
 def has_sheet3_code_1(doc):
@@ -2861,21 +2888,35 @@ def build_hard_constraint_violations(pattern_df):
                     "詳細": f"[{CONSTRAINT_ABS_004}] カテ表（{sched_code}）がある日は外病院（L〜Y列）に割当不可。列{idx}に割当",
                 })
 
-            # 違反5: B〜K列でカテ表コードなし（カテ表コード保有医師のみ、EXTRA医師は例外）(SEMI-001/002)
-            if B_COL_INDEX <= idx <= B_K_END_INDEX and doc in SCHEDULE_CODE_HOLDERS and not sched_code and doc not in EXTRA_ALLOWED:
-                # C-H列は休日大学系(SEMI-002)、それ以外は平日大学系(SEMI-001)
-                constraint_id = CONSTRAINT_SEMI_002 if C_COL_INDEX <= idx <= H_COL_INDEX else CONSTRAINT_SEMI_001
-                rows.append({
-                    "制約ID": constraint_id,
-                    "違反種別": "B-K列カテ表コード欠如",
-                    "日付": date,
-                    "医師名": doc,
-                    "病院": hosp,
-                    "列番号": idx,
-                    "可否コード": code,
-                    "カテ表": "",
-                    "詳細": f"[{constraint_id}] B〜K列（大学系）の割当にカテ表コードが必要（カテ表コード保有医師、EXTRA医師は例外）。列{idx}に割当",
-                })
+            # 違反5: SEMI-001（B列のみ）/ SEMI-002（C-H列のみ）カテ表コードなし
+            # ※I-K列はSEMI制約対象外（平日緩和のため）
+            if doc in SCHEDULE_CODE_HOLDERS and not sched_code and doc not in EXTRA_ALLOWED:
+                # SEMI-001: B列のみカテ表コード必須
+                if idx == B_COL_INDEX:
+                    rows.append({
+                        "制約ID": CONSTRAINT_SEMI_001,
+                        "違反種別": "B列カテ表コード欠如",
+                        "日付": date,
+                        "医師名": doc,
+                        "病院": hosp,
+                        "列番号": idx,
+                        "可否コード": code,
+                        "カテ表": "",
+                        "詳細": f"[{CONSTRAINT_SEMI_001}] B列（平日大学系）の割当にカテ表コードが必要",
+                    })
+                # SEMI-002: C-H列のみカテ当番日必須
+                elif C_COL_INDEX <= idx <= H_COL_INDEX:
+                    rows.append({
+                        "制約ID": CONSTRAINT_SEMI_002,
+                        "違反種別": "C-H列カテ表コード欠如",
+                        "日付": date,
+                        "医師名": doc,
+                        "病院": hosp,
+                        "列番号": idx,
+                        "可否コード": code,
+                        "カテ表": "",
+                        "詳細": f"[{CONSTRAINT_SEMI_002}] C-H列（休日大学系）の割当にカテ表コードが必要",
+                    })
 
             # 違反6: 水曜日L〜Y列禁止医師 (ABS-006)
             if dow == 2 and L_COL_INDEX <= idx <= L_Y_END_INDEX and doc in WED_FORBIDDEN_DOCTORS:
