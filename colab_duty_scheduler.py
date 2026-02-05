@@ -528,18 +528,32 @@ if COLAB_AVAILABLE:
     sheet3_name = find_sheet_name(xls, "sheet3")
     sheet4_name = find_sheet_name(xls, "sheet4") or find_sheet_name(xls, "Sheet4")
 
-    missing = [k for k, v in [("sheet1", sheet1_name), ("sheet2", sheet2_name), ("sheet3", sheet3_name), ("sheet4", sheet4_name)] if v is None]
+    # v6.5.0: 新しいExcel構造対応
+    # Sheet4がない場合はSheet3を医師情報シートとして使用（旧Sheet3のカテ表は廃止）
+    if sheet4_name is None and sheet3_name is not None:
+        print("📋 Sheet4が見つかりません - Sheet3を医師情報シートとして使用")
+        sheet4_name = sheet3_name
+        sheet3_name = None  # 旧カテ表は使用しない
+
+    missing = [k for k, v in [("sheet1", sheet1_name), ("sheet2", sheet2_name), ("sheet4/医師情報", sheet4_name)] if v is None]
     if missing:
         raise ValueError(f"❌ 必要なシートが見つかりません: {missing}\n実際のシート名: {xls.sheet_names}")
 
     # --------- Excel 読み込み ---------
     shift_df = strip_cols(pd.read_excel(xls, sheet_name=sheet1_name))
     availability_raw = strip_cols(pd.read_excel(xls, sheet_name=sheet2_name))
-    schedule_raw = strip_cols(pd.read_excel(xls, sheet_name=sheet3_name))
+
+    # v6.5.0: 旧カテ表(Sheet3)がない場合は空のDataFrameを使用
+    if sheet3_name is not None:
+        schedule_raw = strip_cols(pd.read_excel(xls, sheet_name=sheet3_name))
+        schedule_raw.columns = make_unique(list(schedule_raw.columns))
+    else:
+        # カテ表はSheet1:Z + Sheet4:属性で代替するため空でOK
+        schedule_raw = pd.DataFrame()
+        print("📋 旧カテ表(Sheet3)は使用しません - Sheet1:Z列 + Sheet4:属性で判定")
 
     shift_df.columns = make_unique(list(shift_df.columns))
     availability_raw.columns = make_unique(list(availability_raw.columns))
-    schedule_raw.columns = make_unique(list(schedule_raw.columns))
 
     # sheet4 は「出力用」と「解析用（header=None）」を分ける
     sheet4_raw_out = strip_cols(pd.read_excel(xls, sheet_name=sheet4_name))
@@ -584,9 +598,14 @@ date_col_avail = availability_raw.columns[0]
 availability_raw[date_col_avail] = pd.to_datetime(availability_raw[date_col_avail], errors="coerce").dt.normalize().dt.tz_localize(None)  # 🔧 FIX
 availability_df = availability_raw.set_index(date_col_avail)
 
-date_col_sched = schedule_raw.columns[0]
-schedule_raw[date_col_sched] = pd.to_datetime(schedule_raw[date_col_sched], errors="coerce").dt.normalize().dt.tz_localize(None)  # 🔧 FIX
-schedule_df = schedule_raw.set_index(date_col_sched)
+# v6.5.0: schedule_rawが空の場合（新Excel構造）は空のDataFrameを使用
+if len(schedule_raw.columns) > 0:
+    date_col_sched = schedule_raw.columns[0]
+    schedule_raw[date_col_sched] = pd.to_datetime(schedule_raw[date_col_sched], errors="coerce").dt.normalize().dt.tz_localize(None)
+    schedule_df = schedule_raw.set_index(date_col_sched)
+else:
+    schedule_df = pd.DataFrame()
+    date_col_sched = None
 
 # 🔧 FIX: 祝日もタイムゾーン正規化
 HOLIDAYS = {pd.to_datetime(d).normalize().tz_localize(None) for d in HOLIDAYS}
@@ -771,16 +790,20 @@ def get_sched_code(date, doctor):
     return None
 
 # sheet2 と sheet3 の医師列がズレていないか（ズレてても動くが、制約が弱くなる）
-sched_doctors = [normalize_name(x) for x in list(schedule_raw.columns[1:])]  # 🔧 FIX
-if doctor_names != sched_doctors:
-    print("⚠️ WARNING: sheet2(可否) と sheet3(カテ表) の医師列が一致していません。")
-    only2 = [d for d in doctor_names if d not in sched_doctors]
-    only3 = [d for d in sched_doctors if d not in doctor_names]
-    if only2:
-        print(f"   sheet2 only (先頭10): {only2[:10]}")
-    if only3:
-        print(f"   sheet3 only (先頭10): {only3[:10]}")
-    print("   ※H〜U の『カテ表あり不可』制約が一部の医師で効かない可能性があります。")
+# v6.5.0: schedule_rawが空の場合（新Excel構造）はスキップ
+if len(schedule_raw.columns) > 1:
+    sched_doctors = [normalize_name(x) for x in list(schedule_raw.columns[1:])]
+    if doctor_names != sched_doctors:
+        print("⚠️ WARNING: sheet2(可否) と sheet3(カテ表) の医師列が一致していません。")
+        only2 = [d for d in doctor_names if d not in sched_doctors]
+        only3 = [d for d in sched_doctors if d not in doctor_names]
+        if only2:
+            print(f"   sheet2 only (先頭10): {only2[:10]}")
+        if only3:
+            print(f"   sheet3 only (先頭10): {only3[:10]}")
+        print("   ※H〜U の『カテ表あり不可』制約が一部の医師で効かない可能性があります。")
+else:
+    sched_doctors = []
 
 # =========================
 # sheet4 前月まで累積
@@ -1045,7 +1068,19 @@ def has_sheet3_code_3(doc):
     return any(str(v).strip() == "3" for v in values)
 
 def has_any_schedule_code(doc):
-    """医師がsheet3で少なくとも1つのカテ表コード（A,B,C,CC,D,E等、3以外）を持っているか"""
+    """医師がカテ当番を持っているか
+    v6.5.0: Sheet4:属性またはSheet3のカテ表コードで判定
+    """
+    # v6.5.0: Sheet4:属性にカテチーム（A,B,C,D,E等）があればTrue
+    try:
+        if 'doctor_kate_team' in globals():
+            team = doctor_kate_team.get(doc, "")
+            if team and team not in ("0", "3", ""):
+                return True
+    except Exception:
+        pass
+
+    # 従来方式: Sheet3のカテ表コードをチェック
     if doc not in schedule_df.columns:
         return False
     values = schedule_df[doc].dropna()
