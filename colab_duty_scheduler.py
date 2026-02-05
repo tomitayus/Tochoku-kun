@@ -1,5 +1,15 @@
-# @title 当直くん v6.4.0 (大学系週1ルール + ABS緩和 + シート統合)
+# @title 当直くん v6.5.0 (Excel構造変更対応 + 7日間隔ルール)
 # 修正内容:
+# v6.5.0 (2026-02-05):
+# - Excel構造変更に対応
+#   - Sheet1:Z列「カテ当番」を病院列から除外し、チーム当番日として使用
+#   - Sheet4:B列「属性」からカテチーム属性を読み込み
+#   - get_sched_code()をSheet1:Z + Sheet4:属性で判定（Sheet3でオーバーライド）
+#   - Sheet2の休み希望（1,2,3優先度）に対応（空欄=制約なし、0=不可、1=最優先休み、2=できれば休み、3=可能なら休み）
+#   - 出張曜日の前日を自動的に不可（0）として扱う
+# - 大学系7日間隔ルールに変更（ABS-012改）
+#   - 日曜〜土曜の週単位から「7日以内に2回禁止」に変更
+#   - 3/11と3/15のような週をまたぐケースも検出
 # v6.4.0 (2026-02-04):
 # - 大学系週1回ルール（ABS-012）を実装
 #   - 日曜〜土曜の週単位で大学系（B-K列）は1回まで
@@ -296,7 +306,7 @@ import importlib.util
 import os
 
 # バージョン定数
-VERSION = "6.4.0"
+VERSION = "6.5.0"
 
 # tqdmのインポート（進捗バー用）
 try:
@@ -482,9 +492,15 @@ def parse_sheet4_from_grid(grid: pd.DataFrame) -> pd.DataFrame:
     data["氏名"] = data["氏名"].astype(str).str.strip()
     data = data[(data["氏名"].notna()) & (data["氏名"] != "") & (data["氏名"].str.lower() != "nan")].reset_index(drop=True)
 
-    # 数値化（氏名以外）
+    # v6.5.0: 属性・出張日は文字列として保持
+    STRING_COLS = {"属性", "カテ当番", "出張日", "出張先"}
+
+    # 数値化（氏名・文字列列以外）
     for col in data.columns:
-        if col == "氏名":
+        if col == "氏名" or col in STRING_COLS:
+            # 文字列として保持
+            data[col] = data[col].astype(str).str.strip()
+            data[col] = data[col].replace(["nan", "None", ""], "")
             continue
         data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0)
 
@@ -588,7 +604,22 @@ doctor_col_index = {doc: idx for idx, doc in enumerate(doctor_names)}
 # 🔧 FIX: 禁止医師名も正規化
 WED_FORBIDDEN_DOCTORS = {normalize_name(d) for d in WED_FORBIDDEN_DOCTORS}  # 🔧 FIX
 
-hospital_cols = list(shift_df.columns[1:])
+# v6.5.0: Sheet1:Z列「カテ当番」を病院列から除外
+# カテ当番列の検出（「カテ当番」という名前の列を探す）
+KATE_TOBAN_COL = None
+all_cols = list(shift_df.columns[1:])
+for col in all_cols:
+    if str(col).strip() == "カテ当番":
+        KATE_TOBAN_COL = col
+        break
+
+if KATE_TOBAN_COL is not None:
+    hospital_cols = [c for c in all_cols if c != KATE_TOBAN_COL]
+    print(f"✅ Sheet1:Z列「カテ当番」を検出 - 病院列から除外")
+else:
+    hospital_cols = all_cols
+    print("⚠️ Sheet1に「カテ当番」列が見つかりません（従来方式を使用）")
+
 n_cols = len(shift_df.columns)
 
 # 列インデックス（テンプレ依存：B〜Y を想定）
@@ -643,11 +674,28 @@ for doc in doctor_names:
         fallback_avail_codes[doc] = c
 
 def get_avail_code(date, doctor):
+    """可否コードを取得
+    v6.5.0: 出張曜日の前日は自動的に0（不可）として扱う
+    """
+    date_norm = pd.to_datetime(date).normalize().tz_localize(None)
+
+    # v6.5.0: 出張曜日の前日は0（不可）として扱う
+    try:
+        if 'doctor_travel_day' in globals() and 'WEEKDAY_MAP' in globals():
+            travel_str = doctor_travel_day.get(doctor, "")
+            if travel_str and travel_str in WEEKDAY_MAP:
+                travel_wd = WEEKDAY_MAP[travel_str]
+                pre_travel_wd = (travel_wd - 1) % 7
+                if date_norm.weekday() == pre_travel_wd:
+                    return 0  # 出張前日は不可
+    except Exception:
+        pass
+
     code = None
     raw_value = None
     if isinstance(availability_df.index, pd.DatetimeIndex):
         try:
-            value = availability_df.at[pd.to_datetime(date).normalize().tz_localize(None), doctor]  # 🔧 FIX
+            value = availability_df.at[date_norm, doctor]
             if isinstance(value, pd.Series):
                 value = value.iloc[0]
             if pd.notna(value):
@@ -665,23 +713,62 @@ def get_avail_code(date, doctor):
         code = 1
     return code
 
-def get_sched_code(date, doctor):
-    """その日の有効なカテ表コードを取得（0と3は無効として扱う）"""
-    if doctor not in schedule_df.columns:
+def get_dayoff_request_priority(date, doctor):
+    """v6.5.0: 休み希望の優先度を取得（1=最優先, 2=できれば, 3=可能なら, None=希望なし）
+    Sheet2の値を休み希望として解釈（空欄=希望なし、1/2/3=優先度）
+    """
+    date_norm = pd.to_datetime(date).normalize().tz_localize(None)
+    if not isinstance(availability_df.index, pd.DatetimeIndex):
         return None
     try:
-        value = schedule_df.at[pd.to_datetime(date).normalize().tz_localize(None), doctor]  # 🔧 FIX
+        value = availability_df.at[date_norm, doctor]
         if isinstance(value, pd.Series):
             value = value.iloc[0]
+        if pd.isna(value):
+            return None  # 空欄=希望なし
+        raw_value = float(value)
+        # 1, 2, 3は休み希望の優先度として解釈
+        if raw_value in (1, 2, 3):
+            return int(raw_value)
     except Exception:
-        return None
-    if pd.isna(value):
-        return None
-    code_str = str(value).strip()
-    # 0と3は有効なカテ表コードではない（0=データなし、3=可否コード）
-    if not code_str or code_str == "0" or code_str == "3":
-        return None
-    return code_str
+        pass
+    return None
+
+def get_sched_code(date, doctor):
+    """その日の有効なカテ表コードを取得
+    v6.5.0: Sheet3に直接記載があればそれを優先、なければSheet1:Z + Sheet4:属性で判定
+    """
+    date_norm = pd.to_datetime(date).normalize().tz_localize(None)
+
+    # 1. Sheet3に直接記載があればそれを優先（特別シフト: CC1, CC2等）
+    if doctor in schedule_df.columns:
+        try:
+            value = schedule_df.at[date_norm, doctor]
+            if isinstance(value, pd.Series):
+                value = value.iloc[0]
+            if pd.notna(value):
+                code_str = str(value).strip()
+                # 0と3は有効なカテ表コードではない（0=データなし、3=可否コード）
+                # ただし「1」は平日緩和フラグとして有効
+                if code_str and code_str != "0" and code_str != "3":
+                    return code_str
+        except Exception:
+            pass
+
+    # 2. Sheet1:Z + Sheet4:属性 で判定（v6.5.0 新機能）
+    # kate_team_by_date と doctor_kate_team はグローバル変数として後で設定される
+    try:
+        if 'kate_team_by_date' in globals() and 'doctor_kate_team' in globals():
+            team_on_duty = kate_team_by_date.get(date_norm)
+            doc_team = doctor_kate_team.get(doctor, "")
+            if team_on_duty and doc_team:
+                # チームが一致すればカテ当番
+                if team_on_duty == doc_team:
+                    return team_on_duty
+    except Exception:
+        pass
+
+    return None
 
 # sheet2 と sheet3 の医師列がズレていないか（ズレてても動くが、制約が弱くなる）
 sched_doctors = [normalize_name(x) for x in list(schedule_raw.columns[1:])]  # 🔧 FIX
@@ -728,6 +815,71 @@ prev_bg      = {d: prev_get(d, "大学合計") for d in doctor_names}
 prev_ht      = {d: prev_get(d, "外病院合計") for d in doctor_names}
 prev_weekday = {d: prev_get(d, "平日")     for d in doctor_names}
 prev_weekend = {d: prev_get(d, "休日合計") for d in doctor_names}
+
+# =========================
+# v6.5.0: Sheet4から属性・出張曜日を取得
+# =========================
+def prev_get_str(doc, colname):
+    """文字列列の値を取得"""
+    pname = name_match.get(doc)
+    if pname and pname in name_to_row:
+        row = name_to_row[pname]
+        v = row.get(colname, "")
+        return str(v).strip() if pd.notna(v) else ""
+    return ""
+
+# 医師ごとのカテチーム属性（A, B, C, D, E等）
+doctor_kate_team = {d: prev_get_str(d, "属性") for d in doctor_names}
+
+# 出張曜日（月, 火, 水, 木, 金, 土, 日）
+doctor_travel_day = {d: prev_get_str(d, "出張日") for d in doctor_names}
+
+# 曜日名から曜日番号へのマッピング（月曜=0, ..., 日曜=6）
+WEEKDAY_MAP = {"月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6}
+
+def get_travel_weekday(doc):
+    """医師の出張曜日を数値で返す（なければNone）"""
+    travel_str = doctor_travel_day.get(doc, "")
+    if travel_str and travel_str in WEEKDAY_MAP:
+        return WEEKDAY_MAP[travel_str]
+    return None
+
+# 出張曜日の前日に当たる日付を計算
+def get_pre_travel_dates(doc, all_dates):
+    """出張曜日の前日の日付リストを返す"""
+    travel_wd = get_travel_weekday(doc)
+    if travel_wd is None:
+        return set()
+    # 前日の曜日（0-6）
+    pre_travel_wd = (travel_wd - 1) % 7
+    return {d for d in all_dates if d.weekday() == pre_travel_wd}
+
+# 属性情報の表示
+doc_with_attr = [(d, doctor_kate_team[d]) for d in doctor_names if doctor_kate_team[d]]
+doc_with_travel = [(d, doctor_travel_day[d]) for d in doctor_names if doctor_travel_day[d]]
+if doc_with_attr:
+    print(f"✅ Sheet4:属性 を検出: {len(doc_with_attr)}人 (例: {doc_with_attr[:3]})")
+if doc_with_travel:
+    print(f"✅ Sheet4:出張日 を検出: {len(doc_with_travel)}人 (例: {doc_with_travel[:3]})")
+
+# =========================
+# v6.5.0: Sheet1からカテ当番日（チーム）を取得
+# =========================
+kate_team_by_date = {}  # 日付 -> チームコード (A, B, C, D, E等)
+if KATE_TOBAN_COL is not None:
+    for ridx in shift_df.index:
+        date = shift_df.at[ridx, date_col_shift]
+        if pd.isna(date):
+            continue
+        date = pd.to_datetime(date).normalize().tz_localize(None)
+        team_val = shift_df.at[ridx, KATE_TOBAN_COL]
+        if pd.notna(team_val):
+            team_str = str(team_val).strip()
+            if team_str and team_str.lower() != "nan":
+                kate_team_by_date[date] = team_str
+    if kate_team_by_date:
+        unique_teams = set(kate_team_by_date.values())
+        print(f"✅ カテ当番日を取得: {len(kate_team_by_date)}日分 (チーム: {unique_teams})")
 
 # =========================
 # 全枠数カウント + slots_by_date 前計算
@@ -1060,7 +1212,7 @@ def choose_doctor_for_slot(
     assigned_bi,      # v6.0.0: B/I列の合計（HARD-001）
     assigned_chjk,    # v6.0.0: C-H/J-K列の合計（HARD-002）
     assigned_hosp_count,
-    assigned_bg_weeks,  # v6.4.0: 大学系週別カウント（ABS-012）
+    assigned_bg_dates,  # v6.5.0: 大学系割当日（ABS-012改: 7日間隔ルール）
 ):
     idx = shift_df.columns.get_loc(hospital_name)
     is_BE = B_COL_INDEX <= idx <= E_COL_INDEX
@@ -1135,11 +1287,12 @@ def choose_doctor_for_slot(
             if not relax_abs and is_BG and assigned_bg[doc] >= 2:
                 continue
 
-            # ABS-012: 大学系は週1回まで（日曜〜土曜）
+            # ABS-012改: 大学系は7日間隔必須（v6.5.0）
             if not relax_abs and is_BG:
-                week_start = get_bg_week_start(date)
-                if assigned_bg_weeks[doc].get(week_start, 0) >= 1:
-                    continue
+                if assigned_bg_dates[doc]:
+                    min_bg_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_bg_dates[doc])
+                    if min_bg_gap < 7:
+                        continue
 
             # === ハード制約（HARD）: カテなし医師は必須遵守 ===
 
@@ -1318,7 +1471,7 @@ def build_schedule_pattern(seed=0):
     assigned_chjk = {d: 0 for d in doctor_names}  # v6.0.0: C-H/J-K列の合計（HARD-002: 1回まで）
     assigned_hosp_count = {d: defaultdict(int) for d in doctor_names}
     bg_cat = {d: defaultdict(int) for d in doctor_names}
-    assigned_bg_weeks = {d: defaultdict(int) for d in doctor_names}  # v6.4.0: 大学系週別カウント（ABS-012）
+    assigned_bg_dates = {d: set() for d in doctor_names}  # v6.5.0: 大学系割当日（ABS-012改: 7日間隔ルール）
 
     # 固定当直
     for date in all_dates:
@@ -1331,9 +1484,8 @@ def build_schedule_pattern(seed=0):
             hidx = shift_df.columns.get_loc(hosp)
             if B_COL_INDEX <= hidx <= K_COL_INDEX:
                 assigned_bg[doc] += 1
-                # v6.4.0: 週別カウント（ABS-012）
-                week_start = get_bg_week_start(date)
-                assigned_bg_weeks[doc][week_start] += 1
+                # v6.5.0: 大学系割当日を追加（ABS-012改: 7日間隔ルール）
+                assigned_bg_dates[doc].add(date)
                 if B_COL_INDEX <= hidx <= E_COL_INDEX:
                     assigned_be[doc] += 1
                 elif F_COL_INDEX <= hidx <= G_COL_INDEX:
@@ -1411,7 +1563,7 @@ def build_schedule_pattern(seed=0):
                 assigned_bi=assigned_bi,        # v6.0.0
                 assigned_chjk=assigned_chjk,    # v6.0.0
                 assigned_hosp_count=assigned_hosp_count,
-                assigned_bg_weeks=assigned_bg_weeks,  # v6.4.0
+                assigned_bg_dates=assigned_bg_dates,  # v6.5.0
             )
             if chosen is None:
                 # v6.0.1 フォールバック: 絶対禁忌(ABS)をすべてチェック
@@ -1454,10 +1606,10 @@ def build_schedule_pattern(seed=0):
                     # ABS-011: 大学系2回まで
                     if is_bg_slot_here and assigned_bg[d] >= 2:
                         return False
-                    # ABS-012: 大学系は週1回まで
-                    if is_bg_slot_here:
-                        week_start = get_bg_week_start(date)
-                        if assigned_bg_weeks[d].get(week_start, 0) >= 1:
+                    # ABS-012改: 大学系は7日間隔必須（v6.5.0）
+                    if is_bg_slot_here and assigned_bg_dates[d]:
+                        min_bg_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_bg_dates[d])
+                        if min_bg_gap < 7:
                             return False
                     return True
 
@@ -1483,9 +1635,8 @@ def build_schedule_pattern(seed=0):
                 hidx = shift_df.columns.get_loc(hosp)
                 if B_COL_INDEX <= hidx <= K_COL_INDEX:
                     assigned_bg[chosen] += 1
-                    # v6.4.0: 週別カウント（ABS-012）
-                    week_start = get_bg_week_start(date)
-                    assigned_bg_weeks[chosen][week_start] += 1
+                    # v6.5.0: 大学系割当日を追加（ABS-012改: 7日間隔ルール）
+                    assigned_bg_dates[chosen].add(date)
                     if B_COL_INDEX <= hidx <= E_COL_INDEX:
                         assigned_be[chosen] += 1
                     elif F_COL_INDEX <= hidx <= G_COL_INDEX:
@@ -1863,9 +2014,9 @@ def evaluate_schedule_with_raw(
         if weekday_count >= 2:
             bg_weekday_over_violations += (weekday_count - 1)
 
-    # v6.4.0: 大学系週1違反（日曜〜土曜で2回以上）- ABS-012
+    # v6.5.0: 大学系7日間隔違反（7日以内に2回以上）- ABS-012改
     weekly_bg_violations = 0
-    weekly_bg = {doc: defaultdict(int) for doc in doctor_names}  # doc -> {week_start: count}
+    bg_dates_by_doc = {doc: [] for doc in doctor_names}  # doc -> [date list]
     for ridx in pattern_df.index:
         date = pattern_df.at[ridx, date_col_shift]
         if pd.isna(date):
@@ -1887,13 +2038,14 @@ def evaluate_schedule_with_raw(
             # 固定割当の場合は許容（v6.2.0互換）
             if is_preassigned_slot(ridx, hosp):
                 continue
-            week_start = get_bg_week_start(date)
-            weekly_bg[doc][week_start] += 1
-    # 週2回以上の違反をカウント
+            bg_dates_by_doc[doc].append(date)
+    # 7日以内に2回以上の違反をカウント
     for doc in active_doctors:
-        for week_start, count in weekly_bg[doc].items():
-            if count >= 2:
-                weekly_bg_violations += (count - 1)
+        dates = sorted(bg_dates_by_doc[doc])
+        for i in range(1, len(dates)):
+            gap = abs((dates[i] - dates[i-1]).days)
+            if gap < 7:
+                weekly_bg_violations += 1
 
     # C-H列（休日大学系）カテ当番違反
     # カテ当番保有医師がその日にカテ当番なしでC-H列に割り当てられている場合
@@ -2419,52 +2571,55 @@ def build_hosp_dup_details(assigned_hosp_count):
     return pd.DataFrame(rows)[cols].sort_values(["超過", "氏名"], ascending=[False, True]).reset_index(drop=True)
 
 def build_weekly_bg_details(doc_assignments):
-    """v6.4.0: 大学系週1違反（日曜〜土曜で2回以上）の詳細リストを生成
-    ABS-012: 大学系は週1回まで
+    """v6.5.0: 大学系7日間隔違反の詳細リストを生成
+    ABS-012改: 大学系は7日間隔必須
     """
     rows = []
-    # 医師ごとに週別のBG割当をカウント
-    weekly_bg = defaultdict(lambda: defaultdict(list))  # doc -> {week_start: [(date, hosp), ...]}
+    # 医師ごとのBG割当を日付順に収集
+    bg_by_doc = defaultdict(list)  # doc -> [(date, hosp), ...]
 
     for doc, assigns in doc_assignments.items():
         for date, hosp in assigns:
-            # 大学病院（B～K列）かチェック
             try:
                 hidx = shift_df.columns.get_loc(hosp)
             except KeyError:
                 continue
             if not (B_COL_INDEX <= hidx <= K_COL_INDEX):
                 continue
-            week_start = get_bg_week_start(date)
-            weekly_bg[doc][week_start].append((date, hosp))
+            bg_by_doc[doc].append((date, hosp))
 
-    # 週2回以上の違反を検出
-    for doc, weeks in weekly_bg.items():
-        for week_start, assigns in weeks.items():
-            if len(assigns) >= 2:
+    # 7日間隔違反を検出
+    for doc, assigns in bg_by_doc.items():
+        assigns_sorted = sorted(assigns, key=lambda x: x[0])
+        for i in range(1, len(assigns_sorted)):
+            curr_date, curr_hosp = assigns_sorted[i]
+            prev_date, prev_hosp = assigns_sorted[i-1]
+            gap = abs((curr_date - prev_date).days)
+            if gap < 7:
                 # 固定割当をチェック
                 fixed_count = 0
-                for date, hosp in assigns:
+                for date, hosp in [assigns_sorted[i-1], assigns_sorted[i]]:
                     for (ridx, h), (d, fixed) in slot_meta.items():
                         if h == hosp and d == date and fixed:
                             fixed_count += 1
                             break
-                # 固定割当が全てなら許容
-                if fixed_count == len(assigns):
+                # 両方固定割当なら許容
+                if fixed_count == 2:
                     continue
                 rows.append({
                     "氏名": doc,
-                    "週開始": week_start,
-                    "週終了": week_start + pd.Timedelta(days=6),
-                    "回数": len(assigns),
-                    "超過": len(assigns) - 1,
-                    "詳細": ", ".join([f"{d.strftime('%m/%d')}({h})" for d, h in sorted(assigns)]),
+                    "日付1": prev_date,
+                    "病院1": prev_hosp,
+                    "日付2": curr_date,
+                    "病院2": curr_hosp,
+                    "間隔(日)": gap,
+                    "詳細": f"{prev_date.strftime('%m/%d')}({prev_hosp}) → {curr_date.strftime('%m/%d')}({curr_hosp})",
                 })
 
-    cols = ["氏名", "週開始", "週終了", "回数", "超過", "詳細"]
+    cols = ["氏名", "日付1", "病院1", "日付2", "病院2", "間隔(日)", "詳細"]
     if not rows:
         return pd.DataFrame(columns=cols)
-    return pd.DataFrame(rows)[cols].sort_values(["週開始", "氏名"]).reset_index(drop=True)
+    return pd.DataFrame(rows)[cols].sort_values(["日付1", "氏名"]).reset_index(drop=True)
 
 def build_unassigned_details(unassigned):
     rows = [{"日付": d, "病院": hosp, "row_index": ridx} for d, hosp, ridx in unassigned]
@@ -4209,8 +4364,8 @@ def fix_university_over_2_violations(pattern_df, max_attempts=150, verbose=True)
 
 def fix_weekly_bg_violations(pattern_df, max_attempts=150, verbose=True):
     """
-    v6.4.0: 大学系週1違反（日曜〜土曜で2回以上）を修正する
-    ABS-012: 大学系は週1回まで
+    v6.5.0: 大学系7日間隔違反を修正する
+    ABS-012改: 大学系は7日間隔必須
 
     Args:
         pattern_df: スケジュールDataFrame
@@ -4224,12 +4379,9 @@ def fix_weekly_bg_violations(pattern_df, max_attempts=150, verbose=True):
     total_fixed = 0
     consecutive_failures = 0
 
-    for attempt in range(max_attempts):
-        # 現在の割当状態を再計算
-        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, cc_counts, cc_bg_counts, cc_ht_counts = recompute_stats(df)
-
-        # 週別のBG割当を計算
-        weekly_bg = {doc: defaultdict(list) for doc in doctor_names}  # doc -> {week_start: [(date, hosp, ridx), ...]}
+    def get_bg_assignments():
+        """各医師の大学系割当を取得"""
+        bg_assign = {doc: [] for doc in doctor_names}  # doc -> [(date, hosp, ridx), ...]
         for ridx in df.index:
             date = df.at[ridx, date_col_shift]
             if pd.isna(date):
@@ -4240,7 +4392,6 @@ def fix_weekly_bg_violations(pattern_df, max_attempts=150, verbose=True):
 
             for hosp in hospital_cols:
                 hidx = shift_df.columns.get_loc(hosp)
-                # 大学病院（B～K列）か
                 if not (B_COL_INDEX <= hidx <= K_COL_INDEX):
                     continue
 
@@ -4251,150 +4402,123 @@ def fix_weekly_bg_violations(pattern_df, max_attempts=150, verbose=True):
                 if doc not in doctor_names:
                     continue
 
-                week_start = get_bg_week_start(date)
-                weekly_bg[doc][week_start].append((date, hosp, ridx))
+                bg_assign[doc].append((date, hosp, ridx))
+        return bg_assign
 
-        # 週2回以上の違反を検出
+    def find_7day_violations(bg_assign):
+        """7日間隔違反を検出"""
         violations = []
         for doc in active_doctors:
-            for week_start, assignments in weekly_bg[doc].items():
-                if len(assignments) >= 2:
-                    violations.append((doc, week_start, assignments))
+            assignments = sorted(bg_assign[doc], key=lambda x: x[0])
+            for i in range(1, len(assignments)):
+                gap = abs((assignments[i][0] - assignments[i-1][0]).days)
+                if gap < 7:
+                    # 違反ペア: 後の割当を移動対象とする
+                    violations.append((doc, assignments[i-1], assignments[i], gap))
+        return violations
+
+    for attempt in range(max_attempts):
+        counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, cc_counts, cc_bg_counts, cc_ht_counts = recompute_stats(df)
+
+        bg_assign = get_bg_assignments()
+        violations = find_7day_violations(bg_assign)
 
         if not violations:
             if verbose and total_fixed > 0:
-                print(f"   ✅ 大学系週1違反を{total_fixed}件修正しました")
+                print(f"   ✅ 大学系7日間隔違反を{total_fixed}件修正しました")
             return df, True, total_fixed
 
         if attempt == 0 and verbose:
-            print(f"   ⚠️ 大学系週1違反を{len(violations)}件検出")
+            print(f"   ⚠️ 大学系7日間隔違反を{len(violations)}件検出")
 
-        # 修正試行
         fixed_in_this_iteration = 0
 
-        for doc, week_start, assignments in violations:
-            # 2回以上なので1回まで減らす（超過分を移動）
-            excess = len(assignments) - 1
-            if excess <= 0:
+        for doc, prev_assign, curr_assign, gap in violations:
+            date, hosp, ridx = curr_assign
+
+            # 固定割当はスキップ
+            if is_preassigned_slot(ridx, hosp):
                 continue
 
-            # 固定割当を除外し、移動可能な割当をランダム選択
-            movable = []
-            for date, hosp, ridx in assignments:
-                if not is_preassigned_slot(ridx, hosp):
-                    movable.append((date, hosp, ridx))
+            moved = False
 
-            if not movable:
-                continue  # 全て固定割当の場合はスキップ
+            # 同じ日の外病院（L～Y列）の空き枠に移動を試みる
+            for other_hosp in hospital_cols:
+                other_hidx = shift_df.columns.get_loc(other_hosp)
+                if not (L_COL_INDEX <= other_hidx <= L_Y_END_INDEX):
+                    continue
 
-            import random
-            random.shuffle(movable)
+                if assigned_hosp_count[doc].get(other_hosp, 0) >= 1:
+                    continue
 
-            for date, hosp, ridx in movable[:excess]:
-                moved = False
-
-                # 同じ日の外病院（L～Y列）の空き枠に移動を試みる
-                for other_hosp in hospital_cols:
-                    other_hidx = shift_df.columns.get_loc(other_hosp)
-                    # 外病院か
-                    if not (L_COL_INDEX <= other_hidx <= L_Y_END_INDEX):
+                if pd.isna(df.at[ridx, other_hosp]):
+                    if not can_assign_doc_to_slot(doc, date, other_hosp):
                         continue
 
-                    # この病院にこの医師が既に割当られていないか
-                    if assigned_hosp_count[doc].get(other_hosp, 0) >= 1:
+                    df.at[ridx, hosp] = None
+                    df.at[ridx, other_hosp] = doc
+                    fixed_in_this_iteration += 1
+                    total_fixed += 1
+                    moved = True
+                    break
+
+            # 別の医師と交換を試みる
+            if not moved and attempt >= 5:
+                already_on_date = set()
+                for h in hospital_cols:
+                    v = df.at[ridx, h]
+                    if isinstance(v, str):
+                        already_on_date.add(normalize_name(v))
+
+                # 代替候補: 同日重複なし & 7日間隔を満たす医師
+                replacement_candidates = []
+                for d in doctor_names:
+                    if d in already_on_date or d == doc:
                         continue
+                    if not can_assign_doc_to_slot(d, date, hosp):
+                        continue
+                    # 7日間隔チェック
+                    d_assignments = bg_assign.get(d, [])
+                    has_conflict = False
+                    for d_date, _, _ in d_assignments:
+                        if abs((date - d_date).days) < 7:
+                            has_conflict = True
+                            break
+                    if has_conflict:
+                        continue
+                    replacement_candidates.append(d)
 
-                    # 空き枠があるか
-                    if pd.isna(df.at[ridx, other_hosp]):
-                        # ハード制約チェック
-                        if not can_assign_doc_to_slot(doc, date, other_hosp):
-                            continue
-
-                        # 移動実行
-                        df.at[ridx, hosp] = None
-                        df.at[ridx, other_hosp] = doc
-                        fixed_in_this_iteration += 1
-                        total_fixed += 1
-                        moved = True
-                        break
-
-                # 移動先が見つからない場合、別の医師と交換を試みる
-                if not moved and attempt >= 5:
-                    # この日に既に割り当てられている医師を取得
-                    already_on_date = set()
-                    for h in hospital_cols:
-                        v = df.at[ridx, h]
-                        if isinstance(v, str):
-                            already_on_date.add(normalize_name(v))
-
-                    # 代替候補: 同日重複なし & この週のBG割当0回の医師
-                    replacement_candidates = []
-                    for d in doctor_names:
-                        if d in already_on_date or d == doc:
-                            continue
-                        if len(weekly_bg[d].get(week_start, [])) >= 1:
-                            continue
-                        if not can_assign_doc_to_slot(d, date, hosp):
-                            continue
-                        replacement_candidates.append(d)
-
-                    if replacement_candidates:
-                        replacement_candidates.sort(key=lambda d: bg_counts.get(d, 0))
-                        new_doc = replacement_candidates[0]
-                        df.at[ridx, hosp] = new_doc
-                        if verbose and attempt < 10:
-                            print(f"      {doc}→{new_doc}: {date.strftime('%m/%d')}({week_start.strftime('%m/%d')}週)の大学割当を交代")
-                        fixed_in_this_iteration += 1
-                        total_fixed += 1
+                if replacement_candidates:
+                    replacement_candidates.sort(key=lambda d: bg_counts.get(d, 0))
+                    new_doc = replacement_candidates[0]
+                    df.at[ridx, hosp] = new_doc
+                    if verbose and attempt < 10:
+                        print(f"      {doc}→{new_doc}: {date.strftime('%m/%d')}（{gap}日間隔違反）の大学割当を交代")
+                    fixed_in_this_iteration += 1
+                    total_fixed += 1
 
             if fixed_in_this_iteration > 0:
                 counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
-                # 週別BGも再計算
-                for doc in doctor_names:
-                    weekly_bg[doc] = defaultdict(list)
-                for ridx in df.index:
-                    date = df.at[ridx, date_col_shift]
-                    if pd.isna(date):
-                        continue
-                    date = pd.to_datetime(date).normalize()
-                    if date.tz is not None:
-                        date = date.tz_localize(None)
-                    for hosp in hospital_cols:
-                        hidx = shift_df.columns.get_loc(hosp)
-                        if not (B_COL_INDEX <= hidx <= K_COL_INDEX):
-                            continue
-                        val = df.at[ridx, hosp]
-                        if not isinstance(val, str):
-                            continue
-                        doc = normalize_name(val)
-                        if doc not in doctor_names:
-                            continue
-                        week_start = get_bg_week_start(date)
-                        weekly_bg[doc][week_start].append((date, hosp, ridx))
+                bg_assign = get_bg_assignments()
 
-        # 進捗チェック
         if fixed_in_this_iteration == 0:
             consecutive_failures += 1
         else:
             consecutive_failures = 0
 
-        # 連続で20回修正できなければ諦める
         if consecutive_failures >= 20:
             break
 
     # 最終確認
-    remaining_violations = 0
-    for doc in active_doctors:
-        for week_start, assignments in weekly_bg[doc].items():
-            if len(assignments) >= 2:
-                remaining_violations += 1
+    bg_assign = get_bg_assignments()
+    remaining_violations = len(find_7day_violations(bg_assign))
 
     if verbose:
         if remaining_violations == 0:
             if total_fixed > 0:
-                print(f"   ✅ 全ての大学系週1違反を修正しました（修正数: {total_fixed}）")
+                print(f"   ✅ 全ての大学系7日間隔違反を修正しました（修正数: {total_fixed}）")
         else:
-            print(f"   ⚠️ {remaining_violations}件の大学系週1違反が残っています")
+            print(f"   ⚠️ {remaining_violations}件の大学系7日間隔違反が残っています")
 
     return df, remaining_violations == 0, total_fixed
 
