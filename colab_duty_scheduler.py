@@ -851,11 +851,35 @@ def prev_get_str(doc, colname):
         return str(v).strip() if pd.notna(v) else ""
     return ""
 
-# 医師ごとのカテチーム属性（A, B, C, D, E等）
-doctor_kate_team = {d: prev_get_str(d, "属性") for d in doctor_names}
+# v6.5.0: カテチーム属性の取得（「属性」または「カテ当番」列から）
+# 列名を柔軟に検出
+kate_team_col_name = None
+for col_candidate in ["属性", "カテ当番", "カテ", "チーム"]:
+    if col_candidate in sheet4_data.columns:
+        kate_team_col_name = col_candidate
+        break
 
-# 出張曜日（月, 火, 水, 木, 金, 土, 日）
-doctor_travel_day = {d: prev_get_str(d, "出張日") for d in doctor_names}
+if kate_team_col_name:
+    doctor_kate_team = {d: prev_get_str(d, kate_team_col_name) for d in doctor_names}
+    print(f"✅ Sheet4:{kate_team_col_name}列 を使用")
+else:
+    doctor_kate_team = {d: "" for d in doctor_names}
+    print("⚠️ Sheet4にカテチーム列（属性/カテ当番）が見つかりません")
+
+# 出張曜日の取得（「出張日」列から）
+travel_col_name = None
+for col_candidate in ["出張日", "出張曜日"]:
+    if col_candidate in sheet4_data.columns:
+        travel_col_name = col_candidate
+        break
+
+if travel_col_name:
+    doctor_travel_day = {d: prev_get_str(d, travel_col_name) for d in doctor_names}
+else:
+    doctor_travel_day = {d: "" for d in doctor_names}
+
+# デバッグ: Sheet4の列名を表示
+print(f"📋 Sheet4列名: {list(sheet4_data.columns)}")
 
 # 曜日名から曜日番号へのマッピング（月曜=0, ..., 日曜=6）
 WEEKDAY_MAP = {"月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6}
@@ -881,9 +905,11 @@ def get_pre_travel_dates(doc, all_dates):
 doc_with_attr = [(d, doctor_kate_team[d]) for d in doctor_names if doctor_kate_team[d]]
 doc_with_travel = [(d, doctor_travel_day[d]) for d in doctor_names if doctor_travel_day[d]]
 if doc_with_attr:
-    print(f"✅ Sheet4:属性 を検出: {len(doc_with_attr)}人 (例: {doc_with_attr[:3]})")
+    print(f"✅ カテチーム属性: {len(doc_with_attr)}人 (例: {doc_with_attr[:5]})")
+else:
+    print("⚠️ カテチーム属性を持つ医師が0人です")
 if doc_with_travel:
-    print(f"✅ Sheet4:出張日 を検出: {len(doc_with_travel)}人 (例: {doc_with_travel[:3]})")
+    print(f"✅ 出張日設定: {len(doc_with_travel)}人 (例: {doc_with_travel[:3]})")
 
 # =========================
 # v6.5.0: Sheet1からカテ当番日（チーム）を取得
@@ -902,7 +928,11 @@ if KATE_TOBAN_COL is not None:
                 kate_team_by_date[date] = team_str
     if kate_team_by_date:
         unique_teams = set(kate_team_by_date.values())
-        print(f"✅ カテ当番日を取得: {len(kate_team_by_date)}日分 (チーム: {unique_teams})")
+        print(f"✅ カテ当番日: {len(kate_team_by_date)}日分 (チーム: {unique_teams})")
+    else:
+        print("⚠️ Sheet1:Z列にカテ当番チームのデータがありません")
+else:
+    print("⚠️ Sheet1に「カテ当番」列がないため、Sheet3/Sheet4のカテ表を使用します")
 
 # =========================
 # 全枠数カウント + slots_by_date 前計算
