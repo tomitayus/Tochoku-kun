@@ -1,5 +1,10 @@
-# @title 当直くん v6.5.1 (SEMI制約判定バグ修正)
+# @title 当直くん v6.5.2 (カテチーム列検出改善)
 # 修正内容:
+# v6.5.2 (2026-02-05):
+# - カテチーム列の検出ロジックを改善
+#   - Sheet1:Zのチームコード（A,B,C,D,E等）と一致する値を持つ列を自動検出
+#   - 「属性」列に別のデータ（例: "2"）が入っている場合でも「カテ当番」列を正しく使用
+#   - 検出優先順位: カテ当番 > 属性 > カテ > チーム
 # v6.5.1 (2026-02-05):
 # - SEMI制約の違反検出バグを修正
 #   - SEMI-001: B列のみ（従来はB-K列全体を誤検出していた）
@@ -856,20 +861,46 @@ def prev_get_str(doc, colname):
         return str(v).strip() if pd.notna(v) else ""
     return ""
 
-# v6.5.0: カテチーム属性の取得（「属性」または「カテ当番」列から）
-# 列名を柔軟に検出
+# v6.5.1: カテチーム属性の取得（Sheet1:Zと一致するチームコードを持つ列を探す）
+# まずSheet1:Zから期待されるチームコードを取得（後でkate_team_by_dateが設定されるので先に取得）
+expected_team_codes = set()
+if KATE_TOBAN_COL is not None:
+    for ridx in shift_df.index:
+        team_val = shift_df.at[ridx, KATE_TOBAN_COL]
+        if pd.notna(team_val):
+            team_str = str(team_val).strip()
+            if team_str and team_str.lower() != "nan":
+                expected_team_codes.add(team_str)
+
+# 列候補をチェックして、Sheet1:Zのチームコードと一致する値を持つ列を探す
 kate_team_col_name = None
-for col_candidate in ["属性", "カテ当番", "カテ", "チーム"]:
-    if col_candidate in sheet4_data.columns:
+for col_candidate in ["カテ当番", "属性", "カテ", "チーム"]:  # カテ当番を優先
+    if col_candidate not in sheet4_data.columns:
+        continue
+    # この列の値がSheet1:Zのチームコードと一致するかチェック
+    col_values = set()
+    for idx, row in sheet4_data.iterrows():
+        v = row.get(col_candidate, "")
+        if pd.notna(v):
+            val_str = str(v).strip()
+            if val_str and val_str.lower() not in ("nan", "none", ""):
+                col_values.add(val_str)
+    # 期待されるチームコードと1つでも一致すればこの列を使用
+    if expected_team_codes and col_values & expected_team_codes:
         kate_team_col_name = col_candidate
+        print(f"✅ Sheet4:{kate_team_col_name}列 を使用 (チームコード一致: {col_values & expected_team_codes})")
+        break
+    elif not expected_team_codes and col_values:
+        # Sheet1:Zがない場合は最初に見つかった列を使用
+        kate_team_col_name = col_candidate
+        print(f"✅ Sheet4:{kate_team_col_name}列 を使用 (値: {list(col_values)[:5]})")
         break
 
 if kate_team_col_name:
     doctor_kate_team = {d: prev_get_str(d, kate_team_col_name) for d in doctor_names}
-    print(f"✅ Sheet4:{kate_team_col_name}列 を使用")
 else:
     doctor_kate_team = {d: "" for d in doctor_names}
-    print("⚠️ Sheet4にカテチーム列（属性/カテ当番）が見つかりません")
+    print("⚠️ Sheet4にカテチーム列（カテ当番/属性）が見つからないか、Sheet1:Zのチームコードと一致しません")
 
 # 出張曜日の取得（「出張日」列から）
 travel_col_name = None
