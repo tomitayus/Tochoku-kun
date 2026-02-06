@@ -1,6 +1,11 @@
-# @title 当直くん v6.5.2 (カテチーム列検出改善)
+# @title 当直くん v6.5.3 (C-H列カテ当番をABS制約に格上げ + 出力整理)
 # 修正内容:
-# v6.5.2 (2026-02-05):
+# v6.5.3 (2026-02-06):
+# - SEMI-002をABS-013に格上げ（C-H列休日大学系カテ当番必須）
+#   - C-H列（休日大学系）でのカテ当番チェックを絶対禁忌に変更
+#   - 緩和不可の制約として厳守（カテ当番なしで土日大学系には入れない）
+# - 出力summaryの「今月サマリー」と「医師ごとの偏り」を1テーブルに統合
+# v6.5.2 (2026-02-06):
 # - カテチーム列の検出ロジックを改善
 #   - Sheet1:Zのチームコード（A,B,C,D,E等）と一致する値を持つ列を自動検出
 #   - 「属性」列に別のデータ（例: "2"）が入っている場合でも「カテ当番」列を正しく使用
@@ -99,17 +104,17 @@
 # - gap制約をgap>=3に統一（以前はgap<2だった箇所を修正）
 # v6.0.0 (2026-02-02):
 # - 制約体系を全面改定
-# - 絶対禁忌(ABS): 11項目
+# - 絶対禁忌(ABS): 12項目
 #   - ABS-001〜009: 既存の絶対禁忌
 #   - ABS-010: TARGET_CAP遵守（n超過禁止）
 #   - ABS-011: 大学系2回まで（B-K列合計）
+#   - ABS-013: C-H列カテ当番必須（v6.5.3で追加、旧SEMI-002）
 # - ハード制約(HARD): 3項目
 #   - HARD-001: B/I列1回まで（グループA）
 #   - HARD-002: C-H/J-K列1回まで（グループB）
 #   - HARD-003: 外病院1回以上（L-Y列）
-# - 準ハード制約(SEMI): 2項目
+# - 準ハード制約(SEMI): 1項目
 #   - SEMI-001: B列のみカテ表コード必須（sheet3「1」は例外）
-#   - SEMI-002: C-H列のみカテ当番日必須（I-K列は対象外、sheet3「1」は例外）
 # - ソフト制約(SOFT): 3項目
 #   - SOFT-001: 公平性（max-min最小化）
 #   - SOFT-002: コード1.2優先（大学系0回ペナルティ）
@@ -384,6 +389,7 @@ CONSTRAINT_ABS_003 = "ABS-003"  # コード3の列制約
 CONSTRAINT_ABS_004 = "ABS-004"  # カテ当番日の外病院禁止
 CONSTRAINT_ABS_005 = "ABS-005"  # 同日重複禁止
 CONSTRAINT_ABS_006 = "ABS-006"  # 水曜日L〜Y禁止医師
+CONSTRAINT_ABS_013 = "ABS-013"  # v6.5.3: C-H列（休日大学系）カテ当番必須
 
 # ハード制約（HARD: パターン除外）
 CONSTRAINT_HARD_001 = "HARD-001"  # TARGET_CAP超過
@@ -393,7 +399,7 @@ CONSTRAINT_HARD_004 = "HARD-004"  # CODE_2のn+1違反
 
 # 準ハード制約（SEMI: 緩和可）
 CONSTRAINT_SEMI_001 = "SEMI-001"  # 平日大学系カテ要件
-CONSTRAINT_SEMI_002 = "SEMI-002"  # 休日大学系カテ当番
+CONSTRAINT_SEMI_002 = "SEMI-002"  # 休日大学系カテ当番（※ABS-013に格上げ、互換性のため残す）
 CONSTRAINT_SEMI_003 = "SEMI-003"  # gap制約
 CONSTRAINT_SEMI_004 = "SEMI-004"  # 大学最低1回
 
@@ -1390,6 +1396,12 @@ def choose_doctor_for_slot(
                 if doc in WED_FORBIDDEN_DOCTORS:
                     continue
 
+            # ABS-013: C-H列（休日大学系）カテ当番必須（v6.5.3）
+            # カテ当番保有医師がC-H列に入るには、その日にカテ当番が必要
+            if is_CH_only:
+                if not is_eligible_for_ch_slot(doc, date):
+                    continue
+
             # === v6.3.0: 以下のABS制約はrelax_abs=Trueで緩和可能 ===
 
             # ABS-007: gap >= 3日必須
@@ -1449,11 +1461,7 @@ def choose_doctor_for_slot(
                     if not is_sheet3_one:
                         continue
 
-            # SEMI-002: C-H列のみカテ当番日必須（I-K列は対象外）
-            if not relax_semi and is_CH_only:
-                if not is_eligible_for_ch_slot(doc, date):
-                    if not is_sheet3_one:
-                        continue
+            # (SEMI-002はABS-013に格上げ済み - v6.5.3)
 
             candidates.append(doc)
         return candidates
@@ -2919,8 +2927,8 @@ def build_hard_constraint_violations(pattern_df):
                     "詳細": f"[{CONSTRAINT_ABS_004}] カテ表（{sched_code}）がある日は外病院（L〜Y列）に割当不可。列{idx}に割当",
                 })
 
-            # 違反5: SEMI-001（B列のみ）/ SEMI-002（C-H列のみ）カテ表コードなし
-            # ※I-K列はSEMI制約対象外（平日緩和のため）
+            # 違反5: SEMI-001（B列のみ）/ ABS-013（C-H列）カテ表コードなし
+            # ※I-K列は制約対象外（平日緩和のため）
             if doc in SCHEDULE_CODE_HOLDERS and not sched_code and doc not in EXTRA_ALLOWED:
                 # SEMI-001: B列のみカテ表コード必須
                 if idx == B_COL_INDEX:
@@ -2935,18 +2943,18 @@ def build_hard_constraint_violations(pattern_df):
                         "カテ表": "",
                         "詳細": f"[{CONSTRAINT_SEMI_001}] B列（平日大学系）の割当にカテ表コードが必要",
                     })
-                # SEMI-002: C-H列のみカテ当番日必須
+                # ABS-013: C-H列カテ当番必須（v6.5.3でSEMI-002から格上げ）
                 elif C_COL_INDEX <= idx <= H_COL_INDEX:
                     rows.append({
-                        "制約ID": CONSTRAINT_SEMI_002,
-                        "違反種別": "C-H列カテ表コード欠如",
+                        "制約ID": CONSTRAINT_ABS_013,
+                        "違反種別": "C-H列カテ当番欠如",
                         "日付": date,
                         "医師名": doc,
                         "病院": hosp,
                         "列番号": idx,
                         "可否コード": code,
                         "カテ表": "",
-                        "詳細": f"[{CONSTRAINT_SEMI_002}] C-H列（休日大学系）の割当にカテ表コードが必要",
+                        "詳細": f"[{CONSTRAINT_ABS_013}] C-H列（休日大学系）の割当にはカテ当番が必須",
                     })
 
             # 違反6: 水曜日L〜Y列禁止医師 (ABS-006)
@@ -5799,24 +5807,45 @@ base_name = uploaded_filename.rsplit(".", 1)[0]
 output_filename = f"{base_name}_v{VERSION}.xlsx"
 output_path = output_filename
 
-def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnostics):
-    """v6.3.0: 今月/累計/診断を1シートに統合して出力"""
+def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnostics, df_doctors=None):
+    """v6.5.3: 今月サマリーと医師ごとの偏りを統合、累計/診断を1シートに統合して出力"""
     startrow = 0
 
-    # 今月サマリー
     ws = writer.book.create_sheet(sheet_name)
     writer.sheets[sheet_name] = ws
-    ws.cell(row=1, column=1, value="【今月サマリー】")
-    df_month.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
-    startrow = len(df_month.index) + 4
+
+    # v6.5.3: 今月サマリーと医師ごとの偏りを1テーブルに統合
+    if df_doctors is not None:
+        # df_monthの基本列（氏名, 全合計, 大学合計, 外病院合計, 平日, 休日合計）とdf_doctorsの診断列をマージ
+        # df_doctorsから使う列を選定
+        diag_cols = ["active", "cap", "gap3上限", "利用可能日数", "preassigned",
+                     "gap違反回数", "最小間隔(日)", "同一病院重複超過",
+                     "累計_全合計_平均との差", "累計_大学合計_平均との差",
+                     "累計_外病院合計_平均との差", "累計_平日_平均との差", "累計_休日合計_平均との差"]
+        diag_cols = [c for c in diag_cols if c in df_doctors.columns]
+
+        # df_monthとdf_doctorsをマージ（氏名をキーに）
+        df_diag_subset = df_doctors[["氏名"] + diag_cols].copy()
+        df_combined = pd.merge(df_month, df_diag_subset, on="氏名", how="left")
+
+        ws.cell(row=1, column=1, value="【医師サマリー（今月）】")
+        df_combined.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
+        startrow = len(df_combined.index) + 4
+    else:
+        # 従来方式（今月サマリー単独）
+        ws.cell(row=1, column=1, value="【今月サマリー】")
+        df_month.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
+        startrow = len(df_month.index) + 4
 
     # 累計サマリー
     ws.cell(row=startrow, column=1, value="【累計サマリー】")
     df_total.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
     startrow += len(df_total.index) + 4
 
-    # 診断情報
+    # 診断情報（医師ごとの偏りは統合済みなのでスキップ）
     for title, df in diagnostics:
+        if title == "【医師ごとの偏り】":
+            continue  # v6.5.3: 上で統合済み
         ws.cell(row=startrow, column=1, value=title)
         df.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
         startrow += len(df.index) + 3
@@ -5849,7 +5878,7 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             df_month=df_month,
             df_total=df_total,
             diagnostics=[
-                ("【医師ごとの偏り】", df_doctors),
+                ("【医師ごとの偏り】", df_doctors),  # v6.5.3: 上部テーブルに統合されるためスキップ
                 ("【制約違反: gap（3日未満）】", df_gap),
                 ("【制約違反: 同日重複】", df_same),
                 ("【制約違反: 同一病院重複】", df_hdup),
@@ -5858,6 +5887,7 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
                 ("【制約違反: 重要/推奨ルール】", df_hard_violations),
                 ("【スコアサマリー】", df_metrics),
             ],
+            df_doctors=df_doctors,  # v6.5.3: 今月サマリーと統合
         )
 
 print("\n" + "="*60)
