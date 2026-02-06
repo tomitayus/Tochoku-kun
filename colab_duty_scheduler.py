@@ -835,6 +835,7 @@ if len(schedule_raw.columns) > 1:
         print("   ※H〜U の『カテ表あり不可』制約が一部の医師で効かない可能性があります。")
 else:
     sched_doctors = []
+    print("📋 Sheet3(カテ表)の医師列なし → EXTRA順序はSheet2(可否表)にフォールバック")
 
 # =========================
 # sheet4 前月まで累積
@@ -1154,9 +1155,12 @@ total_cap_final = sum(TARGET_CAP[d] for d in active_doctors)
 print(f"   全枠数: {total_slots} | active医師: {len(active_doctors)}人")
 extra_source = "Sheet3(カテ表)" if sched_doctors else "Sheet2(可否表)"
 extra_names = [d for d in active_sorted_by_index if d in EXTRA_ALLOWED]
-print(f"   基本割当: {BASE_TARGET}回 | +1回対象: {len(EXTRA_ALLOWED)}人（{extra_source}順）")
+print(f"   基本割当: {BASE_TARGET}回 | +1回対象: {len(EXTRA_ALLOWED)}人（{extra_source}の末尾から選出）")
 if extra_names:
     print(f"   +1回対象医師: {', '.join(extra_names)}")
+# ソート順の末尾10人を表示（デバッグ用）
+tail_10 = active_sorted_by_index[-min(10, len(active_sorted_by_index)):]
+print(f"   {extra_source}順 末尾10人: {', '.join(tail_10)}")
 print(f"   割当容量: {total_cap_final} / {total_slots}枠")
 
 # gap3制限された医師の詳細表示
@@ -1642,6 +1646,11 @@ def choose_doctor_for_slot(
         candidates = under_floor
 
     # (削除: gap >= 3 は絶対禁忌として collect_candidates でチェック済み)
+
+    # 9 TARGET_CAP未達の医師を優先（v6.5.7: relax_absで超過した医師を抑制）
+    under_cap = [d for d in candidates if assigned_count[d] < TARGET_CAP.get(d, 0)]
+    if under_cap:
+        candidates = under_cap
 
     # 10 同点ならランダム選択（パターン多様性のため）
     # v6.0.2: deterministic tie-break から random.choice に変更
@@ -5663,6 +5672,10 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         # 2.5) 大学系週1違反を修正（gap/dup修正で発生した違反を含む）
         final_df, _, final_weekly_bg_fc = fix_weekly_bg_violations(final_df, max_attempts=150, verbose=False)
         total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + final_weekly_bg_fc
+
+        # 2.7) TARGET_CAP違反を修正（safe_fixでrevertされた分を含む）
+        final_df, _, final_cap_fc = fix_target_cap_violations(final_df, max_attempts=100, verbose=False)
+        total_fix_counts["cap"] = total_fix_counts.get("cap", 0) + final_cap_fc
 
         # 3) 未割当スロットを埋める（gap/dup修正で発生した未割当を含む）
         final_df, _, final_unassigned_fc = fix_unassigned_slots(final_df, verbose=False)
