@@ -363,7 +363,7 @@ BG_NIGHT_COLS = set()  # 列名で「夜」固定したい大学枠があれば�
 
 WED_FORBIDDEN_DOCTORS = {'金城', '山田', '野寺'}  # 水曜の H〜U を禁止したい医師
 
-NUM_PATTERNS = int(os.getenv("NUM_PATTERNS", "100"))  # デフォルト100パターン
+NUM_PATTERNS = int(os.getenv("NUM_PATTERNS", "1000"))  # デフォルト1000パターン（v6.5.7: 100→1000に増加、大学系週1違反削減のため）
 
 # sheet1 の「枠」扱いする入力値（1以外の記号も許容したい場合）
 SLOT_MARKERS = {1, 1.0, "1", "〇", "○", "◯", "◎"}
@@ -4671,68 +4671,82 @@ def fix_weekly_bg_violations(pattern_df, max_attempts=150, verbose=True):
         fixed_in_this_iteration = 0
 
         for doc, prev_assign, curr_assign, gap in violations:
-            date, hosp, ridx = curr_assign
-
-            # 固定割当はスキップ
-            if is_preassigned_slot(ridx, hosp):
-                continue
+            # 両方の割当を移動候補として試行（v6.5.7: 2番目だけでなく1番目も試す）
+            targets = [(curr_assign, prev_assign), (prev_assign, curr_assign)]
 
             moved = False
+            for target_assign, other_assign in targets:
+                date, hosp, ridx = target_assign
 
-            # 同じ日の外病院（L～Y列）の空き枠に移動を試みる
-            for other_hosp in hospital_cols:
-                other_hidx = shift_df.columns.get_loc(other_hosp)
-                if not (L_COL_INDEX <= other_hidx <= L_Y_END_INDEX):
+                # 固定割当はスキップ
+                if is_preassigned_slot(ridx, hosp):
                     continue
 
-                if assigned_hosp_count[doc].get(other_hosp, 0) >= 1:
-                    continue
-
-                if pd.isna(df.at[ridx, other_hosp]):
-                    if not can_assign_doc_to_slot(doc, date, other_hosp):
+                # 同じ日の外病院（L～Y列）の空き枠に移動を試みる
+                for other_hosp in hospital_cols:
+                    other_hidx = shift_df.columns.get_loc(other_hosp)
+                    if not (L_COL_INDEX <= other_hidx <= L_Y_END_INDEX):
                         continue
 
-                    df.at[ridx, hosp] = None
-                    df.at[ridx, other_hosp] = doc
-                    fixed_in_this_iteration += 1
-                    total_fixed += 1
-                    moved = True
+                    if assigned_hosp_count[doc].get(other_hosp, 0) >= 1:
+                        continue
+
+                    if pd.isna(df.at[ridx, other_hosp]):
+                        if not can_assign_doc_to_slot(doc, date, other_hosp):
+                            continue
+
+                        df.at[ridx, hosp] = None
+                        df.at[ridx, other_hosp] = doc
+                        fixed_in_this_iteration += 1
+                        total_fixed += 1
+                        moved = True
+                        break
+
+                if moved:
                     break
 
-            # 別の医師と交換を試みる
-            if not moved and attempt >= 5:
-                already_on_date = set()
-                for h in hospital_cols:
-                    v = df.at[ridx, h]
-                    if isinstance(v, str):
-                        already_on_date.add(normalize_name(v))
+            # 別の医師と交換を試みる（v6.5.7: attempt >= 2 に前倒し、両方の割当で試行）
+            if not moved and attempt >= 2:
+                for target_assign, other_assign in targets:
+                    date, hosp, ridx = target_assign
 
-                # 代替候補: 同日重複なし & 7日間隔を満たす医師
-                replacement_candidates = []
-                for d in doctor_names:
-                    if d in already_on_date or d == doc:
+                    if is_preassigned_slot(ridx, hosp):
                         continue
-                    if not can_assign_doc_to_slot(d, date, hosp):
-                        continue
-                    # 7日間隔チェック
-                    d_assignments = bg_assign.get(d, [])
-                    has_conflict = False
-                    for d_date, _, _ in d_assignments:
-                        if abs((date - d_date).days) < 7:
-                            has_conflict = True
-                            break
-                    if has_conflict:
-                        continue
-                    replacement_candidates.append(d)
 
-                if replacement_candidates:
-                    replacement_candidates.sort(key=lambda d: bg_counts.get(d, 0))
-                    new_doc = replacement_candidates[0]
-                    df.at[ridx, hosp] = new_doc
-                    if verbose and attempt < 10:
-                        print(f"      {doc}→{new_doc}: {date.strftime('%m/%d')}（{gap}日間隔違反）の大学割当を交代")
-                    fixed_in_this_iteration += 1
-                    total_fixed += 1
+                    already_on_date = set()
+                    for h in hospital_cols:
+                        v = df.at[ridx, h]
+                        if isinstance(v, str):
+                            already_on_date.add(normalize_name(v))
+
+                    # 代替候補: 同日重複なし & 7日間隔を満たす医師
+                    replacement_candidates = []
+                    for d in doctor_names:
+                        if d in already_on_date or d == doc:
+                            continue
+                        if not can_assign_doc_to_slot(d, date, hosp):
+                            continue
+                        # 7日間隔チェック
+                        d_assignments = bg_assign.get(d, [])
+                        has_conflict = False
+                        for d_date, _, _ in d_assignments:
+                            if abs((date - d_date).days) < 7:
+                                has_conflict = True
+                                break
+                        if has_conflict:
+                            continue
+                        replacement_candidates.append(d)
+
+                    if replacement_candidates:
+                        replacement_candidates.sort(key=lambda d: bg_counts.get(d, 0))
+                        new_doc = replacement_candidates[0]
+                        df.at[ridx, hosp] = new_doc
+                        if verbose and attempt < 10:
+                            print(f"      {doc}→{new_doc}: {date.strftime('%m/%d')}（{gap}日間隔違反）の大学割当を交代")
+                        fixed_in_this_iteration += 1
+                        total_fixed += 1
+                        moved = True
+                        break
 
             if fixed_in_this_iteration > 0:
                 counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
@@ -5608,6 +5622,11 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
             total_fix_counts["unassigned"] = total_fix_counts.get("unassigned", 0) + fc
             round_fixed += fc
 
+            # 14. 大学系週1違反の再修正（ステップ11-13で再発した違反をキャッチ）
+            current_df, _, fc = safe_fix(fix_weekly_bg_violations, current_df, max_attempts=150)
+            total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + fc
+            round_fixed += fc
+
             # 収束チェック: 修正がなければループ終了
             if round_fixed == 0:
                 break
@@ -5625,9 +5644,17 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         final_df, _, final_dup_fc = fix_external_hospital_dup_violations(final_df, max_attempts=150, verbose=False)
         total_fix_counts["ext_dup"] = total_fix_counts.get("ext_dup", 0) + final_dup_fc
 
+        # 2.5) 大学系週1違反を修正（gap/dup修正で発生した違反を含む）
+        final_df, _, final_weekly_bg_fc = fix_weekly_bg_violations(final_df, max_attempts=150, verbose=False)
+        total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + final_weekly_bg_fc
+
         # 3) 未割当スロットを埋める（gap/dup修正で発生した未割当を含む）
         final_df, _, final_unassigned_fc = fix_unassigned_slots(final_df, verbose=False)
         total_fix_counts["unassigned"] = total_fix_counts.get("unassigned", 0) + final_unassigned_fc
+
+        # 4) 大学系週1違反の最終修正（未割当埋めで発生した違反をキャッチ）
+        final_df, _, final_weekly_bg_fc2 = fix_weekly_bg_violations(final_df, max_attempts=150, verbose=False)
+        total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + final_weekly_bg_fc2
 
         fix_count = total_fix_counts.get("hard", 0)
         code_2_fix_count = total_fix_counts.get("code2", 0)
