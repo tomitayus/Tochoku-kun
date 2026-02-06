@@ -1,5 +1,10 @@
-# @title 当直くん v6.5.4 (SEMI-001週1回制限 + パターン出力修正)
+# @title 当直くん v6.5.5 (カテチーム判定を厳格化)
 # 修正内容:
+# v6.5.5 (2026-02-06):
+# - カテチーム判定をSheet1:Zのチームコード(A,B,C,D,E等)に限定
+#   - 属性列の"2"などはカテ持ちとして扱わない
+#   - expected_team_codesに含まれる値のみがカテチーム
+#   - これによりSEMI-001は本当のカテ持ち医師にのみ適用
 # v6.5.4 (2026-02-06):
 # - SEMI-001（B列カテ表なし）を月曜始まりの週で1回まで許容
 #   - 土日は同じ週（NG）、日月は別の週（OK）
@@ -1145,13 +1150,19 @@ def has_sheet3_code_3(doc):
 
 def has_any_schedule_code(doc):
     """医師がカテ当番を持っているか
-    v6.5.0: Sheet4:属性またはSheet3のカテ表コードで判定
+    v6.5.5: Sheet1:Zのチームコード（A,B,C,D,E等）に一致する場合のみTrue
     """
-    # v6.5.0: Sheet4:属性にカテチーム（A,B,C,D,E等）があればTrue
+    # v6.5.5: Sheet4のカテチーム属性がSheet1:Zのチームコードと一致すればTrue
     if 'doctor_kate_team' in globals() and doctor_kate_team:
         team = doctor_kate_team.get(doc, "")
-        if team and team not in ("0", "3", "", "nan", "None"):
-            return True
+        if team:
+            # expected_team_codesが定義されていて、チームがその中にあればTrue
+            if 'expected_team_codes' in globals() and expected_team_codes:
+                if team in expected_team_codes:
+                    return True
+            # expected_team_codesがない場合は従来方式（A-E等の1文字アルファベット）
+            elif team.upper() in ('A', 'B', 'C', 'D', 'E', 'F', 'G'):
+                return True
 
     # 従来方式: Sheet3のカテ表コードをチェック
     if len(schedule_df.columns) > 0 and doc in schedule_df.columns:
