@@ -1,10 +1,11 @@
-# @title 当直くん v6.5.6 (カテなし医師B列禁止)
+# @title 当直くん v6.5.6 (属性による緩和可否)
 # 修正内容:
 # v6.5.6 (2026-02-06):
-# - カテなし医師のB列制約をABSレベルに変更（ABS-014追加）
-#   - カテ当番=空欄 または 属性=数値(2等)の医師はB列配置不可
-#   - SEMI-001の緩和対象外となり、絶対禁忌として扱う
-#   - これにより赤間など（属性=2）のカテなし医師はB列に配置されない
+# - SEMI-001の緩和可否を属性で判定
+#   - カテ持ち + 属性1: 緩和可（週1回まで許容）
+#   - カテ持ち + 属性2: 緩和不可（ABS該当、カテ表必須）
+#   - カテなし: その他のルールに従う（B列禁止ではない）
+#   - Sheet4の「属性」列を別途読み込み（doctor_attribute辞書）
 # v6.5.5 (2026-02-06):
 # - カテチーム判定をSheet1:Zのチームコード(A,B,C,D,E等)に限定
 #   - 属性列の"2"などはカテ持ちとして扱わない
@@ -404,7 +405,6 @@ CONSTRAINT_ABS_004 = "ABS-004"  # カテ当番日の外病院禁止
 CONSTRAINT_ABS_005 = "ABS-005"  # 同日重複禁止
 CONSTRAINT_ABS_006 = "ABS-006"  # 水曜日L〜Y禁止医師
 CONSTRAINT_ABS_013 = "ABS-013"  # v6.5.3: C-H列（休日大学系）カテ当番必須
-CONSTRAINT_ABS_014 = "ABS-014"  # v6.5.6: カテなし医師B列禁止（SEMI-001緩和対象外）
 
 # ハード制約（HARD: パターン除外）
 CONSTRAINT_HARD_001 = "HARD-001"  # TARGET_CAP超過
@@ -922,6 +922,19 @@ if kate_team_col_name:
 else:
     doctor_kate_team = {d: "" for d in doctor_names}
     print("⚠️ Sheet4にカテチーム列（カテ当番/属性）が見つからないか、Sheet1:Zのチームコードと一致しません")
+
+# v6.5.6: 属性列（1, 2など）を別途取得（SEMI-001緩和可否の判定に使用）
+# 属性=1: 緩和可、属性=2: 緩和不可
+doctor_attribute = {}
+if "属性" in sheet4_data.columns:
+    for doc in doctor_names:
+        attr_val = prev_get_str(doc, "属性")
+        doctor_attribute[doc] = attr_val
+    attr_count = sum(1 for v in doctor_attribute.values() if v)
+    print(f"✅ 属性列読み込み: {attr_count}人に属性設定あり")
+else:
+    doctor_attribute = {d: "" for d in doctor_names}
+    print("⚠️ Sheet4に属性列が見つかりません")
 
 # 出張曜日の取得（「出張日」列から）
 travel_col_name = None
@@ -1456,12 +1469,10 @@ def choose_doctor_for_slot(
             # カテ当番の有無を判定
             is_kate_holder = doc in SCHEDULE_CODE_HOLDERS
             is_sheet3_one = doc in SHEET3_CODE_1_DOCTORS
-
-            # ABS-014: カテなし医師B列禁止（v6.5.6）
-            # カテ当番=空欄 または 属性=数値（2等）の医師はB列不可
-            # これらの医師はSEMI-001の緩和対象外、ABS該当
-            if is_B_only and not is_kate_holder:
-                continue
+            # v6.5.6: 属性による緩和可否（属性=1なら緩和可、属性=2なら緩和不可）
+            doc_attr = doctor_attribute.get(doc, "")
+            is_attr_1 = (doc_attr == "1")  # 属性1は緩和可
+            is_attr_2 = (doc_attr == "2")  # 属性2は緩和不可
 
             # HARD-001: B/I列1回まで（グループA）
             if not relax_hard and is_B_or_I and assigned_bi[doc] >= 1:
@@ -1481,17 +1492,29 @@ def choose_doctor_for_slot(
                 if is_kate_holder and not is_sheet3_one:
                     continue
 
-            # === 準ハード制約（SEMI）: sheet3「1」は緩和対象 ===
+            # === 準ハード制約（SEMI）: 属性1は緩和対象、属性2は緩和不可 ===
 
-            # SEMI-001: B列のみカテ表コード必須（v6.5.4: 週1回まで許容）
-            if not relax_semi and is_B_only:
-                if is_kate_holder and not get_sched_code(date, doc):
-                    if not is_sheet3_one:
-                        # v6.5.4: 同じ月曜始まり週に既にSEMI-001違反があれば2回目は不可
+            # SEMI-001: B列のみカテ表コード必須（v6.5.6: 属性で緩和可否を判定）
+            # カテ持ち + 属性1: 緩和可（週1回まで許容）
+            # カテ持ち + 属性2: 緩和不可（ABS該当、カテ表必須）
+            # カテなし: その他のルールに従う
+            if is_B_only and is_kate_holder and not get_sched_code(date, doc):
+                if is_attr_2:
+                    # 属性2は緩和不可（ABS該当）- カテ表なしでB列配置不可
+                    continue
+                elif is_attr_1:
+                    # 属性1は緩和可（週1回まで許容）
+                    if not relax_semi:
                         week_start = get_monday_week_start(date)
                         if week_start in semi001_violation_weeks[doc]:
                             continue
                         # 1回目は許容（選ばれた場合、後で週を記録）
+                else:
+                    # 属性未設定の場合はsheet3「1」をフォールバック
+                    if not relax_semi and not is_sheet3_one:
+                        week_start = get_monday_week_start(date)
+                        if week_start in semi001_violation_weeks[doc]:
+                            continue
 
             # (SEMI-002はABS-013に格上げ済み - v6.5.3)
 
@@ -2981,20 +3004,37 @@ def build_hard_constraint_violations(pattern_df):
 
             # 違反5: SEMI-001（B列のみ）/ ABS-013（C-H列）カテ表コードなし
             # ※I-K列は制約対象外（平日緩和のため）
+            # v6.5.6: 属性2は緩和不可（ABS該当）、属性1は緩和可（SEMI）
             if doc in SCHEDULE_CODE_HOLDERS and not sched_code and doc not in EXTRA_ALLOWED:
                 # SEMI-001: B列のみカテ表コード必須
                 if idx == B_COL_INDEX:
-                    rows.append({
-                        "制約ID": CONSTRAINT_SEMI_001,
-                        "違反種別": "B列カテ表コード欠如",
-                        "日付": date,
-                        "医師名": doc,
-                        "病院": hosp,
-                        "列番号": idx,
-                        "可否コード": code,
-                        "カテ表": "",
-                        "詳細": f"[{CONSTRAINT_SEMI_001}] B列（平日大学系）の割当にカテ表コードが必要",
-                    })
+                    doc_attr = doctor_attribute.get(doc, "")
+                    if doc_attr == "2":
+                        # 属性2は緩和不可（ABS該当）
+                        rows.append({
+                            "制約ID": CONSTRAINT_SEMI_001,
+                            "違反種別": "B列カテ表コード欠如（属性2:緩和不可）",
+                            "日付": date,
+                            "医師名": doc,
+                            "病院": hosp,
+                            "列番号": idx,
+                            "可否コード": code,
+                            "カテ表": "",
+                            "詳細": f"[{CONSTRAINT_SEMI_001}] B列割当にカテ表必須（属性2は緩和不可）",
+                        })
+                    else:
+                        # 属性1または未設定は緩和可（週1回まで許容）
+                        rows.append({
+                            "制約ID": CONSTRAINT_SEMI_001,
+                            "違反種別": "B列カテ表コード欠如",
+                            "日付": date,
+                            "医師名": doc,
+                            "病院": hosp,
+                            "列番号": idx,
+                            "可否コード": code,
+                            "カテ表": "",
+                            "詳細": f"[{CONSTRAINT_SEMI_001}] B列（平日大学系）の割当にカテ表コードが必要",
+                        })
                 # ABS-013: C-H列カテ当番必須（v6.5.3でSEMI-002から格上げ）
                 elif C_COL_INDEX <= idx <= H_COL_INDEX:
                     rows.append({
@@ -3008,20 +3048,6 @@ def build_hard_constraint_violations(pattern_df):
                         "カテ表": "",
                         "詳細": f"[{CONSTRAINT_ABS_013}] C-H列（休日大学系）の割当にはカテ当番が必須",
                     })
-
-            # 違反: ABS-014 カテなし医師B列禁止（v6.5.6）
-            if doc not in SCHEDULE_CODE_HOLDERS and idx == B_COL_INDEX:
-                rows.append({
-                    "制約ID": CONSTRAINT_ABS_014,
-                    "違反種別": "カテなし医師B列配置",
-                    "日付": date,
-                    "医師名": doc,
-                    "病院": hosp,
-                    "列番号": idx,
-                    "可否コード": code,
-                    "カテ表": "",
-                    "詳細": f"[{CONSTRAINT_ABS_014}] カテなし医師（{doc}）はB列への配置不可",
-                })
 
             # 違反6: 水曜日L〜Y列禁止医師 (ABS-006)
             if dow == 2 and L_COL_INDEX <= idx <= L_Y_END_INDEX and doc in WED_FORBIDDEN_DOCTORS:
