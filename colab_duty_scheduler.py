@@ -1,5 +1,10 @@
-# @title 当直くん v6.5.5 (カテチーム判定を厳格化)
+# @title 当直くん v6.5.6 (カテなし医師B列禁止)
 # 修正内容:
+# v6.5.6 (2026-02-06):
+# - カテなし医師のB列制約をABSレベルに変更（ABS-014追加）
+#   - カテ当番=空欄 または 属性=数値(2等)の医師はB列配置不可
+#   - SEMI-001の緩和対象外となり、絶対禁忌として扱う
+#   - これにより赤間など（属性=2）のカテなし医師はB列に配置されない
 # v6.5.5 (2026-02-06):
 # - カテチーム判定をSheet1:Zのチームコード(A,B,C,D,E等)に限定
 #   - 属性列の"2"などはカテ持ちとして扱わない
@@ -399,6 +404,7 @@ CONSTRAINT_ABS_004 = "ABS-004"  # カテ当番日の外病院禁止
 CONSTRAINT_ABS_005 = "ABS-005"  # 同日重複禁止
 CONSTRAINT_ABS_006 = "ABS-006"  # 水曜日L〜Y禁止医師
 CONSTRAINT_ABS_013 = "ABS-013"  # v6.5.3: C-H列（休日大学系）カテ当番必須
+CONSTRAINT_ABS_014 = "ABS-014"  # v6.5.6: カテなし医師B列禁止（SEMI-001緩和対象外）
 
 # ハード制約（HARD: パターン除外）
 CONSTRAINT_HARD_001 = "HARD-001"  # TARGET_CAP超過
@@ -1450,6 +1456,12 @@ def choose_doctor_for_slot(
             # カテ当番の有無を判定
             is_kate_holder = doc in SCHEDULE_CODE_HOLDERS
             is_sheet3_one = doc in SHEET3_CODE_1_DOCTORS
+
+            # ABS-014: カテなし医師B列禁止（v6.5.6）
+            # カテ当番=空欄 または 属性=数値（2等）の医師はB列不可
+            # これらの医師はSEMI-001の緩和対象外、ABS該当
+            if is_B_only and not is_kate_holder:
+                continue
 
             # HARD-001: B/I列1回まで（グループA）
             if not relax_hard and is_B_or_I and assigned_bi[doc] >= 1:
@@ -2996,6 +3008,20 @@ def build_hard_constraint_violations(pattern_df):
                         "カテ表": "",
                         "詳細": f"[{CONSTRAINT_ABS_013}] C-H列（休日大学系）の割当にはカテ当番が必須",
                     })
+
+            # 違反: ABS-014 カテなし医師B列禁止（v6.5.6）
+            if doc not in SCHEDULE_CODE_HOLDERS and idx == B_COL_INDEX:
+                rows.append({
+                    "制約ID": CONSTRAINT_ABS_014,
+                    "違反種別": "カテなし医師B列配置",
+                    "日付": date,
+                    "医師名": doc,
+                    "病院": hosp,
+                    "列番号": idx,
+                    "可否コード": code,
+                    "カテ表": "",
+                    "詳細": f"[{CONSTRAINT_ABS_014}] カテなし医師（{doc}）はB列への配置不可",
+                })
 
             # 違反6: 水曜日L〜Y列禁止医師 (ABS-006)
             if dow == 2 and L_COL_INDEX <= idx <= L_Y_END_INDEX and doc in WED_FORBIDDEN_DOCTORS:
