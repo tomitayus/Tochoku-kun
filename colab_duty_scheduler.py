@@ -1,5 +1,9 @@
-# @title 当直くん v6.5.3 (C-H列カテ当番をABS制約に格上げ + 出力整理)
+# @title 当直くん v6.5.4 (SEMI-001週1回制限 + パターン出力修正)
 # 修正内容:
+# v6.5.4 (2026-02-06):
+# - SEMI-001（B列カテ表なし）を月曜始まりの週で1回まで許容
+#   - 土日は同じ週（NG）、日月は別の週（OK）
+#   - semi001_violation_weeksで週ごとの違反を追跡
 # v6.5.3 (2026-02-06):
 # - SEMI-002をABS-013に格上げ（C-H列休日大学系カテ当番必須）
 #   - C-H列（休日大学系）でのカテ当番チェックを絶対禁忌に変更
@@ -1342,6 +1346,7 @@ def choose_doctor_for_slot(
     assigned_chjk,    # v6.0.0: C-H/J-K列の合計（HARD-002）
     assigned_hosp_count,
     assigned_bg_dates,  # v6.5.0: 大学系割当日（ABS-012改: 7日間隔ルール）
+    semi001_violation_weeks,  # v6.5.4: SEMI-001違反週（月曜始まり）
 ):
     idx = shift_df.columns.get_loc(hospital_name)
     is_BE = B_COL_INDEX <= idx <= E_COL_INDEX
@@ -1455,11 +1460,15 @@ def choose_doctor_for_slot(
 
             # === 準ハード制約（SEMI）: sheet3「1」は緩和対象 ===
 
-            # SEMI-001: B列のみカテ表コード必須
+            # SEMI-001: B列のみカテ表コード必須（v6.5.4: 週1回まで許容）
             if not relax_semi and is_B_only:
                 if is_kate_holder and not get_sched_code(date, doc):
                     if not is_sheet3_one:
-                        continue
+                        # v6.5.4: 同じ月曜始まり週に既にSEMI-001違反があれば2回目は不可
+                        week_start = get_monday_week_start(date)
+                        if week_start in semi001_violation_weeks[doc]:
+                            continue
+                        # 1回目は許容（選ばれた場合、後で週を記録）
 
             # (SEMI-002はABS-013に格上げ済み - v6.5.3)
 
@@ -1603,6 +1612,7 @@ def build_schedule_pattern(seed=0):
     assigned_hosp_count = {d: defaultdict(int) for d in doctor_names}
     bg_cat = {d: defaultdict(int) for d in doctor_names}
     assigned_bg_dates = {d: set() for d in doctor_names}  # v6.5.0: 大学系割当日（ABS-012改: 7日間隔ルール）
+    semi001_violation_weeks = {d: set() for d in doctor_names}  # v6.5.4: SEMI-001違反週（月曜始まり）
 
     # 固定当直
     for date in all_dates:
@@ -1695,6 +1705,7 @@ def build_schedule_pattern(seed=0):
                 assigned_chjk=assigned_chjk,    # v6.0.0
                 assigned_hosp_count=assigned_hosp_count,
                 assigned_bg_dates=assigned_bg_dates,  # v6.5.0
+                semi001_violation_weeks=semi001_violation_weeks,  # v6.5.4
             )
             if chosen is None:
                 # v6.0.1 フォールバック: 絶対禁忌(ABS)をすべてチェック
@@ -1784,6 +1795,12 @@ def build_schedule_pattern(seed=0):
                 if hidx == B_COL_INDEX or hidx == I_COL_INDEX:
                     assigned_bi[chosen] += 1
 
+                # v6.5.4: SEMI-001違反週の記録（B列でカテ表なし）
+                if hidx == B_COL_INDEX:
+                    if chosen in SCHEDULE_CODE_HOLDERS and not get_sched_code(date, chosen):
+                        week_start = get_monday_week_start(date)
+                        semi001_violation_weeks[chosen].add(week_start)
+
                 # v6.0.0: C-H/J-K列のカウント（HARD-002）
                 if (C_COL_INDEX <= hidx <= H_COL_INDEX) or (J_COL_INDEX <= hidx <= K_COL_INDEX):
                     assigned_chjk[chosen] += 1
@@ -1848,6 +1865,18 @@ def get_bg_week_start(date):
     # 日曜日=0として計算（Python: 月曜日=0なので調整）
     days_since_sunday = (d.weekday() + 1) % 7
     return d - pd.Timedelta(days=days_since_sunday)
+
+def get_monday_week_start(date):
+    """v6.5.4: 月曜始まりの週の開始日（月曜日）を返す
+    SEMI-001週1回ルールで使用
+    例: 土曜と日曜は同じ週、日曜と月曜は別の週
+    """
+    d = pd.to_datetime(date).normalize()
+    if d.tz is not None:
+        d = d.tz_localize(None)
+    # Python weekday(): 月曜=0, ..., 日曜=6
+    days_since_monday = d.weekday()
+    return d - pd.Timedelta(days=days_since_monday)
 
 # =========================
 # パターン統計再計算（pattern_df から）
