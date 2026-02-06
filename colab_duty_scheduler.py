@@ -1077,13 +1077,21 @@ CODE_2_DOCTORS = {doc for doc in doctor_names if has_code_2_anywhere(doc)}
 BASE_TARGET = total_slots // len(active_doctors)
 EXTRA_SLOTS = total_slots - BASE_TARGET * len(active_doctors)
 
-# 余り枠は右側（下位）の医師に割り当てる
+# 余り枠はSheet3（カテ表）の列順で下位（右側）の医師に割り当てる
+# v6.5.7: Sheet2順 → Sheet3順に変更（カテ表の後ろの方の医師を優先）
 # v6.0.5: CODE_2医師もEXTRA対象に含める
 #   - CODE_2除外だと、他医師の制約(gap/dup等)で枠が埋まらず未割当が発生する
 #   - CODE_2医師のn+1回目はB〜Q列（大学系）に割り当てればよい
-active_sorted_by_index = sorted(active_doctors, key=lambda d: doctor_col_index[d])  # 昇順ソート
+if sched_doctors:
+    # Sheet3の列順で医師をソート（Sheet3に存在しない医師は末尾に配置）
+    sched_col_index = {doc: idx for idx, doc in enumerate(sched_doctors)}
+    max_sched_idx = len(sched_doctors)
+    active_sorted_by_index = sorted(active_doctors, key=lambda d: sched_col_index.get(d, max_sched_idx))
+else:
+    # Sheet3がない場合はSheet2の列順にフォールバック
+    active_sorted_by_index = sorted(active_doctors, key=lambda d: doctor_col_index[d])
 extra_eligible = active_sorted_by_index  # 全active医師がEXTRA対象
-EXTRA_ALLOWED = set(extra_eligible[-EXTRA_SLOTS:] if EXTRA_SLOTS > 0 else [])  # 最後のEXTRA_SLOTS人（右側/下位）
+EXTRA_ALLOWED = set(extra_eligible[-EXTRA_SLOTS:] if EXTRA_SLOTS > 0 else [])  # 最後のEXTRA_SLOTS人（Sheet3の右側/下位）
 
 TARGET_CAP = {d: 0 for d in doctor_names}
 for d in active_doctors:
@@ -1124,8 +1132,12 @@ if gap3_cap_adjusted > 0:
 total_cap = sum(TARGET_CAP[d] for d in active_doctors)
 shortage = total_slots - total_cap
 if shortage > 0:
-    # 余裕のある医師（現CAP < gap3上限）に+1ずつ配分
-    for d in sorted(active_doctors, key=lambda x: doctor_col_index[x], reverse=True):
+    # 余裕のある医師（現CAP < gap3上限）に+1ずつ配分（Sheet3下位の医師から優先）
+    if sched_doctors:
+        _extra_sort_key = lambda x: sched_col_index.get(x, max_sched_idx)
+    else:
+        _extra_sort_key = lambda x: doctor_col_index[x]
+    for d in sorted(active_doctors, key=_extra_sort_key, reverse=True):
         if shortage <= 0:
             break
         max_gap3 = compute_max_gap3_assignments(d)
@@ -1140,7 +1152,11 @@ floor_shifts = BASE_TARGET
 print(f"\n✅ 割当設計完了")
 total_cap_final = sum(TARGET_CAP[d] for d in active_doctors)
 print(f"   全枠数: {total_slots} | active医師: {len(active_doctors)}人")
-print(f"   基本割当: {BASE_TARGET}回 | +1回対象: {len(EXTRA_ALLOWED)}人")
+extra_source = "Sheet3(カテ表)" if sched_doctors else "Sheet2(可否表)"
+extra_names = [d for d in active_sorted_by_index if d in EXTRA_ALLOWED]
+print(f"   基本割当: {BASE_TARGET}回 | +1回対象: {len(EXTRA_ALLOWED)}人（{extra_source}順）")
+if extra_names:
+    print(f"   +1回対象医師: {', '.join(extra_names)}")
 print(f"   割当容量: {total_cap_final} / {total_slots}枠")
 
 # gap3制限された医師の詳細表示
