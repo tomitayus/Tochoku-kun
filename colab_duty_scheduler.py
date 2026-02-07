@@ -1646,6 +1646,16 @@ def choose_doctor_for_slot(
         mwd = min(metric_wd.values())
         candidates = [d for d in candidates if metric_wd[d] == mwd]
 
+    # 6.5 全体の平日/休日差を最小化（ハード制約: 差2以上は違反）
+    def _wd_we_diff(d):
+        wd = prev_weekday[d] + assigned_weekday[d] + (0 if holi_flag else 1)
+        we = prev_weekend[d] + assigned_weekend[d] + (1 if holi_flag else 0)
+        return abs(wd - we)
+    min_diff = min(_wd_we_diff(d) for d in candidates)
+    balanced = [d for d in candidates if _wd_we_diff(d) == min_diff]
+    if balanced:
+        candidates = balanced
+
     # 8 floor未満優先
     under_floor = [d for d in candidates if assigned_count[d] < floor_shifts]
     if under_floor:
@@ -2251,6 +2261,15 @@ def evaluate_schedule_with_raw(
         if weekday_count >= 2:
             bg_weekday_over_violations += (weekday_count - 1)
 
+    # 全体の平日/休日偏り違反（差が2以上はハード制約違反）
+    wd_we_imbalance_violations = 0
+    for doc in active_doctors:
+        wd = wd_counts.get(doc, 0)
+        we = we_counts.get(doc, 0)
+        diff = abs(wd - we)
+        if diff >= 2:
+            wd_we_imbalance_violations += (diff - 1)
+
     # v6.5.0: 大学系7日間隔違反（7日以内に2回以上）- ABS-012改
     weekly_bg_violations = 0
     bg_dates_by_doc = {doc: [] for doc in doctor_names}  # doc -> [date list]
@@ -2322,6 +2341,7 @@ def evaluate_schedule_with_raw(
     penalty += bg_weekday_over_violations * 80  # 大学の平日偏り（平日2回以上は不満）
     penalty += ch_kate_violations * 120  # C-H列カテ当番違反（優先度高）
     penalty += weekly_bg_violations * 300  # v6.4.0: 大学系週1違反（ABS-012）
+    penalty += wd_we_imbalance_violations * 300  # 全体の平日/休日偏り（ハード制約）
 
     penalty += max(0, bg_spread - 1) * W_BG_SPREAD
     penalty += max(0, ht_spread - 1) * W_HT_SPREAD
@@ -2350,6 +2370,7 @@ def evaluate_schedule_with_raw(
         "bg_weekday_over_violations": int(bg_weekday_over_violations),
         "ch_kate_violations": int(ch_kate_violations),
         "weekly_bg_violations": int(weekly_bg_violations),  # v6.4.0: 大学系週1違反（ABS-012）
+        "wd_we_imbalance_violations": int(wd_we_imbalance_violations),  # 全体の平日/休日偏り（差>=2）
         "bg_spread_cum": float(bg_spread),
         "ht_spread_cum": float(ht_spread),
         "weekday_spread_cum": float(wd_spread),
@@ -5005,6 +5026,136 @@ def fix_university_weekday_balance_violations(pattern_df, max_attempts=150, verb
 
     return df, remaining_violations == 0, total_fixed
 
+def fix_weekday_weekend_balance(pattern_df, max_attempts=200, verbose=True):
+    """
+    全体の平日/休日偏り（差>=2）を修正する。
+    平日偏重の医師の平日割当と、休日偏重の医師の休日割当を交換する。
+    """
+    df = pattern_df.copy()
+    total_fixed = 0
+
+    for attempt in range(max_attempts):
+        counts, bg_counts, ht_counts, wd_counts, we_counts, *_ = recompute_stats(df)
+
+        # 偏り医師を特定
+        wd_heavy = []  # 平日過多: wd - we >= 2
+        we_heavy = []  # 休日過多: we - wd >= 2
+        for doc in active_doctors:
+            wd = wd_counts.get(doc, 0)
+            we = we_counts.get(doc, 0)
+            if wd - we >= 2:
+                wd_heavy.append((doc, wd - we))
+            elif we - wd >= 2:
+                we_heavy.append((doc, we - wd))
+
+        if not wd_heavy and not we_heavy:
+            if verbose and total_fixed > 0:
+                print(f"   ✅ 平日/休日偏り違反を{total_fixed}件修正しました")
+            return df, True, total_fixed
+
+        if attempt == 0 and verbose:
+            print(f"   ⚠️ 平日/休日偏り違反: 平日過多{len(wd_heavy)}人, 休日過多{len(we_heavy)}人 → 自動修正...")
+
+        fixed_this = False
+
+        # 平日過多の医師と休日過多の医師間でスワップ
+        for wd_doc, wd_diff in sorted(wd_heavy, key=lambda x: -x[1]):
+            if fixed_this:
+                break
+            for we_doc, we_diff in sorted(we_heavy, key=lambda x: -x[1]):
+                if fixed_this:
+                    break
+
+                # wd_docの平日割当を探す
+                wd_slots = []
+                we_slots = []
+                for (ridx, hosp), (date, fixed_flag) in slot_meta.items():
+                    if fixed_flag:
+                        continue
+                    val = df.at[ridx, hosp]
+                    if not isinstance(val, str):
+                        continue
+                    hidx = shift_df.columns.get_loc(hosp)
+                    dow = date.weekday()
+                    weekday = dow < 5
+                    is_holi = (
+                        is_holiday(date)
+                        or dow >= 5
+                        or (weekday and hidx in (C_COL_INDEX, D_COL_INDEX, F_COL_INDEX, G_COL_INDEX))
+                    )
+                    doc_name = normalize_name(val)
+                    if doc_name == wd_doc and not is_holi:
+                        wd_slots.append((ridx, hosp, date))
+                    elif doc_name == we_doc and is_holi:
+                        we_slots.append((ridx, hosp, date))
+
+                random.shuffle(wd_slots)
+                random.shuffle(we_slots)
+
+                for wd_ridx, wd_hosp, wd_date in wd_slots:
+                    if fixed_this:
+                        break
+                    for we_ridx, we_hosp, we_date in we_slots:
+                        # スワップ可能かチェック
+                        # wd_doc → we_hosp(休日), we_doc → wd_hosp(平日)
+                        if not can_assign_doc_to_slot(wd_doc, we_date, we_hosp):
+                            continue
+                        if not can_assign_doc_to_slot(we_doc, wd_date, wd_hosp):
+                            continue
+
+                        # 同日重複チェック
+                        def has_other_assignment(doc, ridx, exclude_hosp):
+                            for h in hospital_cols:
+                                if h == exclude_hosp:
+                                    continue
+                                v = df.at[ridx, h]
+                                if isinstance(v, str) and normalize_name(v) == doc:
+                                    return True
+                            return False
+
+                        if has_other_assignment(wd_doc, we_ridx, we_hosp):
+                            continue
+                        if has_other_assignment(we_doc, wd_ridx, wd_hosp):
+                            continue
+
+                        # gap チェック（スワップ後に3日未満にならないか）
+                        def check_gap_ok(doc, new_date, old_date):
+                            assigns = []
+                            for (r, h), (d, _) in slot_meta.items():
+                                v = df.at[r, h]
+                                if isinstance(v, str) and normalize_name(v) == doc:
+                                    if d != old_date:
+                                        assigns.append(d)
+                            assigns.append(new_date)
+                            assigns.sort()
+                            for i in range(1, len(assigns)):
+                                if abs((assigns[i] - assigns[i-1]).days) < 3:
+                                    return False
+                            return True
+
+                        if not check_gap_ok(wd_doc, we_date, wd_date):
+                            continue
+                        if not check_gap_ok(we_doc, wd_date, we_date):
+                            continue
+
+                        # スワップ実行
+                        df.at[wd_ridx, wd_hosp] = we_doc
+                        df.at[we_ridx, we_hosp] = wd_doc
+                        total_fixed += 1
+                        fixed_this = True
+                        break
+
+        if not fixed_this:
+            break  # これ以上修正できない
+
+    # 最終確認
+    _, _, _, wd_counts, we_counts, *_ = recompute_stats(df)
+    remaining = sum(1 for d in active_doctors if abs(wd_counts.get(d, 0) - we_counts.get(d, 0)) >= 2)
+    if verbose and remaining > 0:
+        print(f"   ⚠️ {remaining}人の平日/休日偏り違反が残っています（修正数: {total_fixed}）")
+
+    return df, remaining == 0, total_fixed
+
 def fix_fairness_imbalance(pattern_df, max_attempts=200, verbose=True):
     """
     active医師間の割当回数の公平性を強化する（最大と最小の差を縮める）
@@ -5426,6 +5577,17 @@ def validate_absolute_constraints(pattern_df, verbose=True):
                     "desc": f"大学系7日間隔違反: {doc} → gap={gap}日 (必須>=7)"
                 })
 
+    # ABS-014: 全体の平日/休日偏り（差>=2）チェック
+    for doc in active_doctors:
+        wd = wd_counts.get(doc, 0)
+        we = we_counts.get(doc, 0)
+        diff = abs(wd - we)
+        if diff >= 2:
+            violations.append({
+                "type": "ABS-014",
+                "desc": f"平日/休日偏り: {doc} → 平日{wd}/休日{we} (差{diff}, 許容<=1)"
+            })
+
     is_valid = len(violations) == 0
 
     if verbose:
@@ -5672,6 +5834,11 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
             total_fix_counts["univ_wd"] = total_fix_counts.get("univ_wd", 0) + fc
             round_fixed += fc
 
+            # 11.5 全体の平日/休日偏り違反を修正
+            current_df, _, fc = safe_fix(fix_weekday_weekend_balance, current_df, max_attempts=200)
+            total_fix_counts["wd_we"] = total_fix_counts.get("wd_we", 0) + fc
+            round_fixed += fc
+
             # 12. 公平性違反の修正
             current_df, _, fc = safe_fix(fix_fairness_imbalance, current_df, max_attempts=200)
             total_fix_counts["fairness"] = total_fix_counts.get("fairness", 0) + fc
@@ -5712,6 +5879,10 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         final_df, _, final_cap_fc = fix_target_cap_violations(final_df, max_attempts=100, verbose=False)
         total_fix_counts["cap"] = total_fix_counts.get("cap", 0) + final_cap_fc
 
+        # 2.8) 平日/休日偏り違反を修正
+        final_df, _, final_wd_we_fc = fix_weekday_weekend_balance(final_df, max_attempts=200, verbose=False)
+        total_fix_counts["wd_we"] = total_fix_counts.get("wd_we", 0) + final_wd_we_fc
+
         # 3) 未割当スロットを埋める（gap/dup修正で発生した未割当を含む）
         final_df, _, final_unassigned_fc = fix_unassigned_slots(final_df, verbose=False)
         total_fix_counts["unassigned"] = total_fix_counts.get("unassigned", 0) + final_unassigned_fc
@@ -5730,6 +5901,7 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         ext_dup_fix_count = total_fix_counts.get("ext_dup", 0)
         univ_over_2_fix_count = total_fix_counts.get("univ_over2", 0)
         univ_weekday_fix_count = total_fix_counts.get("univ_wd", 0)
+        wd_we_fix_count = total_fix_counts.get("wd_we", 0)
         fairness_fix_count = total_fix_counts.get("fairness", 0)
         unassigned_fix_count = total_fix_counts.get("unassigned", 0)
 
@@ -5806,13 +5978,14 @@ for e in refined:
     code_2_viol = met.get('code_2_extra_violations', 0)
     bg_over_2_viol = met.get('bg_over_2_violations', 0)
     ht_0_viol = met.get('ht_0_violations', 0)
+    wd_we_viol = met.get('wd_we_imbalance_violations', 0)
     abs_valid = e.get("absolute_constraints_valid", False)  # v5.7.1: 絶対禁忌チェック
     # ch_kate_violationsはソフト制約（ペナルティのみ、ハード制約から除外）
 
     # v5.7.1: 絶対禁忌違反があれば除外
     if not abs_valid:
         excluded_count += 1
-    elif cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0 or bg_over_2_viol > 0 or ht_0_viol > 0:
+    elif cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0 or bg_over_2_viol > 0 or ht_0_viol > 0 or wd_we_viol > 0:
         excluded_count += 1
     else:
         valid_patterns.append(e)
