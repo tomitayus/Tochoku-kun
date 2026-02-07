@@ -5999,15 +5999,16 @@ def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnos
     COMPACT_COLS = ["氏名", "全合計", "大学合計", "外病院合計", "平日", "休日合計"]
     df_month_compact = df_month[COMPACT_COLS].copy()
 
+    # === 1. 今月サマリー + 累計詳細を1つの連続テーブルとして出力 ===
     ws.cell(row=1, column=1, value="【今月サマリー】")
     df_month_compact.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
-    startrow = len(df_month_compact.index) + 3
+    startrow = len(df_month_compact.index) + 2  # タイトル無し・空行無しで直結
 
-    # === 2. 累計詳細内訳（今月サマリーの直後に配置）===
+    # 累計詳細内訳（タイトル行なし、今月サマリーに続けて配置）
     detail_cols_available = [c for c in SUMMARY_DETAIL_COLS if c in df_total.columns]
     if detail_cols_available:
         df_detail = df_total[["氏名"] + detail_cols_available].copy()
-        ws.cell(row=startrow, column=1, value="【累計詳細内訳】")
+        ws.cell(row=startrow, column=1, value="【累計詳細】")
         df_detail.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
         startrow += len(df_detail.index) + 4
 
@@ -6035,6 +6036,7 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         ws = writer.sheets[sheet_label]
         axis_short = {"公平性重視": "公平性", "連続当直回避重視": "gap回避", "バランス重視": "バランス", "総合スコア": "総合"}.get(axis_label, axis_label)
         ws.cell(row=1, column=len(entry["pattern_df"].columns) + 2, value=f"【{axis_short}】")
+        ws.column_dimensions['A'].width = 12  # Date列幅（########防止）
 
         # v6.3.0: 今月/累計/診断を1シートに統合
         counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(entry["pattern_df"])
