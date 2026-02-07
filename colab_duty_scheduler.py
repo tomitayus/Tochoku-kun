@@ -598,18 +598,40 @@ else:
     uploaded_filename = "Tochoku.local.xlsx"
     shift_df = strip_cols(pd.DataFrame(LOCAL_DATA["sheet1"]))
     availability_raw = strip_cols(pd.DataFrame(LOCAL_DATA["sheet2"]))
-    schedule_raw = strip_cols(pd.DataFrame(LOCAL_DATA["sheet3"]))
+
+    # v6.5.8: LOCAL_DATAパスでも新構造(v7)に対応
+    # Sheet4がない場合、Sheet3を医師情報シートとして使用（Colabパスと同じ）
+    has_sheet4 = "Sheet4" in LOCAL_DATA and LOCAL_DATA["Sheet4"]
+    has_sheet3 = "sheet3" in LOCAL_DATA and LOCAL_DATA["sheet3"]
+
+    if has_sheet4:
+        schedule_raw = strip_cols(pd.DataFrame(LOCAL_DATA["sheet3"])) if has_sheet3 else pd.DataFrame()
+        sheet4_raw_out = strip_cols(pd.DataFrame(LOCAL_DATA["Sheet4"]))
+    elif has_sheet3:
+        # Sheet4がない場合: Sheet3を医師情報シートとして使用
+        print("📋 [LOCAL] Sheet4なし - Sheet3を医師情報シートとして使用")
+        sheet4_raw_out = strip_cols(pd.DataFrame(LOCAL_DATA["sheet3"]))
+        schedule_raw = pd.DataFrame()  # 旧カテ表は使用しない
+    else:
+        schedule_raw = pd.DataFrame()
+        sheet4_raw_out = pd.DataFrame(columns=["氏名"])
 
     shift_df.columns = make_unique(list(shift_df.columns))
     availability_raw.columns = make_unique(list(availability_raw.columns))
-    schedule_raw.columns = make_unique(list(schedule_raw.columns))
+    if len(schedule_raw.columns) > 0:
+        schedule_raw.columns = make_unique(list(schedule_raw.columns))
 
-    sheet4_raw_out = strip_cols(pd.DataFrame(LOCAL_DATA["Sheet4"]))
     sheet4_raw_out.columns = make_unique(list(sheet4_raw_out.columns))
 
-    sheet4_data = sheet4_raw_out.copy()
-    if "氏名" not in sheet4_data.columns:
-        raise ValueError("❌ Sheet4 の '氏名' 列が見つかりません（ローカルデータを確認してください）")
+    # Sheet4が「氏名」列を含むか確認（新構造ではgrid形式の可能性あり）
+    if "氏名" not in sheet4_raw_out.columns:
+        # grid形式の場合はparse_sheet4_from_gridを試行
+        try:
+            sheet4_data = parse_sheet4_from_grid(sheet4_raw_out)
+        except Exception:
+            raise ValueError("❌ Sheet4 の '氏名' 列が見つかりません（ローカルデータを確認してください）")
+    else:
+        sheet4_data = sheet4_raw_out.copy()
     sheet4_data["氏名"] = sheet4_data["氏名"].astype(str).str.strip()
     for col in sheet4_data.columns:
         if col == "氏名":
@@ -1186,10 +1208,18 @@ if code_2_in_active:
 # sheet3でカテ表コード保有医師の特定
 # =========================
 def has_sheet3_code_3(doc):
-    if doc not in schedule_df.columns:
-        return False
-    values = schedule_df[doc].dropna()
-    return any(str(v).strip() == "3" for v in values)
+    """医師がsheet3でコード「3」を持つか、またはSheet2で全日コード3（外病院専門）か"""
+    # 旧構造: Sheet3にコード「3」がある
+    if doc in schedule_df.columns:
+        values = schedule_df[doc].dropna()
+        if any(str(v).strip() == "3" for v in values):
+            return True
+    # v6.5.8: 新構造ではSheet2の可否コードで判定（全日がコード3なら外病院専門）
+    if doc in availability_df.columns:
+        avail_vals = availability_df[doc].dropna()
+        if len(avail_vals) > 0 and all(str(v).strip() == "3" for v in avail_vals):
+            return True
+    return False
 
 def has_any_schedule_code(doc):
     """医師がカテ当番を持っているか
@@ -1251,16 +1281,22 @@ if kate_team_by_date and doctor_kate_team:
             print(f"   📋 カテ当番判定テスト: {sample_date.strftime('%m/%d')}(チーム{sample_team}) + {sample_doc2}(チーム{doctor_kate_team.get(sample_doc2)}) = {result2}")
 
 # sheet3で「1」を持つ医師（平日大学系でカテ当番不一致を許容）
+# v6.5.8: 新構造ではschedule_dfが空のため、属性1をフォールバックとして使用
 def has_sheet3_code_1(doc):
-    """医師がsheet3で少なくとも1つの「1」コードを持っているか"""
-    if doc not in schedule_df.columns:
-        return False
-    values = schedule_df[doc].dropna()
-    return any(str(v).strip() == "1" for v in values)
+    """医師がsheet3で少なくとも1つの「1」コードを持っているか（新構造では属性1で代替）"""
+    # 旧構造: Sheet3にコード「1」がある
+    if doc in schedule_df.columns:
+        values = schedule_df[doc].dropna()
+        if any(str(v).strip() == "1" for v in values):
+            return True
+    # 新構造: 属性1の医師を「平日緩和」対象として扱う
+    if doctor_attribute.get(doc, "") == "1":
+        return True
+    return False
 
 SHEET3_CODE_1_DOCTORS = {doc for doc in doctor_names if has_sheet3_code_1(doc)}
 if SHEET3_CODE_1_DOCTORS:
-    print(f"   └─ sheet3に1あり（平日緩和）: {len(SHEET3_CODE_1_DOCTORS)}人")
+    print(f"   └─ 平日緩和対象: {len(SHEET3_CODE_1_DOCTORS)}人")
 
 def is_ch_slot(col_idx):
     """C-H列（休日大学系、インデックス2-7）かどうか"""
@@ -5394,6 +5430,35 @@ def validate_absolute_constraints(pattern_df, verbose=True):
                 "type": "ABS-011",
                 "desc": f"大学系3回以上: {doc} → {bg_count}回 (上限2)"
             })
+
+    # v6.5.8: ABS-012: 大学系7日間隔チェック
+    bg_dates_by_doc_v = {doc: [] for doc in doctor_names}
+    for ridx in pattern_df.index:
+        date = pattern_df.at[ridx, date_col_shift]
+        if pd.isna(date):
+            continue
+        date = pd.to_datetime(date).normalize()
+        if date.tz is not None:
+            date = date.tz_localize(None)
+        for hosp in hospital_cols:
+            hidx = shift_df.columns.get_loc(hosp)
+            if not (B_COL_INDEX <= hidx <= K_COL_INDEX):
+                continue
+            val = pattern_df.at[ridx, hosp]
+            if not isinstance(val, str):
+                continue
+            doc = normalize_name(val)
+            if doc in bg_dates_by_doc_v:
+                bg_dates_by_doc_v[doc].append(date)
+    for doc in active_doctors:
+        dates = sorted(bg_dates_by_doc_v.get(doc, []))
+        for i in range(1, len(dates)):
+            gap = abs((dates[i] - dates[i-1]).days)
+            if gap < 7:
+                violations.append({
+                    "type": "ABS-012",
+                    "desc": f"大学系7日間隔違反: {doc} → gap={gap}日 (必須>=7)"
+                })
 
     is_valid = len(violations) == 0
 
