@@ -562,7 +562,7 @@ if COLAB_AVAILABLE:
     # v6.5.0: 新しいExcel構造対応
     # Sheet4がない場合はSheet3を医師情報シートとして使用（旧Sheet3のカテ表は廃止）
     if sheet4_name is None and sheet3_name is not None:
-        print("📋 Sheet4が見つかりません - Sheet3を医師情報シートとして使用")
+        print("📋 Sheet3を医師情報シートとして使用")
         sheet4_name = sheet3_name
         sheet3_name = None  # 旧カテ表は使用しない
 
@@ -581,7 +581,7 @@ if COLAB_AVAILABLE:
     else:
         # カテ表はSheet1:Z + Sheet4:属性で代替するため空でOK
         schedule_raw = pd.DataFrame()
-        print("📋 旧カテ表(Sheet3)は使用しません - Sheet1:Z列 + Sheet4:属性で判定")
+        # 旧カテ表不使用（Sheet1:Z + Sheet4:属性で判定）
 
     shift_df.columns = make_unique(list(shift_df.columns))
     availability_raw.columns = make_unique(list(availability_raw.columns))
@@ -687,7 +687,7 @@ for col in all_cols:
 
 if KATE_TOBAN_COL is not None:
     hospital_cols = [c for c in all_cols if c != KATE_TOBAN_COL]
-    print(f"✅ Sheet1:Z列「カテ当番」を検出 - 病院列から除外")
+    print(f"✅ カテ当番列(Z列)検出")
 else:
     hospital_cols = all_cols
     print("⚠️ Sheet1に「カテ当番」列が見つかりません（従来方式を使用）")
@@ -857,7 +857,7 @@ if len(schedule_raw.columns) > 1:
         print("   ※H〜U の『カテ表あり不可』制約が一部の医師で効かない可能性があります。")
 else:
     sched_doctors = []
-    print("📋 Sheet3(カテ表)の医師列なし → EXTRA順序はSheet2(可否表)にフォールバック")
+    # Sheet3の医師列なし（EXTRA順序はSheet2にフォールバック）
 
 # =========================
 # sheet4 前月まで累積
@@ -932,12 +932,12 @@ for col_candidate in ["カテ当番", "属性", "カテ", "チーム"]:  # カ�
     # 期待されるチームコードと1つでも一致すればこの列を使用
     if expected_team_codes and col_values & expected_team_codes:
         kate_team_col_name = col_candidate
-        print(f"✅ Sheet4:{kate_team_col_name}列 を使用 (チームコード一致: {col_values & expected_team_codes})")
+        # Sheet4:kate_team_col_name列使用
         break
     elif not expected_team_codes and col_values:
         # Sheet1:Zがない場合は最初に見つかった列を使用
         kate_team_col_name = col_candidate
-        print(f"✅ Sheet4:{kate_team_col_name}列 を使用 (値: {list(col_values)[:5]})")
+        # Sheet4:kate_team_col_name列使用（フォールバック）
         break
 
 if kate_team_col_name:
@@ -954,7 +954,7 @@ if "属性" in sheet4_data.columns:
         attr_val = prev_get_str(doc, "属性")
         doctor_attribute[doc] = attr_val
     attr_count = sum(1 for v in doctor_attribute.values() if v)
-    print(f"✅ 属性列読み込み: {attr_count}人に属性設定あり")
+    print(f"   属性: {attr_count}人")
 else:
     doctor_attribute = {d: "" for d in doctor_names}
     print("⚠️ Sheet4に属性列が見つかりません")
@@ -972,7 +972,7 @@ else:
     doctor_travel_day = {d: "" for d in doctor_names}
 
 # デバッグ: Sheet4の列名を表示
-print(f"📋 Sheet4列名: {list(sheet4_data.columns)}")
+# Sheet4列名（デバッグ用）: print(f"📋 Sheet4列名: {list(sheet4_data.columns)}")
 
 # 曜日名から曜日番号へのマッピング（月曜=0, ..., 日曜=6）
 WEEKDAY_MAP = {"月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6}
@@ -998,11 +998,11 @@ def get_pre_travel_dates(doc, all_dates):
 doc_with_attr = [(d, doctor_kate_team[d]) for d in doctor_names if doctor_kate_team[d]]
 doc_with_travel = [(d, doctor_travel_day[d]) for d in doctor_names if doctor_travel_day[d]]
 if doc_with_attr:
-    print(f"✅ カテチーム属性: {len(doc_with_attr)}人 (例: {doc_with_attr[:5]})")
+    print(f"   カテチーム: {len(doc_with_attr)}人")
 else:
     print("⚠️ カテチーム属性を持つ医師が0人です")
 if doc_with_travel:
-    print(f"✅ 出張日設定: {len(doc_with_travel)}人 (例: {doc_with_travel[:3]})")
+    print(f"   出張日: {len(doc_with_travel)}人")
 
 # =========================
 # v6.5.0: Sheet1からカテ当番日（チーム）を取得
@@ -1021,7 +1021,7 @@ if KATE_TOBAN_COL is not None:
                 kate_team_by_date[date] = team_str
     if kate_team_by_date:
         unique_teams = set(kate_team_by_date.values())
-        print(f"✅ カテ当番日: {len(kate_team_by_date)}日分 (チーム: {unique_teams})")
+        print(f"   カテ当番: {len(kate_team_by_date)}日分")
     else:
         print("⚠️ Sheet1:Z列にカテ当番チームのデータがありません")
 else:
@@ -1178,30 +1178,16 @@ if shortage > 0:
 
 floor_shifts = BASE_TARGET
 
-print(f"\n✅ 割当設計完了")
 total_cap_final = sum(TARGET_CAP[d] for d in active_doctors)
-print(f"   全枠数: {total_slots} | active医師: {len(active_doctors)}人")
 extra_names = [d for d in active_sorted_by_index if d in EXTRA_ALLOWED]
 extra_attr1_count = sum(1 for d in EXTRA_ALLOWED if doctor_attribute.get(d, "") == "1")
-print(f"   基本割当: {BASE_TARGET}回 | +1回対象: {len(EXTRA_ALLOWED)}人（属性1: {extra_attr1_count}人）")
-if extra_names:
-    extra_detail = [f"{d}(属性{doctor_attribute.get(d, '?')})" for d in extra_names]
-    print(f"   +1回対象医師: {', '.join(extra_detail)}")
-print(f"   割当容量: {total_cap_final} / {total_slots}枠")
-
-# gap3制限された医師の詳細表示
 gap3_limited = [(d, compute_max_gap3_assignments(d)) for d in active_doctors if compute_max_gap3_assignments(d) < BASE_TARGET]
-if gap3_limited:
-    print(f"   gap>=3制約でCAP切下げ: {len(gap3_limited)}人")
-    for doc, mx in gap3_limited:
-        avail = sum(1 for dt in all_shift_dates if get_avail_code(dt, doc) != 0)
-        print(f"     {doc}: 利用可能{avail}日 → gap3上限{mx}回 (CAP={TARGET_CAP[doc]})")
 
-# 可否コード2の医師の情報表示
-code_2_in_active = [d for d in active_sorted_by_index if d in CODE_2_DOCTORS]
-code_2_in_extra = [d for d in EXTRA_ALLOWED if d in CODE_2_DOCTORS]
-if code_2_in_active:
-    print(f"   CODE_2医師: {len(code_2_in_active)}人（うちEXTRA対象: {len(code_2_in_extra)}人）")
+print(f"\n✅ 割当: {len(active_doctors)}人 × {BASE_TARGET}回 + {len(EXTRA_ALLOWED)}人×1回 = {total_cap_final}/{total_slots}枠")
+if extra_names:
+    print(f"   +1回: {', '.join(extra_names)}")
+if gap3_limited:
+    print(f"   gap3制限: {', '.join(d for d, _ in gap3_limited)}")
 
 # =========================
 # B-K / L-Y 比率バランス（sheet3で「3」記載の医師は除外）
@@ -1252,33 +1238,11 @@ if RATIO_EXEMPT_DOCTORS:
 
 SCHEDULE_CODE_HOLDERS = {doc for doc in doctor_names if has_any_schedule_code(doc)}
 NO_KATE_DOCTORS = {doc for doc in doctor_names if not has_any_schedule_code(doc)}
-print(f"   カテ表保有: {len(SCHEDULE_CODE_HOLDERS)}人 | カテ当番なし: {len(NO_KATE_DOCTORS)}人")
+print(f"   カテ保有: {len(SCHEDULE_CODE_HOLDERS)}人 | なし: {len(NO_KATE_DOCTORS)}人")
 
-# v6.5.0: デバッグ情報
 if len(SCHEDULE_CODE_HOLDERS) == 0:
-    # カテ表保有者が0人の場合、問題がある
     sample_teams = [(d, doctor_kate_team.get(d, "")) for d in list(doctor_names)[:5]]
-    print(f"   ⚠️ カテ表保有者0人 - doctor_kate_team サンプル = {sample_teams}")
-else:
-    print(f"   カテ表保有者 (例): {list(SCHEDULE_CODE_HOLDERS)[:5]}")
-
-# v6.5.0: get_sched_code()の動作確認
-if kate_team_by_date and doctor_kate_team:
-    # サンプル日付でget_sched_code()の動作を確認
-    sample_date = list(kate_team_by_date.keys())[0] if kate_team_by_date else None
-    if sample_date:
-        sample_team = kate_team_by_date[sample_date]
-        # このチームに属する医師を探す
-        matching_docs = [d for d in doctor_names if doctor_kate_team.get(d) == sample_team]
-        non_matching_docs = [d for d in doctor_names if doctor_kate_team.get(d) and doctor_kate_team.get(d) != sample_team][:3]
-        if matching_docs:
-            sample_doc = matching_docs[0]
-            result = get_sched_code(sample_date, sample_doc)
-            print(f"   📋 カテ当番判定テスト: {sample_date.strftime('%m/%d')}(チーム{sample_team}) + {sample_doc}(チーム{doctor_kate_team.get(sample_doc)}) = {result}")
-        if non_matching_docs:
-            sample_doc2 = non_matching_docs[0]
-            result2 = get_sched_code(sample_date, sample_doc2)
-            print(f"   📋 カテ当番判定テスト: {sample_date.strftime('%m/%d')}(チーム{sample_team}) + {sample_doc2}(チーム{doctor_kate_team.get(sample_doc2)}) = {result2}")
+    print(f"   ⚠️ カテ表保有者0人 - {sample_teams}")
 
 # sheet3で「1」を持つ医師（平日大学系でカテ当番不一致を許容）
 # v6.5.8: 新構造ではschedule_dfが空のため、属性1をフォールバックとして使用
@@ -1296,7 +1260,7 @@ def has_sheet3_code_1(doc):
 
 SHEET3_CODE_1_DOCTORS = {doc for doc in doctor_names if has_sheet3_code_1(doc)}
 if SHEET3_CODE_1_DOCTORS:
-    print(f"   └─ 平日緩和対象: {len(SHEET3_CODE_1_DOCTORS)}人")
+    print(f"   平日緩和: {len(SHEET3_CODE_1_DOCTORS)}人")
 
 def is_ch_slot(col_idx):
     """C-H列（休日大学系、インデックス2-7）かどうか"""
@@ -6037,19 +6001,9 @@ def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnos
 
     ws.cell(row=1, column=1, value="【今月サマリー】")
     df_month_compact.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
-    startrow = len(df_month_compact.index) + 4
+    startrow = len(df_month_compact.index) + 3
 
-    # === 2. 累計サマリー（コンパクト: 同じ基本列 + 属性）===
-    CUMUL_COLS = ["氏名", "全合計", "大学合計", "外病院合計", "平日", "休日合計"]
-    df_total_compact = df_total[CUMUL_COLS].copy()
-    # 属性列を追加
-    df_total_compact.insert(1, "属性", [doctor_attribute.get(doc, "") for doc in df_total["氏名"]])
-
-    ws.cell(row=startrow, column=1, value="【累計サマリー】")
-    df_total_compact.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
-    startrow += len(df_total_compact.index) + 4
-
-    # === 3. 詳細内訳（大学7分類 + 個別病院列）===
+    # === 2. 累計詳細内訳（今月サマリーの直後に配置）===
     detail_cols_available = [c for c in SUMMARY_DETAIL_COLS if c in df_total.columns]
     if detail_cols_available:
         df_detail = df_total[["氏名"] + detail_cols_available].copy()
@@ -6057,7 +6011,7 @@ def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnos
         df_detail.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
         startrow += len(df_detail.index) + 4
 
-    # === 4. 制約違反テーブル群 ===
+    # === 3. 制約違反テーブル群 ===
     for title, df in diagnostics:
         if title == "【医師ごとの偏り】":
             continue  # 不要（基本列で十分）
