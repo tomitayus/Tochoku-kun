@@ -6025,44 +6025,42 @@ output_filename = f"{base_name}_v{VERSION}.xlsx"
 output_path = output_filename
 
 def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnostics, df_doctors=None):
-    """v6.5.3: 今月サマリーと医師ごとの偏りを統合、累計/診断を1シートに統合して出力"""
+    """v6.5.8: 今月サマリーをコンパクトに、累計・詳細は下部に配置"""
     startrow = 0
 
     ws = writer.book.create_sheet(sheet_name)
     writer.sheets[sheet_name] = ws
 
-    # v6.5.3: 今月サマリーと医師ごとの偏りを1テーブルに統合
-    if df_doctors is not None:
-        # df_monthの基本列（氏名, 全合計, 大学合計, 外病院合計, 平日, 休日合計）とdf_doctorsの診断列をマージ
-        # df_doctorsから使う列を選定
-        diag_cols = ["active", "cap", "gap3上限", "利用可能日数", "preassigned",
-                     "gap違反回数", "最小間隔(日)", "同一病院重複超過",
-                     "累計_全合計_平均との差", "累計_大学合計_平均との差",
-                     "累計_外病院合計_平均との差", "累計_平日_平均との差", "累計_休日合計_平均との差"]
-        diag_cols = [c for c in diag_cols if c in df_doctors.columns]
+    # === 1. 今月サマリー（コンパクト: 当直回数 + 大学/外病院バランスのみ）===
+    COMPACT_COLS = ["氏名", "全合計", "大学合計", "外病院合計", "平日", "休日合計"]
+    df_month_compact = df_month[COMPACT_COLS].copy()
 
-        # df_monthとdf_doctorsをマージ（氏名をキーに）
-        df_diag_subset = df_doctors[["氏名"] + diag_cols].copy()
-        df_combined = pd.merge(df_month, df_diag_subset, on="氏名", how="left")
+    ws.cell(row=1, column=1, value="【今月サマリー】")
+    df_month_compact.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
+    startrow = len(df_month_compact.index) + 4
 
-        ws.cell(row=1, column=1, value="【医師サマリー（今月）】")
-        df_combined.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
-        startrow = len(df_combined.index) + 4
-    else:
-        # 従来方式（今月サマリー単独）
-        ws.cell(row=1, column=1, value="【今月サマリー】")
-        df_month.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
-        startrow = len(df_month.index) + 4
+    # === 2. 累計サマリー（コンパクト: 同じ基本列 + 属性）===
+    CUMUL_COLS = ["氏名", "全合計", "大学合計", "外病院合計", "平日", "休日合計"]
+    df_total_compact = df_total[CUMUL_COLS].copy()
+    # 属性列を追加
+    df_total_compact.insert(1, "属性", [doctor_attribute.get(doc, "") for doc in df_total["氏名"]])
 
-    # 累計サマリー
     ws.cell(row=startrow, column=1, value="【累計サマリー】")
-    df_total.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
-    startrow += len(df_total.index) + 4
+    df_total_compact.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
+    startrow += len(df_total_compact.index) + 4
 
-    # 診断情報（医師ごとの偏りは統合済みなのでスキップ）
+    # === 3. 詳細内訳（大学7分類 + 個別病院列）===
+    detail_cols_available = [c for c in SUMMARY_DETAIL_COLS if c in df_total.columns]
+    if detail_cols_available:
+        df_detail = df_total[["氏名"] + detail_cols_available].copy()
+        ws.cell(row=startrow, column=1, value="【累計詳細内訳】")
+        df_detail.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
+        startrow += len(df_detail.index) + 4
+
+    # === 4. 制約違反テーブル群 ===
     for title, df in diagnostics:
         if title == "【医師ごとの偏り】":
-            continue  # v6.5.3: 上で統合済み
+            continue  # 不要（基本列で十分）
         ws.cell(row=startrow, column=1, value=title)
         df.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
         startrow += len(df.index) + 3
