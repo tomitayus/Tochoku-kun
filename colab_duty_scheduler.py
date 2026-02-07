@@ -950,9 +950,18 @@ if "属性" in sheet4_data.columns:
     for doc in doctor_names:
         attr_val = prev_get_str(doc, "属性")
         doctor_attribute[doc] = attr_val
+    attr0 = sum(1 for v in doctor_attribute.values() if v == "0")
     attr1 = sum(1 for v in doctor_attribute.values() if v == "1")
     attr2 = sum(1 for v in doctor_attribute.values() if v == "2")
-    print(f"   属性: {attr1 + attr2}人（属性1: {attr1}人, 属性2: {attr2}人）")
+    attr3 = sum(1 for v in doctor_attribute.values() if v == "3")
+    attr_none = len(doctor_attribute) - attr0 - attr1 - attr2 - attr3
+    parts = []
+    if attr0: parts.append(f"0:{attr0}")
+    if attr1: parts.append(f"1:{attr1}")
+    if attr2: parts.append(f"2:{attr2}")
+    if attr3: parts.append(f"3:{attr3}")
+    if attr_none: parts.append(f"未設定:{attr_none}")
+    print(f"   属性: {len(doctor_attribute)}人（{', '.join(parts)}）")
 else:
     doctor_attribute = {d: "" for d in doctor_names}
     print("⚠️ Sheet4に属性列が見つかりません")
