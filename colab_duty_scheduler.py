@@ -6029,14 +6029,17 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         axis_label = entry.get('axis_label', '総合スコア')
         sheet_label = f"pattern_{rank:02d}"
 
-        # パターンシート
-        entry["pattern_df"].to_excel(writer, sheet_name=sheet_label, index=False)
+        # パターンシート（Date列を曜日付き文字列に変換）
+        _WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
+        pdf = entry["pattern_df"].copy()
+        pdf[date_col_shift] = pd.to_datetime(pdf[date_col_shift]).apply(
+            lambda d: f"{d.month}/{d.day}({_WEEKDAY_JP[d.weekday()]})" if pd.notna(d) else "")
+        pdf.to_excel(writer, sheet_name=sheet_label, index=False)
 
         # シート名に軸ラベルを追加（Excelの制限により簡略化）
         ws = writer.sheets[sheet_label]
         axis_short = {"公平性重視": "公平性", "連続当直回避重視": "gap回避", "バランス重視": "バランス", "総合スコア": "総合"}.get(axis_label, axis_label)
         ws.cell(row=1, column=len(entry["pattern_df"].columns) + 2, value=f"【{axis_short}】")
-        ws.column_dimensions['A'].width = 12  # Date列幅（########防止）
 
         # v6.3.0: 今月/累計/診断を1シートに統合
         counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(entry["pattern_df"])
