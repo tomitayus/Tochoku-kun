@@ -5988,37 +5988,59 @@ base_name = uploaded_filename.rsplit(".", 1)[0]
 output_filename = f"{base_name}_v{VERSION}.xlsx"
 output_path = output_filename
 
-def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnostics, df_doctors=None):
-    """v6.5.8: 今月サマリーをコンパクトに、累計・詳細は下部に配置"""
-    startrow = 0
+def _fmt_date_jp(d):
+    """日付を 'YYYY/M/D (曜日)' 形式に変換"""
+    _WD = ["月", "火", "水", "木", "金", "土", "日"]
+    if pd.isna(d):
+        return ""
+    d = pd.to_datetime(d)
+    return f"{d.year}/{d.month}/{d.day} ({_WD[d.weekday()]})"
 
+def _fmt_date_cols(df):
+    """DataFrame内の日付列を文字列フォーマットに変換"""
+    df = df.copy()
+    for col in df.columns:
+        if "日付" in str(col):
+            df[col] = df[col].apply(_fmt_date_jp)
+    return df
+
+def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnostics, df_doctors=None):
+    """v6.5.9: 今月サマリー + 累計詳細を横連結で1テーブル化"""
     ws = writer.book.create_sheet(sheet_name)
     writer.sheets[sheet_name] = ws
 
-    # === 1. 今月サマリー（コンパクト: 当直回数 + 大学/外病院バランスのみ）===
+    # === 1. 今月サマリー + 累計詳細を横連結 ===
     COMPACT_COLS = ["氏名", "全合計", "大学合計", "外病院合計", "平日", "休日合計"]
     df_month_compact = df_month[COMPACT_COLS].copy()
 
-    # === 1. 今月サマリー + 累計詳細を1つの連続テーブルとして出力 ===
-    ws.cell(row=1, column=1, value="【今月サマリー】")
-    df_month_compact.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
-    startrow = len(df_month_compact.index) + 2  # タイトル無し・空行無しで直結
-
-    # 累計詳細内訳（タイトル行なし、今月サマリーに続けて配置）
     detail_cols_available = [c for c in SUMMARY_DETAIL_COLS if c in df_total.columns]
     if detail_cols_available:
         df_detail = df_total[["氏名"] + detail_cols_available].copy()
-        ws.cell(row=startrow, column=1, value="【累計詳細】")
-        df_detail.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
-        startrow += len(df_detail.index) + 4
+        df_combined = df_month_compact.merge(df_detail, on="氏名", how="outer")
+    else:
+        df_combined = df_month_compact.copy()
 
-    # === 3. 制約違反テーブル群 ===
+    # セクションタイトル（行1）
+    ws.cell(row=1, column=1, value="【今月サマリー】")
+    if detail_cols_available:
+        ws.cell(row=1, column=len(COMPACT_COLS) + 1, value="【累計詳細】")
+
+    df_combined.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
+    startrow = len(df_combined.index) + 4
+
+    # === 2. 制約違反テーブル群（日付列をフォーマット）===
     for title, df in diagnostics:
         if title == "【医師ごとの偏り】":
-            continue  # 不要（基本列で十分）
+            continue
         ws.cell(row=startrow, column=1, value=title)
-        df.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
-        startrow += len(df.index) + 3
+        df_out = _fmt_date_cols(df)
+        df_out.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
+        # 日付列の幅を調整
+        for ci, col_name in enumerate(df_out.columns, 1):
+            if "日付" in str(col_name):
+                col_letter = ws.cell(row=startrow + 1, column=ci).column_letter
+                ws.column_dimensions[col_letter].width = 16
+        startrow += len(df_out.index) + 3
 
 
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -6030,16 +6052,15 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         sheet_label = f"pattern_{rank:02d}"
 
         # パターンシート（Date列を曜日付き文字列に変換）
-        _WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
         pdf = entry["pattern_df"].copy()
-        pdf[date_col_shift] = pd.to_datetime(pdf[date_col_shift]).apply(
-            lambda d: f"{d.month}/{d.day}({_WEEKDAY_JP[d.weekday()]})" if pd.notna(d) else "")
+        pdf[date_col_shift] = pd.to_datetime(pdf[date_col_shift]).apply(_fmt_date_jp)
         pdf.to_excel(writer, sheet_name=sheet_label, index=False)
 
-        # シート名に軸ラベルを追加（Excelの制限により簡略化）
+        # シート名に軸ラベルを追加 + Date列幅調整
         ws = writer.sheets[sheet_label]
         axis_short = {"公平性重視": "公平性", "連続当直回避重視": "gap回避", "バランス重視": "バランス", "総合スコア": "総合"}.get(axis_label, axis_label)
         ws.cell(row=1, column=len(entry["pattern_df"].columns) + 2, value=f"【{axis_short}】")
+        ws.column_dimensions['A'].width = 16  # Date列幅
 
         # v6.3.0: 今月/累計/診断を1シートに統合
         counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(entry["pattern_df"])
