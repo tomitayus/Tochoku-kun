@@ -5979,43 +5979,64 @@ def _fmt_date_cols(df):
             df[col] = df[col].apply(_fmt_date_jp)
     return df
 
+def _str_display_width(s):
+    """文字列の表示幅を推定（全角=2, 半角=1）"""
+    import unicodedata
+    width = 0
+    for c in str(s):
+        if unicodedata.east_asian_width(c) in ('F', 'W', 'A'):
+            width += 2
+        else:
+            width += 1
+    return width
+
+def _auto_format_sheet(ws):
+    """全セル中央揃え + 列幅を内容に合わせて自動調整"""
+    from openpyxl.styles import Alignment
+    center = Alignment(horizontal='center')
+    col_max_width = {}
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is not None:
+                cell.alignment = center
+                w = _str_display_width(cell.value)
+                cl = cell.column_letter
+                if w > col_max_width.get(cl, 0):
+                    col_max_width[cl] = w
+    for cl, w in col_max_width.items():
+        ws.column_dimensions[cl].width = min(w + 2, 40)
+
 def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnostics, df_doctors=None):
-    """v6.5.9: 今月サマリー + 累計詳細を横連結で1テーブル化"""
+    """今月サマリー → 制約違反・スコア → 累計詳細 の順で配置"""
     ws = writer.book.create_sheet(sheet_name)
     writer.sheets[sheet_name] = ws
 
-    # === 1. 今月サマリー + 累計詳細を横連結 ===
+    # === 1. 今月サマリー（Sheet2順）===
     COMPACT_COLS = ["氏名", "全合計", "大学合計", "外病院合計", "平日", "休日合計"]
     df_month_compact = df_month[COMPACT_COLS].copy()
+    sheet2_order = {doc: i for i, doc in enumerate(doctor_names)}
+    df_month_compact["_sort"] = df_month_compact["氏名"].map(sheet2_order)
+    df_month_compact = df_month_compact.sort_values("_sort").drop(columns=["_sort"]).reset_index(drop=True)
 
-    detail_cols_available = [c for c in SUMMARY_DETAIL_COLS if c in df_total.columns]
-    if detail_cols_available:
-        df_detail = df_total[["氏名"] + detail_cols_available].copy()
-        df_combined = df_month_compact.merge(df_detail, on="氏名", how="outer")
-    else:
-        df_combined = df_month_compact.copy()
-
-    # セクションタイトル（行1）
     ws.cell(row=1, column=1, value="【今月サマリー】")
-    if detail_cols_available:
-        ws.cell(row=1, column=len(COMPACT_COLS) + 1, value="【累計詳細】")
+    df_month_compact.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
+    startrow = len(df_month_compact.index) + 4
 
-    df_combined.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
-    startrow = len(df_combined.index) + 4
-
-    # === 2. 制約違反テーブル群（日付列をフォーマット）===
+    # === 2. 制約違反 + スコアサマリー ===
     for title, df in diagnostics:
         if title == "【医師ごとの偏り】":
             continue
         ws.cell(row=startrow, column=1, value=title)
         df_out = _fmt_date_cols(df)
         df_out.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
-        # 日付列の幅を調整
-        for ci, col_name in enumerate(df_out.columns, 1):
-            if "日付" in str(col_name):
-                col_letter = ws.cell(row=startrow + 1, column=ci).column_letter
-                ws.column_dimensions[col_letter].width = 16
         startrow += len(df_out.index) + 3
+
+    # === 3. 累計詳細 ===
+    detail_cols_available = [c for c in SUMMARY_DETAIL_COLS if c in df_total.columns]
+    if detail_cols_available:
+        df_detail = df_total[["氏名"] + detail_cols_available].copy()
+        ws.cell(row=startrow, column=1, value="【累計詳細】")
+        df_detail.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
 
 
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -6031,11 +6052,10 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         pdf[date_col_shift] = pd.to_datetime(pdf[date_col_shift]).apply(_fmt_date_jp)
         pdf.to_excel(writer, sheet_name=sheet_label, index=False)
 
-        # シート名に軸ラベルを追加 + Date列幅調整
+        # シート名に軸ラベルを追加
         ws = writer.sheets[sheet_label]
         axis_short = {"公平性重視": "公平性", "連続当直回避重視": "gap回避", "バランス重視": "バランス", "総合スコア": "総合"}.get(axis_label, axis_label)
         ws.cell(row=1, column=len(entry["pattern_df"].columns) + 2, value=f"【{axis_short}】")
-        ws.column_dimensions['A'].width = 16  # Date列幅
 
         # v6.3.0: 今月/累計/診断を1シートに統合
         counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, *_ = recompute_stats(entry["pattern_df"])
@@ -6057,8 +6077,12 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
                 ("【制約違反: 重要/推奨ルール】", df_hard_violations),
                 ("【スコアサマリー】", df_metrics),
             ],
-            df_doctors=df_doctors,  # v6.5.3: 今月サマリーと統合
+            df_doctors=df_doctors,
         )
+
+    # 全シート: 中央揃え + 列幅自動調整
+    for ws in writer.book.worksheets:
+        _auto_format_sheet(ws)
 
 print("\n" + "="*60)
 print("  🎉 完了")
