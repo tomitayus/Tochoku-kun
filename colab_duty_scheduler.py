@@ -562,7 +562,6 @@ if COLAB_AVAILABLE:
     # v6.5.0: 新しいExcel構造対応
     # Sheet4がない場合はSheet3を医師情報シートとして使用（旧Sheet3のカテ表は廃止）
     if sheet4_name is None and sheet3_name is not None:
-        print("📋 Sheet3を医師情報シートとして使用")
         sheet4_name = sheet3_name
         sheet3_name = None  # 旧カテ表は使用しない
 
@@ -609,7 +608,6 @@ else:
         sheet4_raw_out = strip_cols(pd.DataFrame(LOCAL_DATA["Sheet4"]))
     elif has_sheet3:
         # Sheet4がない場合: Sheet3を医師情報シートとして使用
-        print("📋 [LOCAL] Sheet4なし - Sheet3を医師情報シートとして使用")
         sheet4_raw_out = strip_cols(pd.DataFrame(LOCAL_DATA["sheet3"]))
         schedule_raw = pd.DataFrame()  # 旧カテ表は使用しない
     else:
@@ -687,7 +685,6 @@ for col in all_cols:
 
 if KATE_TOBAN_COL is not None:
     hospital_cols = [c for c in all_cols if c != KATE_TOBAN_COL]
-    print(f"✅ カテ当番列(Z列)検出")
 else:
     hospital_cols = all_cols
     print("⚠️ Sheet1に「カテ当番」列が見つかりません（従来方式を使用）")
@@ -953,8 +950,9 @@ if "属性" in sheet4_data.columns:
     for doc in doctor_names:
         attr_val = prev_get_str(doc, "属性")
         doctor_attribute[doc] = attr_val
-    attr_count = sum(1 for v in doctor_attribute.values() if v)
-    print(f"   属性: {attr_count}人")
+    attr1 = sum(1 for v in doctor_attribute.values() if v == "1")
+    attr2 = sum(1 for v in doctor_attribute.values() if v == "2")
+    print(f"   属性: {attr1 + attr2}人（属性1: {attr1}人, 属性2: {attr2}人）")
 else:
     doctor_attribute = {d: "" for d in doctor_names}
     print("⚠️ Sheet4に属性列が見つかりません")
@@ -997,12 +995,8 @@ def get_pre_travel_dates(doc, all_dates):
 # 属性情報の表示
 doc_with_attr = [(d, doctor_kate_team[d]) for d in doctor_names if doctor_kate_team[d]]
 doc_with_travel = [(d, doctor_travel_day[d]) for d in doctor_names if doctor_travel_day[d]]
-if doc_with_attr:
-    print(f"   カテチーム: {len(doc_with_attr)}人")
-else:
+if not doc_with_attr:
     print("⚠️ カテチーム属性を持つ医師が0人です")
-if doc_with_travel:
-    print(f"   出張日: {len(doc_with_travel)}人")
 
 # =========================
 # v6.5.0: Sheet1からカテ当番日（チーム）を取得
@@ -1021,7 +1015,6 @@ if KATE_TOBAN_COL is not None:
                 kate_team_by_date[date] = team_str
     if kate_team_by_date:
         unique_teams = set(kate_team_by_date.values())
-        print(f"   カテ当番: {len(kate_team_by_date)}日分")
     else:
         print("⚠️ Sheet1:Z列にカテ当番チームのデータがありません")
 else:
@@ -5789,27 +5782,11 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
 # =========================
 # v5.7.1: 絶対禁忌チェック結果の表示
 # =========================
-print("\n=== 絶対禁忌チェック (v5.7.1) ===")
 abs_valid_count = sum(1 for e in refined if e.get("absolute_constraints_valid", False))
 abs_invalid_count = len(refined) - abs_valid_count
-print(f"   絶対禁忌クリア: {abs_valid_count}/{len(refined)} パターン")
-if abs_invalid_count > 0:
-    print(f"   ❌ 絶対禁忌違反あり: {abs_invalid_count} パターン")
-    # 違反の内訳を表示
-    for e in refined:
-        if not e.get("absolute_constraints_valid", False):
-            viols = e.get("absolute_violations", [])
-            if viols:
-                print(f"      seed={e['seed']}: {len(viols)}件の違反")
-                for v in viols[:3]:
-                    print(f"         - [{v['type']}] {v['desc']}")
-                if len(viols) > 3:
-                    print(f"         ... 他 {len(viols) - 3}件")
+print(f"\n   絶対禁忌: {abs_valid_count}/{len(refined)} パターンクリア")
 
-# =========================
 # ハード制約違反のないパターンのみ選択（TARGET_CAP、gap、未割当）
-# =========================
-print("\n=== ハード制約チェック ===")
 valid_patterns = []
 excluded_count = 0
 for e in refined:
@@ -5832,10 +5809,10 @@ for e in refined:
         valid_patterns.append(e)
 
 if not valid_patterns:
-    print("\n⚠️  ハード制約を満たすパターンなし → 全パターンから選択")
+    print("   ⚠️ ハード制約を満たすパターンなし → 全パターンから選択")
     valid_patterns = refined
 else:
-    print(f"\n✅ {len(valid_patterns)}/{len(refined)} パターンがハード制約OK（絶対禁忌クリア含む）")
+    print(f"   ハード制約OK: {len(valid_patterns)}/{len(refined)} パターン")
 
 # 評価軸1: 公平性重視（TARGET_CAP、公平性ペナルティを重視）
 fairness_patterns = sorted(
@@ -5932,12 +5909,10 @@ if abs_valid_patterns:
                 seen_seeds.add(e["seed"])
                 if len(top_patterns) >= 3:
                     break
-    print(f"\n✅ 絶対禁忌クリア: {len(abs_valid_patterns)}/{len(valid_patterns)} パターン")
-    print(f"   → 3軸評価で{len(top_patterns)}パターンを出力")
+    print(f"   → {len(top_patterns)}パターンを出力")
 else:
     # 絶対禁忌クリアのパターンがない場合は警告
-    print(f"\n⚠️  絶対禁忌をクリアするパターンがありません")
-    print(f"   全パターンから上位3を選択（参考用）")
+    print(f"   ⚠️ 絶対禁忌クリアなし → 全パターンから上位3を選択（参考用）")
     valid_patterns.sort(key=lambda e: e["raw_after"], reverse=True)
     top_patterns = valid_patterns[:3]
     for i, p in enumerate(top_patterns):
@@ -5965,7 +5940,7 @@ refined_df = pd.DataFrame([
 # v6.0.0: 上位3パターン評価
 # =========================
 print("\n" + "="*60)
-print("  📊 上位パターン評価 (v6.0.0)")
+print("  📊 上位パターン評価")
 print("="*60)
 
 if top_patterns:
