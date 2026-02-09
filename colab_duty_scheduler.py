@@ -363,7 +363,7 @@ BG_NIGHT_COLS = set()  # 列名で「夜」固定したい大学枠があれば�
 
 WED_FORBIDDEN_DOCTORS = {'金城', '山田', '野寺'}  # 水曜の H〜U を禁止したい医師
 
-NUM_PATTERNS = int(os.getenv("NUM_PATTERNS", "100"))  # デフォルト100パターン
+NUM_PATTERNS = int(os.getenv("NUM_PATTERNS", "1000"))  # デフォルト1000パターン（v6.5.7: 100→1000に増加、大学系週1違反削減のため）
 
 # sheet1 の「枠」扱いする入力値（1以外の記号も許容したい場合）
 SLOT_MARKERS = {1, 1.0, "1", "〇", "○", "◯", "◎"}
@@ -405,6 +405,7 @@ CONSTRAINT_ABS_004 = "ABS-004"  # カテ当番日の外病院禁止
 CONSTRAINT_ABS_005 = "ABS-005"  # 同日重複禁止
 CONSTRAINT_ABS_006 = "ABS-006"  # 水曜日L〜Y禁止医師
 CONSTRAINT_ABS_013 = "ABS-013"  # v6.5.3: C-H列（休日大学系）カテ当番必須
+CONSTRAINT_ABS_015 = "ABS-015"  # 属性2のB列カテ表コード欠如（緩和不可）
 
 # ハード制約（HARD: パターン除外）
 CONSTRAINT_HARD_001 = "HARD-001"  # TARGET_CAP超過
@@ -562,7 +563,6 @@ if COLAB_AVAILABLE:
     # v6.5.0: 新しいExcel構造対応
     # Sheet4がない場合はSheet3を医師情報シートとして使用（旧Sheet3のカテ表は廃止）
     if sheet4_name is None and sheet3_name is not None:
-        print("📋 Sheet4が見つかりません - Sheet3を医師情報シートとして使用")
         sheet4_name = sheet3_name
         sheet3_name = None  # 旧カテ表は使用しない
 
@@ -581,7 +581,7 @@ if COLAB_AVAILABLE:
     else:
         # カテ表はSheet1:Z + Sheet4:属性で代替するため空でOK
         schedule_raw = pd.DataFrame()
-        print("📋 旧カテ表(Sheet3)は使用しません - Sheet1:Z列 + Sheet4:属性で判定")
+        # 旧カテ表不使用（Sheet1:Z + Sheet4:属性で判定）
 
     shift_df.columns = make_unique(list(shift_df.columns))
     availability_raw.columns = make_unique(list(availability_raw.columns))
@@ -598,18 +598,39 @@ else:
     uploaded_filename = "Tochoku.local.xlsx"
     shift_df = strip_cols(pd.DataFrame(LOCAL_DATA["sheet1"]))
     availability_raw = strip_cols(pd.DataFrame(LOCAL_DATA["sheet2"]))
-    schedule_raw = strip_cols(pd.DataFrame(LOCAL_DATA["sheet3"]))
+
+    # v6.5.8: LOCAL_DATAパスでも新構造(v7)に対応
+    # Sheet4がない場合、Sheet3を医師情報シートとして使用（Colabパスと同じ）
+    has_sheet4 = "Sheet4" in LOCAL_DATA and LOCAL_DATA["Sheet4"]
+    has_sheet3 = "sheet3" in LOCAL_DATA and LOCAL_DATA["sheet3"]
+
+    if has_sheet4:
+        schedule_raw = strip_cols(pd.DataFrame(LOCAL_DATA["sheet3"])) if has_sheet3 else pd.DataFrame()
+        sheet4_raw_out = strip_cols(pd.DataFrame(LOCAL_DATA["Sheet4"]))
+    elif has_sheet3:
+        # Sheet4がない場合: Sheet3を医師情報シートとして使用
+        sheet4_raw_out = strip_cols(pd.DataFrame(LOCAL_DATA["sheet3"]))
+        schedule_raw = pd.DataFrame()  # 旧カテ表は使用しない
+    else:
+        schedule_raw = pd.DataFrame()
+        sheet4_raw_out = pd.DataFrame(columns=["氏名"])
 
     shift_df.columns = make_unique(list(shift_df.columns))
     availability_raw.columns = make_unique(list(availability_raw.columns))
-    schedule_raw.columns = make_unique(list(schedule_raw.columns))
+    if len(schedule_raw.columns) > 0:
+        schedule_raw.columns = make_unique(list(schedule_raw.columns))
 
-    sheet4_raw_out = strip_cols(pd.DataFrame(LOCAL_DATA["Sheet4"]))
     sheet4_raw_out.columns = make_unique(list(sheet4_raw_out.columns))
 
-    sheet4_data = sheet4_raw_out.copy()
-    if "氏名" not in sheet4_data.columns:
-        raise ValueError("❌ Sheet4 の '氏名' 列が見つかりません（ローカルデータを確認してください）")
+    # Sheet4が「氏名」列を含むか確認（新構造ではgrid形式の可能性あり）
+    if "氏名" not in sheet4_raw_out.columns:
+        # grid形式の場合はparse_sheet4_from_gridを試行
+        try:
+            sheet4_data = parse_sheet4_from_grid(sheet4_raw_out)
+        except Exception:
+            raise ValueError("❌ Sheet4 の '氏名' 列が見つかりません（ローカルデータを確認してください）")
+    else:
+        sheet4_data = sheet4_raw_out.copy()
     sheet4_data["氏名"] = sheet4_data["氏名"].astype(str).str.strip()
     for col in sheet4_data.columns:
         if col == "氏名":
@@ -665,7 +686,6 @@ for col in all_cols:
 
 if KATE_TOBAN_COL is not None:
     hospital_cols = [c for c in all_cols if c != KATE_TOBAN_COL]
-    print(f"✅ Sheet1:Z列「カテ当番」を検出 - 病院列から除外")
 else:
     hospital_cols = all_cols
     print("⚠️ Sheet1に「カテ当番」列が見つかりません（従来方式を使用）")
@@ -835,6 +855,7 @@ if len(schedule_raw.columns) > 1:
         print("   ※H〜U の『カテ表あり不可』制約が一部の医師で効かない可能性があります。")
 else:
     sched_doctors = []
+    # Sheet3の医師列なし（EXTRA順序はSheet2にフォールバック）
 
 # =========================
 # sheet4 前月まで累積
@@ -909,12 +930,12 @@ for col_candidate in ["カテ当番", "属性", "カテ", "チーム"]:  # カ�
     # 期待されるチームコードと1つでも一致すればこの列を使用
     if expected_team_codes and col_values & expected_team_codes:
         kate_team_col_name = col_candidate
-        print(f"✅ Sheet4:{kate_team_col_name}列 を使用 (チームコード一致: {col_values & expected_team_codes})")
+        # Sheet4:kate_team_col_name列使用
         break
     elif not expected_team_codes and col_values:
         # Sheet1:Zがない場合は最初に見つかった列を使用
         kate_team_col_name = col_candidate
-        print(f"✅ Sheet4:{kate_team_col_name}列 を使用 (値: {list(col_values)[:5]})")
+        # Sheet4:kate_team_col_name列使用（フォールバック）
         break
 
 if kate_team_col_name:
@@ -930,8 +951,18 @@ if "属性" in sheet4_data.columns:
     for doc in doctor_names:
         attr_val = prev_get_str(doc, "属性")
         doctor_attribute[doc] = attr_val
-    attr_count = sum(1 for v in doctor_attribute.values() if v)
-    print(f"✅ 属性列読み込み: {attr_count}人に属性設定あり")
+    attr0 = sum(1 for v in doctor_attribute.values() if v == "0")
+    attr1 = sum(1 for v in doctor_attribute.values() if v == "1")
+    attr2 = sum(1 for v in doctor_attribute.values() if v == "2")
+    attr3 = sum(1 for v in doctor_attribute.values() if v == "3")
+    attr_none = len(doctor_attribute) - attr0 - attr1 - attr2 - attr3
+    parts = []
+    if attr0: parts.append(f"0:{attr0}")
+    if attr1: parts.append(f"1:{attr1}")
+    if attr2: parts.append(f"2:{attr2}")
+    if attr3: parts.append(f"3:{attr3}")
+    if attr_none: parts.append(f"未設定:{attr_none}")
+    print(f"   属性: {len(doctor_attribute)}人（{', '.join(parts)}）")
 else:
     doctor_attribute = {d: "" for d in doctor_names}
     print("⚠️ Sheet4に属性列が見つかりません")
@@ -949,7 +980,7 @@ else:
     doctor_travel_day = {d: "" for d in doctor_names}
 
 # デバッグ: Sheet4の列名を表示
-print(f"📋 Sheet4列名: {list(sheet4_data.columns)}")
+# Sheet4列名（デバッグ用）: print(f"📋 Sheet4列名: {list(sheet4_data.columns)}")
 
 # 曜日名から曜日番号へのマッピング（月曜=0, ..., 日曜=6）
 WEEKDAY_MAP = {"月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6}
@@ -974,12 +1005,8 @@ def get_pre_travel_dates(doc, all_dates):
 # 属性情報の表示
 doc_with_attr = [(d, doctor_kate_team[d]) for d in doctor_names if doctor_kate_team[d]]
 doc_with_travel = [(d, doctor_travel_day[d]) for d in doctor_names if doctor_travel_day[d]]
-if doc_with_attr:
-    print(f"✅ カテチーム属性: {len(doc_with_attr)}人 (例: {doc_with_attr[:5]})")
-else:
+if not doc_with_attr:
     print("⚠️ カテチーム属性を持つ医師が0人です")
-if doc_with_travel:
-    print(f"✅ 出張日設定: {len(doc_with_travel)}人 (例: {doc_with_travel[:3]})")
 
 # =========================
 # v6.5.0: Sheet1からカテ当番日（チーム）を取得
@@ -998,7 +1025,6 @@ if KATE_TOBAN_COL is not None:
                 kate_team_by_date[date] = team_str
     if kate_team_by_date:
         unique_teams = set(kate_team_by_date.values())
-        print(f"✅ カテ当番日: {len(kate_team_by_date)}日分 (チーム: {unique_teams})")
     else:
         print("⚠️ Sheet1:Z列にカテ当番チームのデータがありません")
 else:
@@ -1077,13 +1103,26 @@ CODE_2_DOCTORS = {doc for doc in doctor_names if has_code_2_anywhere(doc)}
 BASE_TARGET = total_slots // len(active_doctors)
 EXTRA_SLOTS = total_slots - BASE_TARGET * len(active_doctors)
 
-# 余り枠は右側（下位）の医師に割り当てる
+# 余り枠(EXTRA)は属性1の医師から優先的に選出する
+# v6.5.8: 属性1の医師を優先、不足時はSheet2末尾からフォールバック
 # v6.0.5: CODE_2医師もEXTRA対象に含める
 #   - CODE_2除外だと、他医師の制約(gap/dup等)で枠が埋まらず未割当が発生する
 #   - CODE_2医師のn+1回目はB〜Q列（大学系）に割り当てればよい
-active_sorted_by_index = sorted(active_doctors, key=lambda d: doctor_col_index[d])  # 昇順ソート
-extra_eligible = active_sorted_by_index  # 全active医師がEXTRA対象
-EXTRA_ALLOWED = set(extra_eligible[-EXTRA_SLOTS:] if EXTRA_SLOTS > 0 else [])  # 最後のEXTRA_SLOTS人（右側/下位）
+active_sorted_by_index = sorted(active_doctors, key=lambda d: doctor_col_index[d])
+
+# 属性1の医師をEXTRA候補として優先選出（Sheet2末尾順）
+attr1_doctors = [d for d in active_sorted_by_index if doctor_attribute.get(d, "") == "1"]
+if EXTRA_SLOTS > 0 and len(attr1_doctors) >= EXTRA_SLOTS:
+    # 属性1の医師で十分 → 末尾からEXTRA_SLOTS人を選出
+    EXTRA_ALLOWED = set(attr1_doctors[-EXTRA_SLOTS:])
+elif EXTRA_SLOTS > 0 and attr1_doctors:
+    # 属性1だけでは不足 → 属性1全員 + 残りをSheet2末尾の非属性1から補充
+    remaining = EXTRA_SLOTS - len(attr1_doctors)
+    non_attr1 = [d for d in active_sorted_by_index if d not in attr1_doctors]
+    EXTRA_ALLOWED = set(attr1_doctors) | set(non_attr1[-remaining:])
+else:
+    # 属性1がいない場合はSheet2末尾からフォールバック
+    EXTRA_ALLOWED = set(active_sorted_by_index[-EXTRA_SLOTS:] if EXTRA_SLOTS > 0 else [])
 
 TARGET_CAP = {d: 0 for d in doctor_names}
 for d in active_doctors:
@@ -1124,8 +1163,13 @@ if gap3_cap_adjusted > 0:
 total_cap = sum(TARGET_CAP[d] for d in active_doctors)
 shortage = total_slots - total_cap
 if shortage > 0:
-    # 余裕のある医師（現CAP < gap3上限）に+1ずつ配分
-    for d in sorted(active_doctors, key=lambda x: doctor_col_index[x], reverse=True):
+    # 属性1の医師に優先的に再配分、次にSheet2末尾順
+    _redist_candidates = (
+        [d for d in active_sorted_by_index if doctor_attribute.get(d, "") == "1"]
+        + [d for d in active_sorted_by_index if doctor_attribute.get(d, "") != "1"]
+    )
+    # 末尾（後方）の医師から配分するため逆順
+    for d in reversed(_redist_candidates):
         if shortage <= 0:
             break
         max_gap3 = compute_max_gap3_assignments(d)
@@ -1137,35 +1181,34 @@ if shortage > 0:
 
 floor_shifts = BASE_TARGET
 
-print(f"\n✅ 割当設計完了")
 total_cap_final = sum(TARGET_CAP[d] for d in active_doctors)
-print(f"   全枠数: {total_slots} | active医師: {len(active_doctors)}人")
-print(f"   基本割当: {BASE_TARGET}回 | +1回対象: {len(EXTRA_ALLOWED)}人")
-print(f"   割当容量: {total_cap_final} / {total_slots}枠")
-
-# gap3制限された医師の詳細表示
+extra_names = [d for d in active_sorted_by_index if d in EXTRA_ALLOWED]
+extra_attr1_count = sum(1 for d in EXTRA_ALLOWED if doctor_attribute.get(d, "") == "1")
 gap3_limited = [(d, compute_max_gap3_assignments(d)) for d in active_doctors if compute_max_gap3_assignments(d) < BASE_TARGET]
-if gap3_limited:
-    print(f"   gap>=3制約でCAP切下げ: {len(gap3_limited)}人")
-    for doc, mx in gap3_limited:
-        avail = sum(1 for dt in all_shift_dates if get_avail_code(dt, doc) != 0)
-        print(f"     {doc}: 利用可能{avail}日 → gap3上限{mx}回 (CAP={TARGET_CAP[doc]})")
 
-# 可否コード2の医師の情報表示
-code_2_in_active = [d for d in active_sorted_by_index if d in CODE_2_DOCTORS]
-code_2_in_extra = [d for d in EXTRA_ALLOWED if d in CODE_2_DOCTORS]
-if code_2_in_active:
-    print(f"   CODE_2医師: {len(code_2_in_active)}人（うちEXTRA対象: {len(code_2_in_extra)}人）")
+print(f"\n✅ 割当: {len(active_doctors)}人 × {BASE_TARGET}回 + {len(EXTRA_ALLOWED)}人×1回 = {total_cap_final}/{total_slots}枠")
+if extra_names:
+    print(f"   +1回: {', '.join(extra_names)}")
+if gap3_limited:
+    print(f"   gap3制限: {', '.join(d for d, _ in gap3_limited)}")
 
 # =========================
 # B-K / L-Y 比率バランス（sheet3で「3」記載の医師は除外）
 # sheet3でカテ表コード保有医師の特定
 # =========================
 def has_sheet3_code_3(doc):
-    if doc not in schedule_df.columns:
-        return False
-    values = schedule_df[doc].dropna()
-    return any(str(v).strip() == "3" for v in values)
+    """医師がsheet3でコード「3」を持つか、またはSheet2で全日コード3（外病院専門）か"""
+    # 旧構造: Sheet3にコード「3」がある
+    if doc in schedule_df.columns:
+        values = schedule_df[doc].dropna()
+        if any(str(v).strip() == "3" for v in values):
+            return True
+    # v6.5.8: 新構造ではSheet2の可否コードで判定（全日がコード3なら外病院専門）
+    if doc in availability_df.columns:
+        avail_vals = availability_df[doc].dropna()
+        if len(avail_vals) > 0 and all(str(v).strip() == "3" for v in avail_vals):
+            return True
+    return False
 
 def has_any_schedule_code(doc):
     """医師がカテ当番を持っているか
@@ -1198,45 +1241,29 @@ if RATIO_EXEMPT_DOCTORS:
 
 SCHEDULE_CODE_HOLDERS = {doc for doc in doctor_names if has_any_schedule_code(doc)}
 NO_KATE_DOCTORS = {doc for doc in doctor_names if not has_any_schedule_code(doc)}
-print(f"   カテ表保有: {len(SCHEDULE_CODE_HOLDERS)}人 | カテ当番なし: {len(NO_KATE_DOCTORS)}人")
+print(f"   カテ保有: {len(SCHEDULE_CODE_HOLDERS)}人 | なし: {len(NO_KATE_DOCTORS)}人")
 
-# v6.5.0: デバッグ情報
 if len(SCHEDULE_CODE_HOLDERS) == 0:
-    # カテ表保有者が0人の場合、問題がある
     sample_teams = [(d, doctor_kate_team.get(d, "")) for d in list(doctor_names)[:5]]
-    print(f"   ⚠️ カテ表保有者0人 - doctor_kate_team サンプル = {sample_teams}")
-else:
-    print(f"   カテ表保有者 (例): {list(SCHEDULE_CODE_HOLDERS)[:5]}")
-
-# v6.5.0: get_sched_code()の動作確認
-if kate_team_by_date and doctor_kate_team:
-    # サンプル日付でget_sched_code()の動作を確認
-    sample_date = list(kate_team_by_date.keys())[0] if kate_team_by_date else None
-    if sample_date:
-        sample_team = kate_team_by_date[sample_date]
-        # このチームに属する医師を探す
-        matching_docs = [d for d in doctor_names if doctor_kate_team.get(d) == sample_team]
-        non_matching_docs = [d for d in doctor_names if doctor_kate_team.get(d) and doctor_kate_team.get(d) != sample_team][:3]
-        if matching_docs:
-            sample_doc = matching_docs[0]
-            result = get_sched_code(sample_date, sample_doc)
-            print(f"   📋 カテ当番判定テスト: {sample_date.strftime('%m/%d')}(チーム{sample_team}) + {sample_doc}(チーム{doctor_kate_team.get(sample_doc)}) = {result}")
-        if non_matching_docs:
-            sample_doc2 = non_matching_docs[0]
-            result2 = get_sched_code(sample_date, sample_doc2)
-            print(f"   📋 カテ当番判定テスト: {sample_date.strftime('%m/%d')}(チーム{sample_team}) + {sample_doc2}(チーム{doctor_kate_team.get(sample_doc2)}) = {result2}")
+    print(f"   ⚠️ カテ表保有者0人 - {sample_teams}")
 
 # sheet3で「1」を持つ医師（平日大学系でカテ当番不一致を許容）
+# v6.5.8: 新構造ではschedule_dfが空のため、属性1をフォールバックとして使用
 def has_sheet3_code_1(doc):
-    """医師がsheet3で少なくとも1つの「1」コードを持っているか"""
-    if doc not in schedule_df.columns:
-        return False
-    values = schedule_df[doc].dropna()
-    return any(str(v).strip() == "1" for v in values)
+    """医師がsheet3で少なくとも1つの「1」コードを持っているか（新構造では属性1で代替）"""
+    # 旧構造: Sheet3にコード「1」がある
+    if doc in schedule_df.columns:
+        values = schedule_df[doc].dropna()
+        if any(str(v).strip() == "1" for v in values):
+            return True
+    # 新構造: 属性1の医師を「平日緩和」対象として扱う
+    if doctor_attribute.get(doc, "") == "1":
+        return True
+    return False
 
 SHEET3_CODE_1_DOCTORS = {doc for doc in doctor_names if has_sheet3_code_1(doc)}
 if SHEET3_CODE_1_DOCTORS:
-    print(f"   └─ sheet3に1あり（平日緩和）: {len(SHEET3_CODE_1_DOCTORS)}人")
+    print(f"   平日緩和: {len(SHEET3_CODE_1_DOCTORS)}人")
 
 def is_ch_slot(col_idx):
     """C-H列（休日大学系、インデックス2-7）かどうか"""
@@ -1620,12 +1647,27 @@ def choose_doctor_for_slot(
         mwd = min(metric_wd.values())
         candidates = [d for d in candidates if metric_wd[d] == mwd]
 
+    # 6.5 全体の平日/休日差を最小化（ハード制約: 差2以上は違反）
+    def _wd_we_diff(d):
+        wd = prev_weekday[d] + assigned_weekday[d] + (0 if holi_flag else 1)
+        we = prev_weekend[d] + assigned_weekend[d] + (1 if holi_flag else 0)
+        return abs(wd - we)
+    min_diff = min(_wd_we_diff(d) for d in candidates)
+    balanced = [d for d in candidates if _wd_we_diff(d) == min_diff]
+    if balanced:
+        candidates = balanced
+
     # 8 floor未満優先
     under_floor = [d for d in candidates if assigned_count[d] < floor_shifts]
     if under_floor:
         candidates = under_floor
 
     # (削除: gap >= 3 は絶対禁忌として collect_candidates でチェック済み)
+
+    # 9 TARGET_CAP未達の医師を優先（v6.5.7: relax_absで超過した医師を抑制）
+    under_cap = [d for d in candidates if assigned_count[d] < TARGET_CAP.get(d, 0)]
+    if under_cap:
+        candidates = under_cap
 
     # 10 同点ならランダム選択（パターン多様性のため）
     # v6.0.2: deterministic tie-break から random.choice に変更
@@ -2220,6 +2262,19 @@ def evaluate_schedule_with_raw(
         if weekday_count >= 2:
             bg_weekday_over_violations += (weekday_count - 1)
 
+    # 全体の平日/休日偏り違反（差が2以上はハード制約違反）
+    wd_we_imbalance_violations = 0
+    we_0_violations = 0  # 休日0回の違反（ハード制約）
+    for doc in active_doctors:
+        wd = wd_counts.get(doc, 0)
+        we = we_counts.get(doc, 0)
+        total = counts.get(doc, 0)
+        diff = abs(wd - we)
+        if diff >= 2:
+            wd_we_imbalance_violations += (diff - 1)
+        if we == 0 and total >= 1:
+            we_0_violations += 1
+
     # v6.5.0: 大学系7日間隔違反（7日以内に2回以上）- ABS-012改
     weekly_bg_violations = 0
     bg_dates_by_doc = {doc: [] for doc in doctor_names}  # doc -> [date list]
@@ -2291,6 +2346,8 @@ def evaluate_schedule_with_raw(
     penalty += bg_weekday_over_violations * 80  # 大学の平日偏り（平日2回以上は不満）
     penalty += ch_kate_violations * 120  # C-H列カテ当番違反（優先度高）
     penalty += weekly_bg_violations * 300  # v6.4.0: 大学系週1違反（ABS-012）
+    penalty += wd_we_imbalance_violations * 300  # 全体の平日/休日偏り（ハード制約）
+    penalty += we_0_violations * 300  # 休日0回（ハード制約）
 
     penalty += max(0, bg_spread - 1) * W_BG_SPREAD
     penalty += max(0, ht_spread - 1) * W_HT_SPREAD
@@ -2319,6 +2376,8 @@ def evaluate_schedule_with_raw(
         "bg_weekday_over_violations": int(bg_weekday_over_violations),
         "ch_kate_violations": int(ch_kate_violations),
         "weekly_bg_violations": int(weekly_bg_violations),  # v6.4.0: 大学系週1違反（ABS-012）
+        "wd_we_imbalance_violations": int(wd_we_imbalance_violations),  # 全体の平日/休日偏り（差>=2）
+        "we_0_violations": int(we_0_violations),  # 休日0回違反
         "bg_spread_cum": float(bg_spread),
         "ht_spread_cum": float(ht_spread),
         "weekday_spread_cum": float(wd_spread),
@@ -3010,9 +3069,9 @@ def build_hard_constraint_violations(pattern_df):
                 if idx == B_COL_INDEX:
                     doc_attr = doctor_attribute.get(doc, "")
                     if doc_attr == "2":
-                        # 属性2は緩和不可（ABS該当）
+                        # 属性2は緩和不可（ABS-015）
                         rows.append({
-                            "制約ID": CONSTRAINT_SEMI_001,
+                            "制約ID": CONSTRAINT_ABS_015,
                             "違反種別": "B列カテ表コード欠如（属性2:緩和不可）",
                             "日付": date,
                             "医師名": doc,
@@ -3020,7 +3079,7 @@ def build_hard_constraint_violations(pattern_df):
                             "列番号": idx,
                             "可否コード": code,
                             "カテ表": "",
-                            "詳細": f"[{CONSTRAINT_SEMI_001}] B列割当にカテ表必須（属性2は緩和不可）",
+                            "詳細": f"[{CONSTRAINT_ABS_015}] B列割当にカテ表必須（属性2は緩和不可）",
                         })
                     else:
                         # 属性1または未設定は緩和可（週1回まで許容）
@@ -4671,68 +4730,82 @@ def fix_weekly_bg_violations(pattern_df, max_attempts=150, verbose=True):
         fixed_in_this_iteration = 0
 
         for doc, prev_assign, curr_assign, gap in violations:
-            date, hosp, ridx = curr_assign
-
-            # 固定割当はスキップ
-            if is_preassigned_slot(ridx, hosp):
-                continue
+            # 両方の割当を移動候補として試行（v6.5.7: 2番目だけでなく1番目も試す）
+            targets = [(curr_assign, prev_assign), (prev_assign, curr_assign)]
 
             moved = False
+            for target_assign, other_assign in targets:
+                date, hosp, ridx = target_assign
 
-            # 同じ日の外病院（L～Y列）の空き枠に移動を試みる
-            for other_hosp in hospital_cols:
-                other_hidx = shift_df.columns.get_loc(other_hosp)
-                if not (L_COL_INDEX <= other_hidx <= L_Y_END_INDEX):
+                # 固定割当はスキップ
+                if is_preassigned_slot(ridx, hosp):
                     continue
 
-                if assigned_hosp_count[doc].get(other_hosp, 0) >= 1:
-                    continue
-
-                if pd.isna(df.at[ridx, other_hosp]):
-                    if not can_assign_doc_to_slot(doc, date, other_hosp):
+                # 同じ日の外病院（L～Y列）の空き枠に移動を試みる
+                for other_hosp in hospital_cols:
+                    other_hidx = shift_df.columns.get_loc(other_hosp)
+                    if not (L_COL_INDEX <= other_hidx <= L_Y_END_INDEX):
                         continue
 
-                    df.at[ridx, hosp] = None
-                    df.at[ridx, other_hosp] = doc
-                    fixed_in_this_iteration += 1
-                    total_fixed += 1
-                    moved = True
+                    if assigned_hosp_count[doc].get(other_hosp, 0) >= 1:
+                        continue
+
+                    if pd.isna(df.at[ridx, other_hosp]):
+                        if not can_assign_doc_to_slot(doc, date, other_hosp):
+                            continue
+
+                        df.at[ridx, hosp] = None
+                        df.at[ridx, other_hosp] = doc
+                        fixed_in_this_iteration += 1
+                        total_fixed += 1
+                        moved = True
+                        break
+
+                if moved:
                     break
 
-            # 別の医師と交換を試みる
-            if not moved and attempt >= 5:
-                already_on_date = set()
-                for h in hospital_cols:
-                    v = df.at[ridx, h]
-                    if isinstance(v, str):
-                        already_on_date.add(normalize_name(v))
+            # 別の医師と交換を試みる（v6.5.7: attempt >= 2 に前倒し、両方の割当で試行）
+            if not moved and attempt >= 2:
+                for target_assign, other_assign in targets:
+                    date, hosp, ridx = target_assign
 
-                # 代替候補: 同日重複なし & 7日間隔を満たす医師
-                replacement_candidates = []
-                for d in doctor_names:
-                    if d in already_on_date or d == doc:
+                    if is_preassigned_slot(ridx, hosp):
                         continue
-                    if not can_assign_doc_to_slot(d, date, hosp):
-                        continue
-                    # 7日間隔チェック
-                    d_assignments = bg_assign.get(d, [])
-                    has_conflict = False
-                    for d_date, _, _ in d_assignments:
-                        if abs((date - d_date).days) < 7:
-                            has_conflict = True
-                            break
-                    if has_conflict:
-                        continue
-                    replacement_candidates.append(d)
 
-                if replacement_candidates:
-                    replacement_candidates.sort(key=lambda d: bg_counts.get(d, 0))
-                    new_doc = replacement_candidates[0]
-                    df.at[ridx, hosp] = new_doc
-                    if verbose and attempt < 10:
-                        print(f"      {doc}→{new_doc}: {date.strftime('%m/%d')}（{gap}日間隔違反）の大学割当を交代")
-                    fixed_in_this_iteration += 1
-                    total_fixed += 1
+                    already_on_date = set()
+                    for h in hospital_cols:
+                        v = df.at[ridx, h]
+                        if isinstance(v, str):
+                            already_on_date.add(normalize_name(v))
+
+                    # 代替候補: 同日重複なし & 7日間隔を満たす医師
+                    replacement_candidates = []
+                    for d in doctor_names:
+                        if d in already_on_date or d == doc:
+                            continue
+                        if not can_assign_doc_to_slot(d, date, hosp):
+                            continue
+                        # 7日間隔チェック
+                        d_assignments = bg_assign.get(d, [])
+                        has_conflict = False
+                        for d_date, _, _ in d_assignments:
+                            if abs((date - d_date).days) < 7:
+                                has_conflict = True
+                                break
+                        if has_conflict:
+                            continue
+                        replacement_candidates.append(d)
+
+                    if replacement_candidates:
+                        replacement_candidates.sort(key=lambda d: bg_counts.get(d, 0))
+                        new_doc = replacement_candidates[0]
+                        df.at[ridx, hosp] = new_doc
+                        if verbose and attempt < 10:
+                            print(f"      {doc}→{new_doc}: {date.strftime('%m/%d')}（{gap}日間隔違反）の大学割当を交代")
+                        fixed_in_this_iteration += 1
+                        total_fixed += 1
+                        moved = True
+                        break
 
             if fixed_in_this_iteration > 0:
                 counts, bg_counts, ht_counts, wd_counts, we_counts, bk_counts, ly_counts, bg_cat, assigned_hosp_count, doc_assignments, unassigned, *_ = recompute_stats(df)
@@ -4959,6 +5032,136 @@ def fix_university_weekday_balance_violations(pattern_df, max_attempts=150, verb
             print(f"   ⚠️ {remaining_violations}件の大学平日偏り違反が残っています（修正数: {total_fixed}）")
 
     return df, remaining_violations == 0, total_fixed
+
+def fix_weekday_weekend_balance(pattern_df, max_attempts=200, verbose=True):
+    """
+    全体の平日/休日偏り（差>=2）を修正する。
+    平日偏重の医師の平日割当と、休日偏重の医師の休日割当を交換する。
+    """
+    df = pattern_df.copy()
+    total_fixed = 0
+
+    for attempt in range(max_attempts):
+        counts, bg_counts, ht_counts, wd_counts, we_counts, *_ = recompute_stats(df)
+
+        # 偏り医師を特定
+        wd_heavy = []  # 平日過多: wd - we >= 2
+        we_heavy = []  # 休日過多: we - wd >= 2
+        for doc in active_doctors:
+            wd = wd_counts.get(doc, 0)
+            we = we_counts.get(doc, 0)
+            if wd - we >= 2:
+                wd_heavy.append((doc, wd - we))
+            elif we - wd >= 2:
+                we_heavy.append((doc, we - wd))
+
+        if not wd_heavy and not we_heavy:
+            if verbose and total_fixed > 0:
+                print(f"   ✅ 平日/休日偏り違反を{total_fixed}件修正しました")
+            return df, True, total_fixed
+
+        if attempt == 0 and verbose:
+            print(f"   ⚠️ 平日/休日偏り違反: 平日過多{len(wd_heavy)}人, 休日過多{len(we_heavy)}人 → 自動修正...")
+
+        fixed_this = False
+
+        # 平日過多の医師と休日過多の医師間でスワップ
+        for wd_doc, wd_diff in sorted(wd_heavy, key=lambda x: -x[1]):
+            if fixed_this:
+                break
+            for we_doc, we_diff in sorted(we_heavy, key=lambda x: -x[1]):
+                if fixed_this:
+                    break
+
+                # wd_docの平日割当を探す
+                wd_slots = []
+                we_slots = []
+                for (ridx, hosp), (date, fixed_flag) in slot_meta.items():
+                    if fixed_flag:
+                        continue
+                    val = df.at[ridx, hosp]
+                    if not isinstance(val, str):
+                        continue
+                    hidx = shift_df.columns.get_loc(hosp)
+                    dow = date.weekday()
+                    weekday = dow < 5
+                    is_holi = (
+                        is_holiday(date)
+                        or dow >= 5
+                        or (weekday and hidx in (C_COL_INDEX, D_COL_INDEX, F_COL_INDEX, G_COL_INDEX))
+                    )
+                    doc_name = normalize_name(val)
+                    if doc_name == wd_doc and not is_holi:
+                        wd_slots.append((ridx, hosp, date))
+                    elif doc_name == we_doc and is_holi:
+                        we_slots.append((ridx, hosp, date))
+
+                random.shuffle(wd_slots)
+                random.shuffle(we_slots)
+
+                for wd_ridx, wd_hosp, wd_date in wd_slots:
+                    if fixed_this:
+                        break
+                    for we_ridx, we_hosp, we_date in we_slots:
+                        # スワップ可能かチェック
+                        # wd_doc → we_hosp(休日), we_doc → wd_hosp(平日)
+                        if not can_assign_doc_to_slot(wd_doc, we_date, we_hosp):
+                            continue
+                        if not can_assign_doc_to_slot(we_doc, wd_date, wd_hosp):
+                            continue
+
+                        # 同日重複チェック
+                        def has_other_assignment(doc, ridx, exclude_hosp):
+                            for h in hospital_cols:
+                                if h == exclude_hosp:
+                                    continue
+                                v = df.at[ridx, h]
+                                if isinstance(v, str) and normalize_name(v) == doc:
+                                    return True
+                            return False
+
+                        if has_other_assignment(wd_doc, we_ridx, we_hosp):
+                            continue
+                        if has_other_assignment(we_doc, wd_ridx, wd_hosp):
+                            continue
+
+                        # gap チェック（スワップ後に3日未満にならないか）
+                        def check_gap_ok(doc, new_date, old_date):
+                            assigns = []
+                            for (r, h), (d, _) in slot_meta.items():
+                                v = df.at[r, h]
+                                if isinstance(v, str) and normalize_name(v) == doc:
+                                    if d != old_date:
+                                        assigns.append(d)
+                            assigns.append(new_date)
+                            assigns.sort()
+                            for i in range(1, len(assigns)):
+                                if abs((assigns[i] - assigns[i-1]).days) < 3:
+                                    return False
+                            return True
+
+                        if not check_gap_ok(wd_doc, we_date, wd_date):
+                            continue
+                        if not check_gap_ok(we_doc, wd_date, we_date):
+                            continue
+
+                        # スワップ実行
+                        df.at[wd_ridx, wd_hosp] = we_doc
+                        df.at[we_ridx, we_hosp] = wd_doc
+                        total_fixed += 1
+                        fixed_this = True
+                        break
+
+        if not fixed_this:
+            break  # これ以上修正できない
+
+    # 最終確認
+    _, _, _, wd_counts, we_counts, *_ = recompute_stats(df)
+    remaining = sum(1 for d in active_doctors if abs(wd_counts.get(d, 0) - we_counts.get(d, 0)) >= 2)
+    if verbose and remaining > 0:
+        print(f"   ⚠️ {remaining}人の平日/休日偏り違反が残っています（修正数: {total_fixed}）")
+
+    return df, remaining == 0, total_fixed
 
 def fix_fairness_imbalance(pattern_df, max_attempts=200, verbose=True):
     """
@@ -5352,6 +5555,62 @@ def validate_absolute_constraints(pattern_df, verbose=True):
                 "desc": f"大学系3回以上: {doc} → {bg_count}回 (上限2)"
             })
 
+    # v6.5.8: ABS-012: 大学系7日間隔チェック
+    bg_dates_by_doc_v = {doc: [] for doc in doctor_names}
+    for ridx in pattern_df.index:
+        date = pattern_df.at[ridx, date_col_shift]
+        if pd.isna(date):
+            continue
+        date = pd.to_datetime(date).normalize()
+        if date.tz is not None:
+            date = date.tz_localize(None)
+        for hosp in hospital_cols:
+            hidx = shift_df.columns.get_loc(hosp)
+            if not (B_COL_INDEX <= hidx <= K_COL_INDEX):
+                continue
+            val = pattern_df.at[ridx, hosp]
+            if not isinstance(val, str):
+                continue
+            doc = normalize_name(val)
+            if doc in bg_dates_by_doc_v:
+                bg_dates_by_doc_v[doc].append(date)
+    for doc in active_doctors:
+        dates = sorted(bg_dates_by_doc_v.get(doc, []))
+        for i in range(1, len(dates)):
+            gap = abs((dates[i] - dates[i-1]).days)
+            if gap < 7:
+                violations.append({
+                    "type": "ABS-012",
+                    "desc": f"大学系7日間隔違反: {doc} → gap={gap}日 (必須>=7)"
+                })
+
+    # ABS-014: 全体の平日/休日偏り（差>=2）チェック
+    for doc in active_doctors:
+        wd = wd_counts.get(doc, 0)
+        we = we_counts.get(doc, 0)
+        diff = abs(wd - we)
+        if diff >= 2:
+            violations.append({
+                "type": "ABS-014",
+                "desc": f"平日/休日偏り: {doc} → 平日{wd}/休日{we} (差{diff}, 許容<=1)"
+            })
+
+    # ABS-015: 属性2のB列カテ表コード欠如チェック
+    for (ridx, hosp), (date, fixed) in slot_meta.items():
+        val = pattern_df.at[ridx, hosp]
+        if not isinstance(val, str):
+            continue
+        doc = normalize_name(val)
+        if doc not in doctor_names:
+            continue
+        hidx = shift_df.columns.get_loc(hosp)
+        if hidx == B_COL_INDEX and doc in SCHEDULE_CODE_HOLDERS and doctor_attribute.get(doc, "") == "2":
+            if not get_sched_code(date, doc) and doc not in EXTRA_ALLOWED:
+                violations.append({
+                    "type": "ABS-015",
+                    "desc": f"属性2 B列カテ表欠如: {doc} → {date.strftime('%Y-%m-%d')} {hosp}"
+                })
+
     is_valid = len(violations) == 0
 
     if verbose:
@@ -5598,6 +5857,11 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
             total_fix_counts["univ_wd"] = total_fix_counts.get("univ_wd", 0) + fc
             round_fixed += fc
 
+            # 11.5 全体の平日/休日偏り違反を修正
+            current_df, _, fc = safe_fix(fix_weekday_weekend_balance, current_df, max_attempts=200)
+            total_fix_counts["wd_we"] = total_fix_counts.get("wd_we", 0) + fc
+            round_fixed += fc
+
             # 12. 公平性違反の修正
             current_df, _, fc = safe_fix(fix_fairness_imbalance, current_df, max_attempts=200)
             total_fix_counts["fairness"] = total_fix_counts.get("fairness", 0) + fc
@@ -5606,6 +5870,11 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
             # 13. 未割り当てスロットを埋める（セーフティネット）
             current_df, _, fc = safe_fix(fix_unassigned_slots, current_df)
             total_fix_counts["unassigned"] = total_fix_counts.get("unassigned", 0) + fc
+            round_fixed += fc
+
+            # 14. 大学系週1違反の再修正（ステップ11-13で再発した違反をキャッチ）
+            current_df, _, fc = safe_fix(fix_weekly_bg_violations, current_df, max_attempts=150)
+            total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + fc
             round_fixed += fc
 
             # 収束チェック: 修正がなければループ終了
@@ -5625,9 +5894,25 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         final_df, _, final_dup_fc = fix_external_hospital_dup_violations(final_df, max_attempts=150, verbose=False)
         total_fix_counts["ext_dup"] = total_fix_counts.get("ext_dup", 0) + final_dup_fc
 
+        # 2.5) 大学系週1違反を修正（gap/dup修正で発生した違反を含む）
+        final_df, _, final_weekly_bg_fc = fix_weekly_bg_violations(final_df, max_attempts=150, verbose=False)
+        total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + final_weekly_bg_fc
+
+        # 2.7) TARGET_CAP違反を修正（safe_fixでrevertされた分を含む）
+        final_df, _, final_cap_fc = fix_target_cap_violations(final_df, max_attempts=100, verbose=False)
+        total_fix_counts["cap"] = total_fix_counts.get("cap", 0) + final_cap_fc
+
+        # 2.8) 平日/休日偏り違反を修正
+        final_df, _, final_wd_we_fc = fix_weekday_weekend_balance(final_df, max_attempts=200, verbose=False)
+        total_fix_counts["wd_we"] = total_fix_counts.get("wd_we", 0) + final_wd_we_fc
+
         # 3) 未割当スロットを埋める（gap/dup修正で発生した未割当を含む）
         final_df, _, final_unassigned_fc = fix_unassigned_slots(final_df, verbose=False)
         total_fix_counts["unassigned"] = total_fix_counts.get("unassigned", 0) + final_unassigned_fc
+
+        # 4) 大学系週1違反の最終修正（未割当埋めで発生した違反をキャッチ）
+        final_df, _, final_weekly_bg_fc2 = fix_weekly_bg_violations(final_df, max_attempts=150, verbose=False)
+        total_fix_counts["weekly_bg"] = total_fix_counts.get("weekly_bg", 0) + final_weekly_bg_fc2
 
         fix_count = total_fix_counts.get("hard", 0)
         code_2_fix_count = total_fix_counts.get("code2", 0)
@@ -5639,6 +5924,7 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
         ext_dup_fix_count = total_fix_counts.get("ext_dup", 0)
         univ_over_2_fix_count = total_fix_counts.get("univ_over2", 0)
         univ_weekday_fix_count = total_fix_counts.get("univ_wd", 0)
+        wd_we_fix_count = total_fix_counts.get("wd_we", 0)
         fairness_fix_count = total_fix_counts.get("fairness", 0)
         unassigned_fix_count = total_fix_counts.get("unassigned", 0)
 
@@ -5700,27 +5986,11 @@ for idx, cand in enumerate(tqdm(refine_list, desc="   局所探索    ", ncols=6
 # =========================
 # v5.7.1: 絶対禁忌チェック結果の表示
 # =========================
-print("\n=== 絶対禁忌チェック (v5.7.1) ===")
 abs_valid_count = sum(1 for e in refined if e.get("absolute_constraints_valid", False))
 abs_invalid_count = len(refined) - abs_valid_count
-print(f"   絶対禁忌クリア: {abs_valid_count}/{len(refined)} パターン")
-if abs_invalid_count > 0:
-    print(f"   ❌ 絶対禁忌違反あり: {abs_invalid_count} パターン")
-    # 違反の内訳を表示
-    for e in refined:
-        if not e.get("absolute_constraints_valid", False):
-            viols = e.get("absolute_violations", [])
-            if viols:
-                print(f"      seed={e['seed']}: {len(viols)}件の違反")
-                for v in viols[:3]:
-                    print(f"         - [{v['type']}] {v['desc']}")
-                if len(viols) > 3:
-                    print(f"         ... 他 {len(viols) - 3}件")
+print(f"\n   絶対禁忌: {abs_valid_count}/{len(refined)} パターンクリア")
 
-# =========================
 # ハード制約違反のないパターンのみ選択（TARGET_CAP、gap、未割当）
-# =========================
-print("\n=== ハード制約チェック ===")
 valid_patterns = []
 excluded_count = 0
 for e in refined:
@@ -5731,22 +6001,23 @@ for e in refined:
     code_2_viol = met.get('code_2_extra_violations', 0)
     bg_over_2_viol = met.get('bg_over_2_violations', 0)
     ht_0_viol = met.get('ht_0_violations', 0)
-    abs_valid = e.get("absolute_constraints_valid", False)  # v5.7.1: 絶対禁忌チェック
+    wd_we_viol = met.get('wd_we_imbalance_violations', 0)
+    we_0_viol = met.get('we_0_violations', 0)
+    abs_valid = e.get("absolute_constraints_valid", False)
     # ch_kate_violationsはソフト制約（ペナルティのみ、ハード制約から除外）
 
-    # v5.7.1: 絶対禁忌違反があれば除外
     if not abs_valid:
         excluded_count += 1
-    elif cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0 or bg_over_2_viol > 0 or ht_0_viol > 0:
+    elif cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0 or bg_over_2_viol > 0 or ht_0_viol > 0 or wd_we_viol > 0 or we_0_viol > 0:
         excluded_count += 1
     else:
         valid_patterns.append(e)
 
 if not valid_patterns:
-    print("\n⚠️  ハード制約を満たすパターンなし → 全パターンから選択")
+    print("   ⚠️ ハード制約を満たすパターンなし → 全パターンから選択")
     valid_patterns = refined
 else:
-    print(f"\n✅ {len(valid_patterns)}/{len(refined)} パターンがハード制約OK（絶対禁忌クリア含む）")
+    print(f"   ハード制約OK: {len(valid_patterns)}/{len(refined)} パターン")
 
 # 評価軸1: 公平性重視（TARGET_CAP、公平性ペナルティを重視）
 fairness_patterns = sorted(
@@ -5843,12 +6114,10 @@ if abs_valid_patterns:
                 seen_seeds.add(e["seed"])
                 if len(top_patterns) >= 3:
                     break
-    print(f"\n✅ 絶対禁忌クリア: {len(abs_valid_patterns)}/{len(valid_patterns)} パターン")
-    print(f"   → 3軸評価で{len(top_patterns)}パターンを出力")
+    print(f"   → {len(top_patterns)}パターンを出力")
 else:
     # 絶対禁忌クリアのパターンがない場合は警告
-    print(f"\n⚠️  絶対禁忌をクリアするパターンがありません")
-    print(f"   全パターンから上位3を選択（参考用）")
+    print(f"   ⚠️ 絶対禁忌クリアなし → 全パターンから上位3を選択（参考用）")
     valid_patterns.sort(key=lambda e: e["raw_after"], reverse=True)
     top_patterns = valid_patterns[:3]
     for i, p in enumerate(top_patterns):
@@ -5876,7 +6145,7 @@ refined_df = pd.DataFrame([
 # v6.0.0: 上位3パターン評価
 # =========================
 print("\n" + "="*60)
-print("  📊 上位パターン評価 (v6.0.0)")
+print("  📊 上位パターン評価")
 print("="*60)
 
 if top_patterns:
@@ -5899,48 +6168,287 @@ base_name = uploaded_filename.rsplit(".", 1)[0]
 output_filename = f"{base_name}_v{VERSION}.xlsx"
 output_path = output_filename
 
-def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnostics, df_doctors=None):
-    """v6.5.3: 今月サマリーと医師ごとの偏りを統合、累計/診断を1シートに統合して出力"""
-    startrow = 0
+def _fmt_date_jp(d):
+    """日付を 'YYYY/M/D (曜日)' 形式に変換"""
+    _WD = ["月", "火", "水", "木", "金", "土", "日"]
+    if pd.isna(d):
+        return ""
+    d = pd.to_datetime(d)
+    return f"{d.year}/{d.month}/{d.day} ({_WD[d.weekday()]})"
 
+def _fmt_date_cols(df):
+    """DataFrame内の日付列を文字列フォーマットに変換"""
+    df = df.copy()
+    for col in df.columns:
+        if "日付" in str(col):
+            df[col] = df[col].apply(_fmt_date_jp)
+    return df
+
+def _str_display_width(s):
+    """文字列の表示幅を推定（全角=2, 半角=1）"""
+    import unicodedata
+    width = 0
+    for c in str(s):
+        if unicodedata.east_asian_width(c) in ('F', 'W', 'A'):
+            width += 2
+        else:
+            width += 1
+    return width
+
+def _auto_format_sheet(ws):
+    """全セル中央揃え + 列幅を内容に合わせて自動調整"""
+    from openpyxl.styles import Alignment
+    center = Alignment(horizontal='center')
+    col_max_width = {}
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is not None:
+                cell.alignment = center
+                w = _str_display_width(cell.value)
+                cl = cell.column_letter
+                if w > col_max_width.get(cl, 0):
+                    col_max_width[cl] = w
+    for cl, w in col_max_width.items():
+        ws.column_dimensions[cl].width = min(w + 2, 40)
+
+def _format_summary_sheet(ws, sections):
+    """サマリーシートに詳細なフォーマットを適用
+
+    sections: list of dict, each with:
+        - title_row: セクションタイトルの行番号 (1-indexed)
+        - header_row: ヘッダー行番号
+        - data_start: データ開始行
+        - data_end: データ最終行
+        - num_cols: 列数
+        - section_type: 'summary' | 'violation' | 'score' | 'detail'
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    # --- カラー定義 ---
+    NAVY = "1F3864"
+    LIGHT_BLUE_GREY = "D6E4F0"
+    ZEBRA_GREY = "F2F2F2"
+    WHITE = "FFFFFF"
+    BORDER_GREY = "D9D9D9"
+    VIOLATION_RED = "FFC7CE"
+    SCORE_GREEN = "C6EFCE"
+    SCORE_YELLOW = "FFEB9C"
+    SCORE_RED = "FFC7CE"
+
+    # --- スタイル定義 ---
+    font_base = Font(name="MS Pゴシック", size=10)
+    font_title = Font(name="MS Pゴシック", size=12, bold=True, color=WHITE)
+    font_header = Font(name="MS Pゴシック", size=11, bold=True)
+    fill_title = PatternFill(start_color=NAVY, end_color=NAVY, fill_type="solid")
+    fill_header = PatternFill(start_color=LIGHT_BLUE_GREY, end_color=LIGHT_BLUE_GREY, fill_type="solid")
+    fill_zebra = PatternFill(start_color=ZEBRA_GREY, end_color=ZEBRA_GREY, fill_type="solid")
+    fill_white = PatternFill(start_color=WHITE, end_color=WHITE, fill_type="solid")
+    fill_violation = PatternFill(start_color=VIOLATION_RED, end_color=VIOLATION_RED, fill_type="solid")
+    fill_score_green = PatternFill(start_color=SCORE_GREEN, end_color=SCORE_GREEN, fill_type="solid")
+    fill_score_yellow = PatternFill(start_color=SCORE_YELLOW, end_color=SCORE_YELLOW, fill_type="solid")
+    fill_score_red = PatternFill(start_color=SCORE_RED, end_color=SCORE_RED, fill_type="solid")
+    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    align_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    thin_border = Border(
+        left=Side(style="thin", color=BORDER_GREY),
+        right=Side(style="thin", color=BORDER_GREY),
+        top=Side(style="thin", color=BORDER_GREY),
+        bottom=Side(style="thin", color=BORDER_GREY),
+    )
+    header_bottom_border = Border(
+        left=Side(style="thin", color=BORDER_GREY),
+        right=Side(style="thin", color=BORDER_GREY),
+        top=Side(style="thin", color=BORDER_GREY),
+        bottom=Side(style="medium", color="000000"),
+    )
+
+    # 全セクション最大列数
+    max_cols = max((s["num_cols"] for s in sections), default=6)
+
+    for sec in sections:
+        title_row = sec["title_row"]
+        header_row = sec["header_row"]
+        data_start = sec["data_start"]
+        data_end = sec["data_end"]
+        num_cols = sec["num_cols"]
+        sec_type = sec.get("section_type", "summary")
+
+        # --- セクションタイトル行: ダークネイビー + 白文字 + 結合 ---
+        for col_idx in range(1, num_cols + 1):
+            cell = ws.cell(row=title_row, column=col_idx)
+            cell.fill = fill_title
+            cell.font = font_title
+            cell.alignment = align_center
+        if num_cols > 1:
+            ws.merge_cells(start_row=title_row, start_column=1,
+                           end_row=title_row, end_column=num_cols)
+
+        # --- ヘッダー行: ライトブルーグレー + ボールド + 下線 ---
+        for col_idx in range(1, num_cols + 1):
+            cell = ws.cell(row=header_row, column=col_idx)
+            cell.fill = fill_header
+            cell.font = font_header
+            cell.alignment = align_center
+            cell.border = header_bottom_border
+
+        # --- データ行 ---
+        for r in range(data_start, data_end + 1):
+            row_idx = r - data_start  # 0-based index within data
+            is_odd = (row_idx % 2 == 1)
+
+            for col_idx in range(1, num_cols + 1):
+                cell = ws.cell(row=r, column=col_idx)
+                cell.font = font_base
+                cell.border = thin_border
+
+                # 氏名列（通常col=1）は左寄せ、それ以外は中央
+                if col_idx == 1:
+                    cell.alignment = align_left
+                else:
+                    cell.alignment = align_center
+
+                # ゼブラストライプ（奇数行にグレー背景）
+                if is_odd:
+                    cell.fill = fill_zebra
+                else:
+                    cell.fill = fill_white
+
+            # --- 違反テーブル: 違反がある行をハイライト ---
+            if sec_type == "violation":
+                # 違反行: 数値列で非0の値がある行は赤ハイライト
+                has_violation = False
+                for col_idx in range(2, num_cols + 1):
+                    val = ws.cell(row=r, column=col_idx).value
+                    if val is not None and str(val).strip() != "" and str(val).strip() != "0":
+                        has_violation = True
+                        break
+                if has_violation:
+                    for col_idx in range(1, num_cols + 1):
+                        ws.cell(row=r, column=col_idx).fill = fill_violation
+
+            # --- スコアテーブル: 値に応じた条件付き色分け ---
+            if sec_type == "score":
+                for col_idx in range(2, num_cols + 1):
+                    cell = ws.cell(row=r, column=col_idx)
+                    val = cell.value
+                    if val is not None:
+                        try:
+                            num_val = float(val)
+                            if num_val == 0:
+                                cell.fill = fill_score_green
+                            elif num_val <= 5:
+                                cell.fill = fill_score_yellow
+                            else:
+                                cell.fill = fill_score_red
+                        except (ValueError, TypeError):
+                            pass
+
+    # --- 列幅自動調整 ---
+    col_max_width = {}
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is not None:
+                w = _str_display_width(cell.value)
+                cl = cell.column_letter
+                if w > col_max_width.get(cl, 0):
+                    col_max_width[cl] = w
+    for cl, w in col_max_width.items():
+        # 最小幅を確保しつつ、内容に合わせる
+        auto_w = w + 3
+        ws.column_dimensions[cl].width = max(min(auto_w, 50), 8)
+
+    # A列（氏名）は広めに確保
+    ws.column_dimensions["A"].width = max(ws.column_dimensions["A"].width, 14)
+
+    # --- freeze_panes: 最初のセクションのヘッダー下で固定 ---
+    if sections:
+        first_data = sections[0].get("data_start", 3)
+        ws.freeze_panes = f"A{first_data}"
+
+def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnostics, df_doctors=None):
+    """今月サマリー → 制約違反・スコア → 累計詳細 の順で配置（詳細フォーマット付き）"""
     ws = writer.book.create_sheet(sheet_name)
     writer.sheets[sheet_name] = ws
 
-    # v6.5.3: 今月サマリーと医師ごとの偏りを1テーブルに統合
-    if df_doctors is not None:
-        # df_monthの基本列（氏名, 全合計, 大学合計, 外病院合計, 平日, 休日合計）とdf_doctorsの診断列をマージ
-        # df_doctorsから使う列を選定
-        diag_cols = ["active", "cap", "gap3上限", "利用可能日数", "preassigned",
-                     "gap違反回数", "最小間隔(日)", "同一病院重複超過",
-                     "累計_全合計_平均との差", "累計_大学合計_平均との差",
-                     "累計_外病院合計_平均との差", "累計_平日_平均との差", "累計_休日合計_平均との差"]
-        diag_cols = [c for c in diag_cols if c in df_doctors.columns]
+    sections = []  # フォーマット用セクション情報
 
-        # df_monthとdf_doctorsをマージ（氏名をキーに）
-        df_diag_subset = df_doctors[["氏名"] + diag_cols].copy()
-        df_combined = pd.merge(df_month, df_diag_subset, on="氏名", how="left")
+    # === 1. 今月サマリー（Sheet2順）===
+    COMPACT_COLS = ["氏名", "全合計", "大学合計", "外病院合計", "平日", "休日合計"]
+    df_month_compact = df_month[COMPACT_COLS].copy()
+    sheet2_order = {doc: i for i, doc in enumerate(doctor_names)}
+    df_month_compact["_sort"] = df_month_compact["氏名"].map(sheet2_order)
+    df_month_compact = df_month_compact.sort_values("_sort").drop(columns=["_sort"]).reset_index(drop=True)
 
-        ws.cell(row=1, column=1, value="【医師サマリー（今月）】")
-        df_combined.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
-        startrow = len(df_combined.index) + 4
-    else:
-        # 従来方式（今月サマリー単独）
-        ws.cell(row=1, column=1, value="【今月サマリー】")
-        df_month.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
-        startrow = len(df_month.index) + 4
+    title_row = 1
+    ws.cell(row=title_row, column=1, value="【今月サマリー】")
+    df_month_compact.to_excel(writer, sheet_name=sheet_name, startrow=title_row, index=False)
+    header_row = title_row + 1  # to_excel writes header at startrow
+    data_start = header_row + 1
+    data_end = data_start + len(df_month_compact.index) - 1
+    sections.append({
+        "title_row": title_row,
+        "header_row": header_row,
+        "data_start": data_start,
+        "data_end": data_end,
+        "num_cols": len(COMPACT_COLS),
+        "section_type": "summary",
+    })
+    startrow = data_end + 2
 
-    # 累計サマリー
-    ws.cell(row=startrow, column=1, value="【累計サマリー】")
-    df_total.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
-    startrow += len(df_total.index) + 4
-
-    # 診断情報（医師ごとの偏りは統合済みなのでスキップ）
+    # === 2. 制約違反 + スコアサマリー ===
     for title, df in diagnostics:
         if title == "【医師ごとの偏り】":
-            continue  # v6.5.3: 上で統合済み
-        ws.cell(row=startrow, column=1, value=title)
-        df.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
-        startrow += len(df.index) + 3
+            continue
+        title_row_cur = startrow
+        ws.cell(row=title_row_cur, column=1, value=title)
+        df_out = _fmt_date_cols(df)
+        df_out.to_excel(writer, sheet_name=sheet_name, startrow=title_row_cur, index=False)
+        header_row_cur = title_row_cur + 1
+        data_start_cur = header_row_cur + 1
+        data_end_cur = data_start_cur + len(df_out.index) - 1
+        if len(df_out.index) == 0:
+            data_end_cur = data_start_cur - 1
+
+        # セクションタイプ判定
+        if "スコア" in title:
+            sec_type = "score"
+        elif "違反" in title or "未割当" in title:
+            sec_type = "violation"
+        else:
+            sec_type = "summary"
+
+        sections.append({
+            "title_row": title_row_cur,
+            "header_row": header_row_cur,
+            "data_start": data_start_cur,
+            "data_end": data_end_cur,
+            "num_cols": len(df_out.columns),
+            "section_type": sec_type,
+        })
+        startrow = data_end_cur + 2
+
+    # === 3. 累計詳細 ===
+    detail_cols_available = [c for c in SUMMARY_DETAIL_COLS if c in df_total.columns]
+    if detail_cols_available:
+        df_detail = df_total[["氏名"] + detail_cols_available].copy()
+        title_row_det = startrow
+        ws.cell(row=title_row_det, column=1, value="【累計詳細】")
+        df_detail.to_excel(writer, sheet_name=sheet_name, startrow=title_row_det, index=False)
+        header_row_det = title_row_det + 1
+        data_start_det = header_row_det + 1
+        data_end_det = data_start_det + len(df_detail.index) - 1
+        sections.append({
+            "title_row": title_row_det,
+            "header_row": header_row_det,
+            "data_start": data_start_det,
+            "data_end": data_end_det,
+            "num_cols": len(df_detail.columns),
+            "section_type": "detail",
+        })
+
+    # === 4. 詳細フォーマット適用 ===
+    _format_summary_sheet(ws, sections)
 
 
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -5951,10 +6459,12 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         axis_label = entry.get('axis_label', '総合スコア')
         sheet_label = f"pattern_{rank:02d}"
 
-        # パターンシート
-        entry["pattern_df"].to_excel(writer, sheet_name=sheet_label, index=False)
+        # パターンシート（Date列を曜日付き文字列に変換）
+        pdf = entry["pattern_df"].copy()
+        pdf[date_col_shift] = pd.to_datetime(pdf[date_col_shift]).apply(_fmt_date_jp)
+        pdf.to_excel(writer, sheet_name=sheet_label, index=False)
 
-        # シート名に軸ラベルを追加（Excelの制限により簡略化）
+        # シート名に軸ラベルを追加
         ws = writer.sheets[sheet_label]
         axis_short = {"公平性重視": "公平性", "連続当直回避重視": "gap回避", "バランス重視": "バランス", "総合スコア": "総合"}.get(axis_label, axis_label)
         ws.cell(row=1, column=len(entry["pattern_df"].columns) + 2, value=f"【{axis_short}】")
@@ -5979,8 +6489,13 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
                 ("【制約違反: 重要/推奨ルール】", df_hard_violations),
                 ("【スコアサマリー】", df_metrics),
             ],
-            df_doctors=df_doctors,  # v6.5.3: 今月サマリーと統合
+            df_doctors=df_doctors,
         )
+
+    # 全シート: 中央揃え + 列幅自動調整（summaryシートは個別フォーマット済み）
+    for ws in writer.book.worksheets:
+        if not ws.title.endswith("_summary"):
+            _auto_format_sheet(ws)
 
 print("\n" + "="*60)
 print("  🎉 完了")
