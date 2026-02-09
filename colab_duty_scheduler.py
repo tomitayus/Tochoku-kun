@@ -405,6 +405,7 @@ CONSTRAINT_ABS_004 = "ABS-004"  # カテ当番日の外病院禁止
 CONSTRAINT_ABS_005 = "ABS-005"  # 同日重複禁止
 CONSTRAINT_ABS_006 = "ABS-006"  # 水曜日L〜Y禁止医師
 CONSTRAINT_ABS_013 = "ABS-013"  # v6.5.3: C-H列（休日大学系）カテ当番必須
+CONSTRAINT_ABS_015 = "ABS-015"  # 属性2のB列カテ表コード欠如（緩和不可）
 
 # ハード制約（HARD: パターン除外）
 CONSTRAINT_HARD_001 = "HARD-001"  # TARGET_CAP超過
@@ -2263,12 +2264,16 @@ def evaluate_schedule_with_raw(
 
     # 全体の平日/休日偏り違反（差が2以上はハード制約違反）
     wd_we_imbalance_violations = 0
+    we_0_violations = 0  # 休日0回の違反（ハード制約）
     for doc in active_doctors:
         wd = wd_counts.get(doc, 0)
         we = we_counts.get(doc, 0)
+        total = counts.get(doc, 0)
         diff = abs(wd - we)
         if diff >= 2:
             wd_we_imbalance_violations += (diff - 1)
+        if we == 0 and total >= 1:
+            we_0_violations += 1
 
     # v6.5.0: 大学系7日間隔違反（7日以内に2回以上）- ABS-012改
     weekly_bg_violations = 0
@@ -2342,6 +2347,7 @@ def evaluate_schedule_with_raw(
     penalty += ch_kate_violations * 120  # C-H列カテ当番違反（優先度高）
     penalty += weekly_bg_violations * 300  # v6.4.0: 大学系週1違反（ABS-012）
     penalty += wd_we_imbalance_violations * 300  # 全体の平日/休日偏り（ハード制約）
+    penalty += we_0_violations * 300  # 休日0回（ハード制約）
 
     penalty += max(0, bg_spread - 1) * W_BG_SPREAD
     penalty += max(0, ht_spread - 1) * W_HT_SPREAD
@@ -2371,6 +2377,7 @@ def evaluate_schedule_with_raw(
         "ch_kate_violations": int(ch_kate_violations),
         "weekly_bg_violations": int(weekly_bg_violations),  # v6.4.0: 大学系週1違反（ABS-012）
         "wd_we_imbalance_violations": int(wd_we_imbalance_violations),  # 全体の平日/休日偏り（差>=2）
+        "we_0_violations": int(we_0_violations),  # 休日0回違反
         "bg_spread_cum": float(bg_spread),
         "ht_spread_cum": float(ht_spread),
         "weekday_spread_cum": float(wd_spread),
@@ -3062,9 +3069,9 @@ def build_hard_constraint_violations(pattern_df):
                 if idx == B_COL_INDEX:
                     doc_attr = doctor_attribute.get(doc, "")
                     if doc_attr == "2":
-                        # 属性2は緩和不可（ABS該当）
+                        # 属性2は緩和不可（ABS-015）
                         rows.append({
-                            "制約ID": CONSTRAINT_SEMI_001,
+                            "制約ID": CONSTRAINT_ABS_015,
                             "違反種別": "B列カテ表コード欠如（属性2:緩和不可）",
                             "日付": date,
                             "医師名": doc,
@@ -3072,7 +3079,7 @@ def build_hard_constraint_violations(pattern_df):
                             "列番号": idx,
                             "可否コード": code,
                             "カテ表": "",
-                            "詳細": f"[{CONSTRAINT_SEMI_001}] B列割当にカテ表必須（属性2は緩和不可）",
+                            "詳細": f"[{CONSTRAINT_ABS_015}] B列割当にカテ表必須（属性2は緩和不可）",
                         })
                     else:
                         # 属性1または未設定は緩和可（週1回まで許容）
@@ -5588,6 +5595,22 @@ def validate_absolute_constraints(pattern_df, verbose=True):
                 "desc": f"平日/休日偏り: {doc} → 平日{wd}/休日{we} (差{diff}, 許容<=1)"
             })
 
+    # ABS-015: 属性2のB列カテ表コード欠如チェック
+    for (ridx, hosp), (date, fixed) in slot_meta.items():
+        val = pattern_df.at[ridx, hosp]
+        if not isinstance(val, str):
+            continue
+        doc = normalize_name(val)
+        if doc not in doctor_names:
+            continue
+        hidx = shift_df.columns.get_loc(hosp)
+        if hidx == B_COL_INDEX and doc in SCHEDULE_CODE_HOLDERS and doctor_attribute.get(doc, "") == "2":
+            if not get_sched_code(date, doc) and doc not in EXTRA_ALLOWED:
+                violations.append({
+                    "type": "ABS-015",
+                    "desc": f"属性2 B列カテ表欠如: {doc} → {date.strftime('%Y-%m-%d')} {hosp}"
+                })
+
     is_valid = len(violations) == 0
 
     if verbose:
@@ -5979,13 +6002,13 @@ for e in refined:
     bg_over_2_viol = met.get('bg_over_2_violations', 0)
     ht_0_viol = met.get('ht_0_violations', 0)
     wd_we_viol = met.get('wd_we_imbalance_violations', 0)
-    abs_valid = e.get("absolute_constraints_valid", False)  # v5.7.1: 絶対禁忌チェック
+    we_0_viol = met.get('we_0_violations', 0)
+    abs_valid = e.get("absolute_constraints_valid", False)
     # ch_kate_violationsはソフト制約（ペナルティのみ、ハード制約から除外）
 
-    # v5.7.1: 絶対禁忌違反があれば除外
     if not abs_valid:
         excluded_count += 1
-    elif cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0 or bg_over_2_viol > 0 or ht_0_viol > 0 or wd_we_viol > 0:
+    elif cap_viol > 0 or gap_viol > 0 or unassigned > 0 or code_2_viol > 0 or bg_over_2_viol > 0 or ht_0_viol > 0 or wd_we_viol > 0 or we_0_viol > 0:
         excluded_count += 1
     else:
         valid_patterns.append(e)
