@@ -6211,10 +6211,167 @@ def _auto_format_sheet(ws):
     for cl, w in col_max_width.items():
         ws.column_dimensions[cl].width = min(w + 2, 40)
 
+def _format_summary_sheet(ws, sections):
+    """サマリーシートに詳細なフォーマットを適用
+
+    sections: list of dict, each with:
+        - title_row: セクションタイトルの行番号 (1-indexed)
+        - header_row: ヘッダー行番号
+        - data_start: データ開始行
+        - data_end: データ最終行
+        - num_cols: 列数
+        - section_type: 'summary' | 'violation' | 'score' | 'detail'
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    # --- カラー定義 ---
+    NAVY = "1F3864"
+    LIGHT_BLUE_GREY = "D6E4F0"
+    ZEBRA_GREY = "F2F2F2"
+    WHITE = "FFFFFF"
+    BORDER_GREY = "D9D9D9"
+    VIOLATION_RED = "FFC7CE"
+    SCORE_GREEN = "C6EFCE"
+    SCORE_YELLOW = "FFEB9C"
+    SCORE_RED = "FFC7CE"
+
+    # --- スタイル定義 ---
+    font_base = Font(name="MS Pゴシック", size=10)
+    font_title = Font(name="MS Pゴシック", size=12, bold=True, color=WHITE)
+    font_header = Font(name="MS Pゴシック", size=11, bold=True)
+    fill_title = PatternFill(start_color=NAVY, end_color=NAVY, fill_type="solid")
+    fill_header = PatternFill(start_color=LIGHT_BLUE_GREY, end_color=LIGHT_BLUE_GREY, fill_type="solid")
+    fill_zebra = PatternFill(start_color=ZEBRA_GREY, end_color=ZEBRA_GREY, fill_type="solid")
+    fill_white = PatternFill(start_color=WHITE, end_color=WHITE, fill_type="solid")
+    fill_violation = PatternFill(start_color=VIOLATION_RED, end_color=VIOLATION_RED, fill_type="solid")
+    fill_score_green = PatternFill(start_color=SCORE_GREEN, end_color=SCORE_GREEN, fill_type="solid")
+    fill_score_yellow = PatternFill(start_color=SCORE_YELLOW, end_color=SCORE_YELLOW, fill_type="solid")
+    fill_score_red = PatternFill(start_color=SCORE_RED, end_color=SCORE_RED, fill_type="solid")
+    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    align_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    thin_border = Border(
+        left=Side(style="thin", color=BORDER_GREY),
+        right=Side(style="thin", color=BORDER_GREY),
+        top=Side(style="thin", color=BORDER_GREY),
+        bottom=Side(style="thin", color=BORDER_GREY),
+    )
+    header_bottom_border = Border(
+        left=Side(style="thin", color=BORDER_GREY),
+        right=Side(style="thin", color=BORDER_GREY),
+        top=Side(style="thin", color=BORDER_GREY),
+        bottom=Side(style="medium", color="000000"),
+    )
+
+    # 全セクション最大列数
+    max_cols = max((s["num_cols"] for s in sections), default=6)
+
+    for sec in sections:
+        title_row = sec["title_row"]
+        header_row = sec["header_row"]
+        data_start = sec["data_start"]
+        data_end = sec["data_end"]
+        num_cols = sec["num_cols"]
+        sec_type = sec.get("section_type", "summary")
+
+        # --- セクションタイトル行: ダークネイビー + 白文字 + 結合 ---
+        for col_idx in range(1, num_cols + 1):
+            cell = ws.cell(row=title_row, column=col_idx)
+            cell.fill = fill_title
+            cell.font = font_title
+            cell.alignment = align_center
+        if num_cols > 1:
+            ws.merge_cells(start_row=title_row, start_column=1,
+                           end_row=title_row, end_column=num_cols)
+
+        # --- ヘッダー行: ライトブルーグレー + ボールド + 下線 ---
+        for col_idx in range(1, num_cols + 1):
+            cell = ws.cell(row=header_row, column=col_idx)
+            cell.fill = fill_header
+            cell.font = font_header
+            cell.alignment = align_center
+            cell.border = header_bottom_border
+
+        # --- データ行 ---
+        for r in range(data_start, data_end + 1):
+            row_idx = r - data_start  # 0-based index within data
+            is_odd = (row_idx % 2 == 1)
+
+            for col_idx in range(1, num_cols + 1):
+                cell = ws.cell(row=r, column=col_idx)
+                cell.font = font_base
+                cell.border = thin_border
+
+                # 氏名列（通常col=1）は左寄せ、それ以外は中央
+                if col_idx == 1:
+                    cell.alignment = align_left
+                else:
+                    cell.alignment = align_center
+
+                # ゼブラストライプ（奇数行にグレー背景）
+                if is_odd:
+                    cell.fill = fill_zebra
+                else:
+                    cell.fill = fill_white
+
+            # --- 違反テーブル: 違反がある行をハイライト ---
+            if sec_type == "violation":
+                # 違反行: 数値列で非0の値がある行は赤ハイライト
+                has_violation = False
+                for col_idx in range(2, num_cols + 1):
+                    val = ws.cell(row=r, column=col_idx).value
+                    if val is not None and str(val).strip() != "" and str(val).strip() != "0":
+                        has_violation = True
+                        break
+                if has_violation:
+                    for col_idx in range(1, num_cols + 1):
+                        ws.cell(row=r, column=col_idx).fill = fill_violation
+
+            # --- スコアテーブル: 値に応じた条件付き色分け ---
+            if sec_type == "score":
+                for col_idx in range(2, num_cols + 1):
+                    cell = ws.cell(row=r, column=col_idx)
+                    val = cell.value
+                    if val is not None:
+                        try:
+                            num_val = float(val)
+                            if num_val == 0:
+                                cell.fill = fill_score_green
+                            elif num_val <= 5:
+                                cell.fill = fill_score_yellow
+                            else:
+                                cell.fill = fill_score_red
+                        except (ValueError, TypeError):
+                            pass
+
+    # --- 列幅自動調整 ---
+    col_max_width = {}
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is not None:
+                w = _str_display_width(cell.value)
+                cl = cell.column_letter
+                if w > col_max_width.get(cl, 0):
+                    col_max_width[cl] = w
+    for cl, w in col_max_width.items():
+        # 最小幅を確保しつつ、内容に合わせる
+        auto_w = w + 3
+        ws.column_dimensions[cl].width = max(min(auto_w, 50), 8)
+
+    # A列（氏名）は広めに確保
+    ws.column_dimensions["A"].width = max(ws.column_dimensions["A"].width, 14)
+
+    # --- freeze_panes: 最初のセクションのヘッダー下で固定 ---
+    if sections:
+        first_data = sections[0].get("data_start", 3)
+        ws.freeze_panes = f"A{first_data}"
+
 def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnostics, df_doctors=None):
-    """今月サマリー → 制約違反・スコア → 累計詳細 の順で配置"""
+    """今月サマリー → 制約違反・スコア → 累計詳細 の順で配置（詳細フォーマット付き）"""
     ws = writer.book.create_sheet(sheet_name)
     writer.sheets[sheet_name] = ws
+
+    sections = []  # フォーマット用セクション情報
 
     # === 1. 今月サマリー（Sheet2順）===
     COMPACT_COLS = ["氏名", "全合計", "大学合計", "外病院合計", "平日", "休日合計"]
@@ -6223,25 +6380,75 @@ def write_combined_summary_sheet(writer, sheet_name, df_month, df_total, diagnos
     df_month_compact["_sort"] = df_month_compact["氏名"].map(sheet2_order)
     df_month_compact = df_month_compact.sort_values("_sort").drop(columns=["_sort"]).reset_index(drop=True)
 
-    ws.cell(row=1, column=1, value="【今月サマリー】")
-    df_month_compact.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
-    startrow = len(df_month_compact.index) + 4
+    title_row = 1
+    ws.cell(row=title_row, column=1, value="【今月サマリー】")
+    df_month_compact.to_excel(writer, sheet_name=sheet_name, startrow=title_row, index=False)
+    header_row = title_row + 1  # to_excel writes header at startrow
+    data_start = header_row + 1
+    data_end = data_start + len(df_month_compact.index) - 1
+    sections.append({
+        "title_row": title_row,
+        "header_row": header_row,
+        "data_start": data_start,
+        "data_end": data_end,
+        "num_cols": len(COMPACT_COLS),
+        "section_type": "summary",
+    })
+    startrow = data_end + 2
 
     # === 2. 制約違反 + スコアサマリー ===
     for title, df in diagnostics:
         if title == "【医師ごとの偏り】":
             continue
-        ws.cell(row=startrow, column=1, value=title)
+        title_row_cur = startrow
+        ws.cell(row=title_row_cur, column=1, value=title)
         df_out = _fmt_date_cols(df)
-        df_out.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
-        startrow += len(df_out.index) + 3
+        df_out.to_excel(writer, sheet_name=sheet_name, startrow=title_row_cur, index=False)
+        header_row_cur = title_row_cur + 1
+        data_start_cur = header_row_cur + 1
+        data_end_cur = data_start_cur + len(df_out.index) - 1
+        if len(df_out.index) == 0:
+            data_end_cur = data_start_cur - 1
+
+        # セクションタイプ判定
+        if "スコア" in title:
+            sec_type = "score"
+        elif "違反" in title or "未割当" in title:
+            sec_type = "violation"
+        else:
+            sec_type = "summary"
+
+        sections.append({
+            "title_row": title_row_cur,
+            "header_row": header_row_cur,
+            "data_start": data_start_cur,
+            "data_end": data_end_cur,
+            "num_cols": len(df_out.columns),
+            "section_type": sec_type,
+        })
+        startrow = data_end_cur + 2
 
     # === 3. 累計詳細 ===
     detail_cols_available = [c for c in SUMMARY_DETAIL_COLS if c in df_total.columns]
     if detail_cols_available:
         df_detail = df_total[["氏名"] + detail_cols_available].copy()
-        ws.cell(row=startrow, column=1, value="【累計詳細】")
-        df_detail.to_excel(writer, sheet_name=sheet_name, startrow=startrow, index=False)
+        title_row_det = startrow
+        ws.cell(row=title_row_det, column=1, value="【累計詳細】")
+        df_detail.to_excel(writer, sheet_name=sheet_name, startrow=title_row_det, index=False)
+        header_row_det = title_row_det + 1
+        data_start_det = header_row_det + 1
+        data_end_det = data_start_det + len(df_detail.index) - 1
+        sections.append({
+            "title_row": title_row_det,
+            "header_row": header_row_det,
+            "data_start": data_start_det,
+            "data_end": data_end_det,
+            "num_cols": len(df_detail.columns),
+            "section_type": "detail",
+        })
+
+    # === 4. 詳細フォーマット適用 ===
+    _format_summary_sheet(ws, sections)
 
 
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -6285,9 +6492,10 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             df_doctors=df_doctors,
         )
 
-    # 全シート: 中央揃え + 列幅自動調整
+    # 全シート: 中央揃え + 列幅自動調整（summaryシートは個別フォーマット済み）
     for ws in writer.book.worksheets:
-        _auto_format_sheet(ws)
+        if not ws.title.endswith("_summary"):
+            _auto_format_sheet(ws)
 
 print("\n" + "="*60)
 print("  🎉 完了")
