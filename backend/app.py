@@ -39,22 +39,23 @@ class ConfigModel(BaseModel):
     num_patterns: int = Field(default=1000, ge=10, le=10000, description="生成パターン数")
     local_search_enabled: bool = Field(default=True, description="局所探索を有効化")
 
-    # スコア重み
-    w_fair_total: float = Field(default=10, description="全合計の公平性重み")
-    w_gap: float = Field(default=3, description="gap違反の重み")
-    w_hosp_dup: float = Field(default=1, description="同一病院重複の重み")
-    w_unassigned: float = Field(default=100, description="未割当の重み")
-    w_cap: float = Field(default=50, description="cap超過の重み")
+    # スコア重み（v6.0.0以降: GAP/CAP/外病院重複はABS制約に格上げされペナルティ重み0）
+    w_fair_total: float = Field(default=30, description="全合計の公平性重み")
+    w_gap: float = Field(default=0, description="gap違反の重み（ABS-007で対応、ペナルティ不要）")
+    w_hosp_dup: float = Field(default=0, description="同一病院重複の重み（ABS-008で対応、ペナルティ不要）")
+    w_unassigned: float = Field(default=500, description="未割当の重み")
+    w_cap: float = Field(default=0, description="cap超過の重み（ABS-010で対応、ペナルティ不要）")
 
-    class Config:
-        schema_extra = {
-            "example": {
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
                 "holidays": ["2026-01-01", "2026-05-03"],
                 "wed_forbidden_doctors": ["金城", "山田"],
                 "num_patterns": 1000,
                 "local_search_enabled": True
-            }
+            }]
         }
+    }
 
 
 class TaskStatus(BaseModel):
