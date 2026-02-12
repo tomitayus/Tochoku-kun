@@ -392,8 +392,65 @@ class DutyScheduler:
         Returns:
             TOP3パターンのリスト
         """
-        # TODO: 既存の build_schedule_pattern, local_search, evaluate などを実装
-        pass
+        if self.shift_df is None or self.availability_df is None:
+            raise ValueError("先に load_excel() を実行してください")
+
+        date_col = self.shift_df.columns[0]
+        pattern_df = self.shift_df.copy()
+        pattern_df[self.hospital_cols] = pattern_df[self.hospital_cols].astype(object)
+        assigned_count = defaultdict(int)
+
+        for row_idx, row in pattern_df.iterrows():
+            date = pd.to_datetime(row[date_col], errors="coerce")
+            if pd.isna(date):
+                continue
+            date = date.normalize().tz_localize(None)
+
+            for hosp in self.hospital_cols:
+                cell = row[hosp]
+
+                # 既に医師名が入っている場合は固定割当として扱う
+                if isinstance(cell, str):
+                    existing = cell.strip().replace(" ", "").replace("　", "")
+                    if existing in self.doctor_names:
+                        assigned_count[existing] += 1
+                        continue
+
+                # 枠マーカー以外はスキップ
+                if not self.is_slot_value(cell):
+                    continue
+
+                candidates = []
+                for doc in self.doctor_names:
+                    avail = self.fallback_avail_codes.get(doc, 1)
+                    if date in self.availability_df.index and doc in self.availability_df.columns:
+                        v = self.availability_df.at[date, doc]
+                        if pd.notna(v):
+                            try:
+                                avail = int(v)
+                            except Exception:
+                                avail = self.fallback_avail_codes.get(doc, 1)
+
+                    if avail == 0:
+                        continue
+
+                    candidates.append((assigned_count[doc], doc))
+
+                if candidates:
+                    _, picked = min(candidates)
+                    pattern_df.at[row_idx, hosp] = picked
+                    assigned_count[picked] += 1
+                else:
+                    pattern_df.at[row_idx, hosp] = "UNASSIGNED"
+
+        return [{
+            "df": pattern_df,
+            "score": 0,
+            "meta": {
+                "algorithm": "greedy-baseline",
+                "note": "簡易実装: 可否を考慮した均等割当"
+            }
+        }]
 
     def export_excel(self, patterns: List[Dict]) -> bytes:
         """
