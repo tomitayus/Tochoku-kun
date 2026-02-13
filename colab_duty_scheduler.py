@@ -1063,6 +1063,18 @@ if len(active_doctors) == 0:
 if inactive_doctors:
     print(f"⚠️ inactive医師（解析除外、出力のみ）: {len(inactive_doctors)}人")
 
+# v6.6.0: 休み希望数（code 0の日数）を医師ごとに事前計算
+# 制約緩和時、休み希望ありの医師を優先的に緩和対象にするために使用
+doctor_timeoff_count = {}
+for doc in active_doctors:
+    doctor_timeoff_count[doc] = sum(
+        1 for d in all_shift_dates if get_avail_code(d, doc) == 0
+    )
+doctors_with_timeoff = {doc for doc, cnt in doctor_timeoff_count.items() if cnt > 0}
+_n_with = len(doctors_with_timeoff)
+_n_without = len(active_doctors) - _n_with
+print(f"ℹ️ 休み希望: あり {_n_with}人 / なし {_n_without}人")
+
 # 可否コード2の医師（大学系のみ可能）
 # v6.0.5: CODE_2医師もEXTRA枠対象に含める（除外すると物理的に枠不足になりうる）
 def has_code_2_anywhere(doc):
@@ -1401,9 +1413,17 @@ def choose_doctor_for_slot(
         relax_semi=False,  # v6.0.0: SEMI制約を緩和（sheet3「1」以外も許容）
         relax_hard=False,  # v6.0.1: HARD制約を緩和（ABS-009回避のため）
         relax_abs=False,   # v6.3.0: ABS制約を緩和（未割当回避のため）
+        only_with_timeoff=False,  # v6.6.0: 休み希望ありの医師のみを緩和対象にする
     ):
         candidates = []
         for doc in doctor_names:
+            # v6.6.0: only_with_timeoff=Trueの場合、休み希望なしの医師は
+            # 緩和前の制約で評価する（緩和対象にしない）
+            doc_has_timeoff = doc in doctors_with_timeoff
+            eff_relax_semi = relax_semi if (doc_has_timeoff or not only_with_timeoff) else False
+            eff_relax_hard = relax_hard if (doc_has_timeoff or not only_with_timeoff) else False
+            eff_relax_abs = relax_abs if (doc_has_timeoff or not only_with_timeoff) else False
+
             # === 絶対禁忌（ABS）===
             # v6.3.0: relax_abs=Trueでも緩和しない制約（物理的に不可能）
 
@@ -1442,27 +1462,28 @@ def choose_doctor_for_slot(
                     continue
 
             # === v6.3.0: 以下のABS制約はrelax_abs=Trueで緩和可能 ===
+            # v6.6.0: eff_relax_* は医師ごとの実効緩和フラグ（休み希望優先緩和）
 
             # ABS-007: gap >= 3日必須
-            if not relax_abs and assigned_dates[doc]:
+            if not eff_relax_abs and assigned_dates[doc]:
                 min_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_dates[doc])
                 if min_gap < 3:
                     continue
 
             # ABS-008: 同一病院重複禁止（初期生成時は全列で禁止、fix関数では外病院のみ）
-            if not relax_abs and assigned_hosp_count[doc].get(hospital_name, 0) >= 1:
+            if not eff_relax_abs and assigned_hosp_count[doc].get(hospital_name, 0) >= 1:
                 continue
 
             # ABS-010: TARGET_CAP遵守（n超過禁止）
-            if not relax_abs and assigned_count[doc] >= TARGET_CAP.get(doc, 0):
+            if not eff_relax_abs and assigned_count[doc] >= TARGET_CAP.get(doc, 0):
                 continue
 
             # ABS-011: 大学系2回まで（B-K列合計）
-            if not relax_abs and is_BG and assigned_bg[doc] >= 2:
+            if not eff_relax_abs and is_BG and assigned_bg[doc] >= 2:
                 continue
 
             # ABS-012改: 大学系は7日間隔必須（v6.5.0）
-            if not relax_abs and is_BG:
+            if not eff_relax_abs and is_BG:
                 if assigned_bg_dates[doc]:
                     min_bg_gap = min(abs((pd.to_datetime(date) - x).days) for x in assigned_bg_dates[doc])
                     if min_bg_gap < 7:
@@ -1479,7 +1500,7 @@ def choose_doctor_for_slot(
             is_attr_2 = (doc_attr == "2")  # 属性2は緩和不可
 
             # HARD-001: B/I列1回まで（グループA）
-            if not relax_hard and is_B_or_I and assigned_bi[doc] >= 1:
+            if not eff_relax_hard and is_B_or_I and assigned_bi[doc] >= 1:
                 # カテなし医師は必須遵守
                 if not is_kate_holder:
                     continue
@@ -1488,7 +1509,7 @@ def choose_doctor_for_slot(
                     continue
 
             # HARD-002: C-H/J-K列1回まで（グループB）
-            if not relax_hard and is_CH_or_JK and assigned_chjk[doc] >= 1:
+            if not eff_relax_hard and is_CH_or_JK and assigned_chjk[doc] >= 1:
                 # カテなし医師は必須遵守
                 if not is_kate_holder:
                     continue
@@ -1508,14 +1529,14 @@ def choose_doctor_for_slot(
                     continue
                 elif is_attr_1:
                     # 属性1は緩和可（週1回まで許容）
-                    if not relax_semi:
+                    if not eff_relax_semi:
                         week_start = get_monday_week_start(date)
                         if week_start in semi001_violation_weeks[doc]:
                             continue
                         # 1回目は許容（選ばれた場合、後で週を記録）
                 else:
                     # 属性未設定の場合はsheet3「1」をフォールバック
-                    if not relax_semi and not is_sheet3_one:
+                    if not eff_relax_semi and not is_sheet3_one:
                         week_start = get_monday_week_start(date)
                         if week_start in semi001_violation_weeks[doc]:
                             continue
@@ -1525,16 +1546,27 @@ def choose_doctor_for_slot(
             candidates.append(doc)
         return candidates
 
-    # v6.3.0: 段階的制約緩和（未割当回避を最優先）
+    # v6.6.0: 段階的制約緩和（休み希望ありの医師を優先的に緩和）
+    # 各緩和段階で、まず休み希望ありの医師のみ緩和を試み、
+    # それでも候補がなければ全員に緩和を適用する。
     # 1. 全制約適用
     candidates = collect_candidates()
-    # 2. SEMI緩和
+    # 2a. SEMI緩和（休み希望ありの医師のみ）
+    if not candidates:
+        candidates = collect_candidates(relax_semi=True, only_with_timeoff=True)
+    # 2b. SEMI緩和（全員）
     if not candidates:
         candidates = collect_candidates(relax_semi=True)
-    # 3. HARD緩和（SEMI緩和済み）
+    # 3a. HARD緩和（休み希望ありの医師のみ、SEMI緩和済み）
+    if not candidates:
+        candidates = collect_candidates(relax_semi=True, relax_hard=True, only_with_timeoff=True)
+    # 3b. HARD緩和（全員、SEMI緩和済み）
     if not candidates:
         candidates = collect_candidates(relax_semi=True, relax_hard=True)
-    # 4. ABS緩和（SEMI/HARD緩和済み）- 未割当を絶対に回避
+    # 4a. ABS緩和（休み希望ありの医師のみ、SEMI/HARD緩和済み）- 未割当を絶対に回避
+    if not candidates:
+        candidates = collect_candidates(relax_semi=True, relax_hard=True, relax_abs=True, only_with_timeoff=True)
+    # 4b. ABS緩和（全員、SEMI/HARD緩和済み）- 未割当を絶対に回避
     if not candidates:
         candidates = collect_candidates(relax_semi=True, relax_hard=True, relax_abs=True)
 
