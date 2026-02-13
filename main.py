@@ -543,25 +543,23 @@ print("\n" + "="*60)
 print(f"  当直くん v{VERSION} (ローカル実行)")
 print("="*60)
 
-# 入力ファイルパスの決定（コマンドライン引数 > ファイル選択ダイアログ > config.py）
+# 入力ファイルパスの決定（Finderダイアログ > コマンドライン引数 > config.py）
 if len(sys.argv) > 1:
     input_path = sys.argv[1]
 else:
     try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        input_path = filedialog.askopenfilename(
-            title="入力Excelファイルを選択してください",
-            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")],
+        import subprocess as _sp
+        _result = _sp.run(
+            ["osascript", "-e",
+             'POSIX path of (choose file with prompt "入力Excelファイルを選択してください" of type {"xlsx", "xls"})'],
+            capture_output=True, text=True, timeout=300,
         )
-        root.destroy()
-        if not input_path:
+        if _result.returncode == 0 and _result.stdout.strip():
+            input_path = _result.stdout.strip()
+        else:
             print("\nファイルが選択されませんでした。終了します。")
             sys.exit(0)
-    except ImportError:
+    except Exception:
         input_path = _cfg.INPUT_FILE
 
 if not os.path.exists(input_path):
@@ -6104,8 +6102,9 @@ else:
 # =========================
 base_name = uploaded_filename.rsplit(".", 1)[0]
 output_filename = f"{base_name}_v{VERSION}.xlsx"
-os.makedirs(_cfg.OUTPUT_DIR, exist_ok=True)
-output_path = os.path.join(_cfg.OUTPUT_DIR, output_filename)
+_downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+os.makedirs(_downloads_dir, exist_ok=True)
+output_path = os.path.join(_downloads_dir, output_filename)
 
 def _fmt_date_jp(d):
     """日付を 'YYYY/M/D (曜日)' 形式に変換"""
