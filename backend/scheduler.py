@@ -27,16 +27,16 @@ class SchedulerConfig:
     local_patience: int = 1200
     local_refresh_every: int = 200
 
-    # スコア重み
-    w_fair_total: float = 10
-    w_gap: float = 3
-    w_hosp_dup: float = 1
-    w_unassigned: float = 100
-    w_cap: float = 50
-    w_bg_spread: float = 3
-    w_ht_spread: float = 3
-    w_wd_spread: float = 2
-    w_we_spread: float = 3
+    # スコア重み（v6.0.0以降: GAP/CAP/外病院重複はABS制約に格上げされペナルティ重み0）
+    w_fair_total: float = 30
+    w_gap: float = 0             # ABS-007で対応
+    w_hosp_dup: float = 0        # ABS-008で対応
+    w_unassigned: float = 500    # v6.0.2: fix_unassigned_slots有効化に伴い復活
+    w_cap: float = 0             # ABS-010で対応
+    w_bg_spread: float = 0       # 削除（簡略化）
+    w_ht_spread: float = 0       # 削除（簡略化）
+    w_wd_spread: float = 0       # 削除（簡略化）
+    w_we_spread: float = 0       # 削除（簡略化）
 
     # 枠マーカー
     slot_markers: Set = field(default_factory=lambda: {1, 1.0, "1", "〇", "○", "◯", "◎"})

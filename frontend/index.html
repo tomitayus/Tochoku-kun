@@ -492,7 +492,7 @@
             `;
         }
 
-        // エラー表示
+        // エラー表示（XSS対策: textContentでエスケープ）
         function showError(message) {
             progressContainer.style.display = 'none';
             result.className = 'result error';
@@ -502,10 +502,9 @@
                 <div style="font-size: 1.3em; font-weight: bold; margin-bottom: 10px; color: #c62828;">
                     エラーが発生しました
                 </div>
-                <div style="color: #666;">
-                    ${message}
-                </div>
+                <div id="errorMessage" style="color: #666;"></div>
             `;
+            document.getElementById('errorMessage').textContent = message;
         }
     </script>
 </body>
